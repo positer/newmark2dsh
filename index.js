@@ -641,15 +641,29 @@ export function apply(ctx, config) {
                   };
                 }
 
-                // The value is applied to the row's live config option and then written to
-                // the file by the editor, so reading the SAME object back afterwards is
-                // reading what was persisted rather than what was requested.
-                const live = entry.options.config ?? {};
+                // The value is written to the file by the editor, and the receipt must carry
+                // what was PERSISTED rather than what was requested — so the row's config is
+                // read back. It has to be read back AFTER the edit, and that ordering is the
+                // whole bug this replaced.
+                //
+                // The object captured BEFORE the edit is not the object the editor updates.
+                // `configEditor.edit` resolves the config through the row's fiber, so
+                // `entry.options.config` is REPLACED rather than mutated in place; a reference
+                // taken before the call keeps pointing at the pre-edit object, `live.model`
+                // stays undefined, and the receipt says "the write did not take: the row's
+                // config still holds /" — printing two empty strings around a slash — for a
+                // write that had in fact taken. The patch file carried
+                // `model: deepseek-flash, modelProvider: deepseek-official` the whole time.
+                //
+                // That is the same class of defect as the `memory_lab_reindex` output-boundary
+                // bug fixed in 0.2.2: an operation that SUCCEEDED, reported to the caller as a
+                // failure. A caller's natural response to a failed write is to write again.
                 await configEditor.edit(entry, (current) => ({
                   ...current,
                   model,
                   modelProvider: provider,
                 }));
+                const live = entry.options.config ?? {};
                 const persisted = normaliseSelection({
                   provider: live.modelProvider,
                   model: live.model,
