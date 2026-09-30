@@ -61,6 +61,69 @@ function toolText(value) {
   return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }];
 }
 
+/**
+ * The declared parameter surface is snake_case; the backends read camelCase.
+ *
+ * The two families do not meet on their own. `execute` used to spread the tool's arguments
+ * straight into `runComputerUse`, so every parameter a backend reads only in its camelCase
+ * spelling was silently discarded - `dry_run` most seriously, because a caller that asked
+ * for a dry run got a real one and no field saying otherwise.
+ *
+ * A few names were carried across all along, each by accident rather than by a rule: the
+ * backends happen to accept both spellings of `scroll_x`/`scroll_y`, `sparse_wait_ms` and
+ * `duration_ms` (`lib/win32.js:3562`, `:3318`, `:3279`), and of `app_target` and
+ * `window_handle` (`:2326`, `:1802`). Those work today and are mapped here too, so they no
+ * longer depend on a fallback surviving.
+ *
+ * This table is the whole translation, and it is deliberately explicit rather than
+ * generated from a case rule: a generated one would also rewrite `action`, `x`, `y`, `text`,
+ * `key`, `button` and `steps`, which are spelled the same in both families, and it would
+ * silently "fix" any future parameter whether or not a backend read exists for it. A name
+ * belongs here only when a read of that camelCase name exists in a backend.
+ *
+ * `include_ui_tree` is absent on purpose: no backend reads it under any spelling, so giving
+ * it a camelCase name would only hide that it does nothing.
+ */
+const SNAKE_TO_CAMEL = Object.freeze({
+  owner_id: 'ownerId',
+  mouse_mode: 'mouseMode',
+  app_target: 'appTarget',
+  window_handle: 'windowHandle',
+  target_id: 'targetId',
+  scroll_x: 'scrollX',
+  scroll_y: 'scrollY',
+  duration_ms: 'durationMs',
+  timeout_ms: 'timeoutMs',
+  sparse_wait_ms: 'sparseWaitMs',
+  capture_max_width: 'captureMaxWidth',
+  capture_max_height: 'captureMaxHeight',
+  max_chars: 'maxChars',
+  dry_run: 'dryRun',
+  start_x: 'startX',
+  start_y: 'startY',
+  end_x: 'endX',
+  end_y: 'endY',
+});
+
+/**
+ * The declared tool arguments under the backends' own option names.
+ *
+ * A camelCase key from the caller has no snake_case sibling to collide with, so it is left
+ * as it stands: a direct `runComputerUse` dispatch and a tool call then land on the same
+ * option. When a caller sends both spellings of one parameter the declared spelling wins,
+ * because that is the contract the schema publishes.
+ */
+function backendOptions(args) {
+  const source = args && typeof args === 'object' ? args : {};
+  const translated = { ...source };
+  for (const [snake, camel] of Object.entries(SNAKE_TO_CAMEL)) {
+    if (source[snake] === undefined) continue;
+    translated[camel] = source[snake];
+    delete translated[snake];
+  }
+  return translated;
+}
+
 export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
   /**
    * The frozen Loader row (`index.js`) still declares a `leaseTtlMs` setting and passes it
@@ -212,13 +275,19 @@ export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
             const action = String(args?.action || 'observe');
             const backend = await loadBackend();
             if (!backend) return UNAVAILABLE(action);
+            /**
+             * The declared arguments are translated before they are handed over. Nothing
+             * above this line and nothing below it changes: the schema keeps publishing
+             * snake_case, and the backend keeps reading camelCase.
+             */
+            const translated = backendOptions(args);
             const result = await backend.runComputerUse({
-              ...args,
+              ...translated,
               imageDir: captionDir,
-              ownerId: String(args?.owner_id || 'dsh'),
-              mouseMode: args?.mouse_mode,
+              ownerId: String(translated.ownerId || 'dsh'),
+              mouseMode: translated.mouseMode,
             });
-            observeLeaseArgs(args, result);
+            observeLeaseArgs(translated, result);
             return asToolResult(result);
           },
         },

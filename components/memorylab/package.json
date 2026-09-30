@@ -1,6 +1,6 @@
 {
   "name": "newmark2dsh-memorylab",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "description": "Newmark Core component: MemoryLab's durable store and the five memory_lab_* tools.",
