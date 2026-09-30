@@ -23,18 +23,6 @@
       name: 'newmark2dsh'
       config:
         root: ''
-    - id: newmark-memorylab
-      name: 'newmark2dsh-memorylab'
-      config:
-        root: ''
-        language: auto
-        # The display path rebuilds the index only when it is stale, so the steady
-        # state performs no write at all on a store Newmark also owns.
-        reindexOnRender: true
-    - id: newmark-computeruse
-      name: 'newmark2dsh-computeruse'
-      config:
-        leaseTtlMs: 120000
     - id: preset-dev
       name: '@deepseek-ai/dsh-agent-preset'
       config:

@@ -1324,6 +1324,212 @@ function readPageGlobals() {
           );
         }
 
+        /** Panel styles. Theme tokens only, so both colour schemes follow the shell. */
+        const CONFIG_CSS = `
+    .nmc-config { display: flex; flex-direction: column; gap: 10px; }
+    .nmc-config-head { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
+    .nmc-config-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+    .nmc-config-row {
+      display: grid;
+      grid-template-columns: 10px minmax(0, 1fr) auto auto;
+      grid-template-areas: "dot text state action" ". note note note";
+      align-items: center;
+      gap: 4px 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: var(--dsw-alias-bg-elevated);
+      border: 1px solid var(--dsw-alias-border-secondary);
+    }
+    .nmc-config-switch {
+      grid-area: action;
+      font: inherit;
+      font-size: 12px;
+      padding: 3px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      color: var(--dsw-alias-label-primary);
+      background: transparent;
+      border: 1px solid var(--dsw-alias-border-secondary);
+    }
+    .nmc-config-switch:hover:not(:disabled) { border-color: var(--dsw-alias-label-primary); }
+    .nmc-config-switch:disabled { opacity: 0.45; cursor: default; }
+    /* The plugin page has no slot for suppressing its own component rows: that section
+       is rendered unconditionally from the bundle's row list, and the "hidden" slots
+       filter the plugin LIST page, not a bundle's page.
+
+       An adjacent-sibling rule was tried first and did not work, which means the slot
+       renders this panel inside a wrapper and the rows section is not its sibling. So
+       this rule is unscoped instead, and its scoping comes from where the style tag
+       lives: the tag is rendered by this component, so it is in the DOM only while this
+       panel is mounted, and the plugin page shows one bundle at a time. No other
+       plugin's rows can be on screen while this rule is.
+
+       The panel above replaces what it hides: it names the components and carries their
+       switches, which those rows cannot do. */
+    [data-plugin-rows] { display: none; }
+    .nmc-config-dot { grid-area: dot; width: 8px; height: 8px; border-radius: 50%; background: var(--dsw-alias-label-tertiary); }
+    .nmc-config-on { background: var(--dsw-alias-state-success-primary, #38a06a); }
+    .nmc-config-text { grid-area: text; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .nmc-config-name { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
+    .nmc-config-role { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
+    .nmc-config-state { grid-area: state; font-size: 12px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+    .nmc-config-note { grid-area: note; font-size: 12px; color: var(--dsw-alias-label-tertiary); word-break: break-all; }
+    `;
+
+        /**
+         * The bundle's own configuration page.
+         *
+         * Registered into `plugins.bundle.config` under this package's name, which is the
+         * seat the plugin card renders on the bundle's page. It exists because the rows the
+         * card draws underneath are Loader bookkeeping — a row id and the module it resolved
+         * to — and a module path is not something a person can act on. Here the components
+         * appear by the names they are known by, each with the state that is true right now,
+         * read from the same page globals the rest of this half uses.
+         */
+        function NewmarkConfigPanel() {
+          const state = useMemoryLab();
+          const payload = state && typeof state.payload === 'object' ? state.payload : null;
+          const components = payload && typeof payload.components === 'object' && payload.components ? payload.components : {};
+          const lease = payload && typeof payload.computerUse === 'object' && payload.computerUse ? payload.computerUse : null;
+
+          // The Host half owns these switches, so what is shown is its answer — not the
+          // click. A switch that only echoed the click would be a label.
+          const [pending, setPending] = React.useState('');
+          const [applied, setApplied] = React.useState({});
+          const [loaded, setLoaded] = React.useState(false);
+
+          React.useEffect(() => {
+            let live = true;
+            fetch('/newmark-core/components')
+              .then((response) => response.json())
+              .then((result) => {
+                if (!live || !result || !Array.isArray(result.components)) return;
+                const next = {};
+                for (const entry of result.components) next[entry.name] = { ok: true, mounted: entry.mounted === true };
+                setApplied((current) => ({ ...current, ...next }));
+                setLoaded(true);
+              })
+              .catch(() => setLoaded(true));
+            return () => {
+              live = false;
+            };
+          }, []);
+
+          const toggle = (key, next) => {
+            setPending(key);
+            fetch('/newmark-core/components', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ component: key, enabled: next }),
+            })
+              .then((response) => response.json())
+              .then((result) => setApplied((current) => ({ ...current, [key]: result })))
+              .catch((error) => setApplied((current) => ({ ...current, [key]: { ok: false, error: String(error) } })))
+              .then(() => setPending(''));
+          };
+
+          const rows = [
+            {
+              key: 'core',
+              name: 'Newmark Core',
+              role: 'shared user store, page snapshot',
+              on: Boolean(payload),
+              note: payload && payload.root ? payload.root : 'no snapshot on this page',
+              switchable: false,
+            },
+            {
+              key: 'memoryLab',
+              name: 'MemoryLab',
+              role: 'durable memory, five memory_lab_* tools, sidebar renderer',
+              on: components.memoryLab === true,
+              note: components.memoryLab === true ? 'store mounted' : 'not loaded',
+              switchable: true,
+            },
+            {
+              key: 'computerUse',
+              name: 'ComputerUse',
+              role: '21 computer_use actions, native screen-wide takeover stroke',
+              on: components.computerUse === true,
+              note:
+                components.computerUse === true
+                  ? lease && lease.held
+                    ? 'lease held by ' + (lease.ownerId || 'unknown')
+                    : 'loaded, lease free'
+                  : 'not loaded',
+              switchable: true,
+            },
+            {
+              key: 'presetDev',
+              name: 'Dev preset',
+              role: 'agent preset this bundle declares and selects',
+              on: true,
+              note: 'declared by this bundle; the active preset is chosen in Settings',
+              switchable: true,
+            },
+          ];
+
+          return h(
+            'section',
+            { className: 'nmc-config' },
+            h('style', null, CONFIG_CSS),
+            h('div', { className: 'nmc-config-head' }, '组件'),
+            h(
+              'ul',
+              { className: 'nmc-config-list' },
+              ...rows.map((row) => {
+                const answer = applied[row.key];
+                const on = answer && answer.ok === true && typeof answer.mounted === 'boolean' ? answer.mounted : row.on;
+                const failed = answer && answer.ok === false;
+                return h(
+                  'li',
+                  { key: row.key, className: 'nmc-config-row' },
+                  h('span', { className: on ? 'nmc-config-dot nmc-config-on' : 'nmc-config-dot' }),
+                  h(
+                    'span',
+                    { className: 'nmc-config-text' },
+                    h('span', { className: 'nmc-config-name' }, row.name),
+                    h('span', { className: 'nmc-config-role' }, row.role),
+                  ),
+                  h('span', { className: 'nmc-config-state' }, failed ? '切换失败' : on ? '运行中' : '已关闭'),
+                  row.switchable
+                    ? h(
+                        'button',
+                        {
+                          className: 'nmc-config-switch',
+                          type: 'button',
+                          disabled: pending === row.key || !loaded,
+                          'aria-pressed': on,
+                          onClick: () => toggle(row.key, !on),
+                        },
+                        pending === row.key ? '…' : on ? '关闭' : '开启',
+                      )
+                    : null,
+                  h(
+                    'span',
+                    { className: 'nmc-config-note' },
+                    failed ? String(answer.error || 'failed') : row.note,
+                  ),
+                );
+              }),
+            ),
+          );
+        }
+
+        // ------------------------------------------------------------ the config page
+        //
+        // This bundle owns its own page. The rows the card draws are Loader
+        // bookkeeping: they name a row and the module it resolved to, which is the wrong
+        // thing to show a person. The names that matter are the components, and what
+        // matters about them is whether they are running — so they are rendered here, by
+        // their product names, from the same page globals the rest of this half reads.
+        ctx.effect(
+          () =>
+            ctx.slots.inject('plugins.bundle.config', () =>
+              ctx.slots.register({ name: 'plugins.bundle.config', key: 'newmark2dsh' }, NewmarkConfigPanel),
+            ),
+          'newmark-core-config-panel',
+        );
+
         // ComputerUse registers no sidebar entry, no panel and no overlay. The
         // takeover stroke is a native topmost click-through window that the Host half
         // owns and that covers the whole screen, because it must live outside the DSH
