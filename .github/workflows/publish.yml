@@ -1,0 +1,85 @@
+# Publish to npm when a version tag is pushed.
+#
+# Uses npm Trusted Publishing (OpenID Connect), so there is no token in this
+# repository and nothing to rotate. The workflow proves its identity to the npm
+# registry with the run's OIDC token, which is minted per job and expires with it.
+#
+# Configure the npm side once at
+#   https://www.npmjs.com/package/newmark2dsh/access  ->  Trusted Publisher
+#   Provider: GitHub Actions
+#   Repository: positer/newmark2dsh
+#   Workflow filename: publish.yml
+# The values must match this file exactly or the registry refuses the exchange.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag and `package.json` must agree: a tag can never publish a different
+# version than the one in the manifest, so a mistaken tag fails instead of
+# shipping something nobody asked for.
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# `id-token: write` is what mints the OIDC token. Without it the publish cannot
+# authenticate, and no other permission substitutes for it.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Deliberately no NODE_AUTH_TOKEN: a token here would override the OIDC
+      # exchange and quietly turn this back into a long-lived-secret workflow.
+
+      - name: The tag must match the manifest
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag does not match package.json version $version"
+            exit 1
+          fi
+          echo "publishing newmark2dsh $version"
+
+      # The two component packages live inside this bundle and are declared as its
+      # `file:` dependencies. If either manifest or any of their libraries is
+      # missing, the published tarball installs and then does nothing, so this is
+      # checked before publishing rather than discovered by a user.
+      - name: The bundle must be self-contained
+        run: |
+          set -eu
+          fail=0
+          for component in memorylab computeruse; do
+            manifest="components/$component/package.json"
+            [ -f "$manifest" ] || { echo "::error::missing $manifest"; fail=1; continue; }
+            node -e "
+              const fs = require('fs');
+              const m = JSON.parse(fs.readFileSync('$manifest', 'utf8'));
+              const root = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+              if (m.dsh?.client !== undefined) { console.error('$component must not declare dsh.client'); process.exit(1); }
+              if (root.dependencies?.[m.name] === undefined) { console.error('$component is not a declared dependency'); process.exit(1); }
+            " || fail=1
+          done
+          for f in index.js client.js cordis.patch.yml components/memorylab/lib/memory-store.js; do
+            [ -f "$f" ] || { echo "::error::missing $f"; fail=1; }
+          done
+          exit $fail
+
+      # A tag that reaches here publishes. `npm stage publish` is the alternative
+      # when a human approval step is wanted instead: it needs no 2FA and leaves
+      # the version staged until someone runs `npm stage approve <stage-id>`.
+      - name: Publish
+        run: npm publish --provenance --access public

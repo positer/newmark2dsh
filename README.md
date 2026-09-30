@@ -56,6 +56,35 @@ node scripts/verify-newmark-core-package.mjs    # publishable and self-contained
 node scripts/verify-memorylab-tools.mjs         # all five tools + their pre-exposure
 ```
 
+## Releasing
+
+Publishing is driven by a version tag, through **npm Trusted Publishing (OIDC)** — no
+token lives in this repository and there is nothing to rotate.
+
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+`.github/workflows/publish.yml` then checks that the tag and `package.json` agree,
+checks that the bundle is self-contained (both nested manifests present, both declared
+as dependencies, neither declaring `dsh.client`), and publishes with
+`--provenance`.
+
+One-time setup on the npm side, at
+<https://www.npmjs.com/package/newmark2dsh/access> → **Trusted Publisher**:
+
+| Field | Value |
+|---|---|
+| Provider | GitHub Actions |
+| Repository | `positer/newmark2dsh` |
+| Workflow filename | `publish.yml` |
+
+These must match the workflow exactly, or the registry refuses the OIDC exchange.
+
+A tag can never publish a version other than the one in `package.json`: the mismatch
+fails the run instead of shipping something nobody asked for.
+
 ## License
 
 Proprietary. See [LICENSE](LICENSE) — all rights reserved by Newmark AI, no licence
