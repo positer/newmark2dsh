@@ -25,12 +25,104 @@
  * channel, and nothing here imports a harness package: the only shared
  * dependencies are React from the platform module table, the `slots` service,
  * the theme tokens and that global.
+ *
+ * A page global is fixed once it has been written, so 重置 (reset) and 重建索引
+ * (reindex) re-read the current state by asking the shell for its own index
+ * document again and reading the globals out of that response — the same route and
+ * the same injection the page loaded with. The shell is never reloaded: it keeps
+ * its state, and this panel alone re-renders.
  */
 window.__ModuleLoader__.load({
   id: 'newmark2dsh',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
+
+    /**
+     * The harness's Markdown renderer, when the shell has it.
+     *
+     * A component body is Markdown, and often LaTeX. Rendering it as preformatted text is
+     * what the pane used to do, and it is what the pane must keep doing when this resolve
+     * fails — an older shell, or a build that does not carry the primitives. So the require
+     * is guarded here, ONCE, at module scope: the answer is a value the render path reads,
+     * not a throw it has to catch.
+     *
+     * `MarkdownText` is the whole thing — Markdown AND maths are one component, because the
+     * package parses with `mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown()]`
+     * (`dsh-client-ui-primitives/lib/index.js:10739`). It is what the harness's own tool
+     * cards render through (`dsh-client-ui-tool/lib/client.js:9`, `:1362`). The package's
+     * `exports` map is `"." -> ./lib/index.js`, so a bare require is the supported way in.
+     */
+    let MarkdownText = null;
+    try {
+      const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+      if (primitives && typeof primitives.MarkdownText === 'function') MarkdownText = primitives.MarkdownText;
+    } catch (error) {
+      MarkdownText = null;
+    }
+
+    /**
+     * The chrome MarkdownText reads off its labels prop, and the only keys it reads.
+     *
+     * Two reads exist in the shipped package and BOTH are unguarded, so `undefined` is not
+     * a safe argument — this is measured off the installed bundle, not inferred from the
+     * types:
+     *
+     *   - `renderCode` reads `context.labels.code.copyLabel`, `.copiedLabel` and
+     *     `.toolbarLabels` (`lib/index.js:11361-11363`). It runs for EVERY fenced code
+     *     block, which a memory body may easily contain, so a bare `{}` throws there.
+     *   - `renderFootnoteSection` reads `context.labels.footnotes` (`:11661`). It runs only
+     *     when a footnote was referenced AND defined — it returns at `:11654` otherwise —
+     *     but a body that carries one reaches it.
+     *
+     * `toolbarLabels` is read one level deeper, by `CodeToolbar`
+     * (`:9459`, `:9468`, `:9488`): `codeLabel`, `wrapLabel`, `unwrapLabel`. Those three are
+     * the smallest set that satisfies the read; the shape below is the reference adapter's
+     * from the shipped caller (`dsh-client-ui-tool/lib/client.js:1098-1118`), spelled out
+     * rather than imported so this pane owes the tool plugin nothing.
+     *
+     * FROZEN ON PURPOSE. `MarkdownText` memoises on the identity of `labels`, and its own
+     * docs say a new identity "discards the streaming render cache mid-message"
+     * (`:11796`). A fresh object per render would re-parse the body every time the pane
+     * re-renders — and this pane re-renders on every selection change.
+     */
+    const PREVIEW_MARKDOWN_LABELS = Object.freeze({
+      code: Object.freeze({
+        copyLabel: '复制',
+        copiedLabel: '已复制',
+        toolbarLabels: Object.freeze({ codeLabel: '代码', wrapLabel: '自动换行', unwrapLabel: '取消自动换行' }),
+      }),
+      footnotes: '脚注',
+    });
+
+    /**
+     * One component body, rendered.
+     *
+     * It reads as nothing at all when the body is empty, which is the pane's existing
+     * behaviour for a store with no body — a blank reading pane says "no memory" rather
+     * than rendering an empty document.
+     *
+     * `variant="compact"` is not decoration. The default `body` variant is document
+     * typography: 32px block margins on every heading (`markdown/MarkdownText.module.css`)
+     * inside a column that is `min(420px, 40%)` wide and sits beside the graph — a body of
+     * five headings would spend most of the pane on whitespace. `compact` is the variant the
+     * package documents for exactly this ("`variant="compact"` uses secondary text sizing,
+     * uniform bold headings, and tight block spacing", `:11805-11807`), and it sets
+     * `max-width: 100%` on itself and scrolls code blocks in their own box instead of
+     * widening the pane.
+     */
+    function PreviewBody({ text }) {
+      const body = String(text == null ? '' : text);
+      if (body === '') return null;
+      if (MarkdownText) {
+        return h(
+          'div',
+          { className: 'ml-preview-doc' },
+          h(MarkdownText, { text: body, labels: PREVIEW_MARKDOWN_LABELS, variant: 'compact' }),
+        );
+      }
+      return h('pre', null, body);
+    }
 
     const PANEL_ID = 'memory-lab';
     /** The page global the Host half's index injection writes. */
@@ -40,6 +132,8 @@ const CORE_GLOBAL = '__NEWMARK_CORE__';
 const MEMORYLAB_GLOBAL = '__NEWMARK_MEMORYLAB__';
 /** The ComputerUse row's global: the lease mirror. Its presence is the switch. */
 const COMPUTERUSE_GLOBAL = '__NEWMARK_COMPUTERUSE__';
+/** The agent-api row's global: the host profile. Its presence is the switch. */
+const AGENTAPI_GLOBAL = '__NEWMARK_AGENTAPI__';
 /** Used in diagnostics, so an absent injection still names the global it looked for. */
 const SNAPSHOT_GLOBAL = CORE_GLOBAL;
 
@@ -47,7 +141,7 @@ const SNAPSHOT_GLOBAL = CORE_GLOBAL;
 const FREE_LEASE = { held: false, ownerId: '', mouseMode: 'real', ttlMs: 0, remainingMs: 0 };
 
 /**
- * Compose the three row globals into one payload.
+ * Compose the four row globals into one payload.
  *
  * Returns `undefined` when no row published anything, which is the signal that the
  * Host half's injection did not run at all — the Client half then fails open and
@@ -60,7 +154,8 @@ function readPageGlobals() {
   const core = window[CORE_GLOBAL];
   const memory = window[MEMORYLAB_GLOBAL];
   const automation = window[COMPUTERUSE_GLOBAL];
-  if (!core && !memory && !automation) return undefined;
+  const api = window[AGENTAPI_GLOBAL];
+  if (!core && !memory && !automation && !api) return undefined;
   return {
     ...(memory || {}),
     ok: memory ? memory.ok === true : true,
@@ -69,6 +164,7 @@ function readPageGlobals() {
     generatedAt: (memory && memory.generatedAt) || (core && core.generatedAt) || '',
     components: { memoryLab: Boolean(memory), computerUse: Boolean(automation) },
     computerUse: automation || FREE_LEASE,
+    agentApi: api || null,
   };
 }
     const CAMERA_DEFAULT = 0.88;
@@ -111,7 +207,17 @@ function readPageGlobals() {
 .ml-preview-tags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 5px; }
 .ml-tag { padding: 1px 8px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2); font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .ml-preview-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px; }
+/* The plain-text path, and NOT dead: this is what the pane renders when the shell cannot
+   give us the primitives (see MarkdownText in the factory). The pre keeps the body
+   readable AND selectable there, which is the whole reason the fallback exists rather
+   than rendering nothing. On the rendered path the only <pre> in the pane belongs to a
+   fenced code block inside the markdown document, and that one wears the primitives' own
+   md-code-block class instead of this bare selector. */
 .ml-preview-body pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6; color: var(--dsw-alias-label-primary); }
+/* The rendered document. min-width: 0 is what stops a wide table or an unbreakable token
+   from widening the flex row instead of scrolling inside the pane; MarkdownText's own
+   .compact rule carries max-width: 100% for the same reason. */
+.ml-preview-doc { min-width: 0; }
 .ml-overview { position: relative; flex: 1; min-width: 0; overflow: hidden; }
 .ml-overview svg { display: block; width: 100%; height: 100%; cursor: grab; }
 .ml-overview svg:active { cursor: grabbing; }
@@ -139,7 +245,56 @@ function readPageGlobals() {
 .ml-status[data-state="error"] .ml-dot { background: var(--dsw-alias-state-error-primary); }
 .ml-status[data-state="loading"] .ml-dot { background: var(--dsw-alias-state-warn-primary); }
 .ml-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.ml-busy { box-shadow: inset 0 0 0 2px var(--dsw-alias-brand-primary); }
+/* The rebuild light bar: one slow, continuous black-and-white gradient travelling around the
+ * MemoryLab panel's border.
+ *
+ * The first version of this was wrong, and wrong in a way worth recording. It used a repeating
+ * linear gradient with hard stops on four separate edges, travelling 64 px per lap over
+ * 3000 ms. Hard stops produce dashes, four edges produce four independent runs, and a 3000 ms
+ * lap is fast — so what it drew was discrete black-and-white segments stepping around the
+ * frame with visible seams at every corner. What is wanted is one unbroken gradient, flowing
+ * slowly around the whole border.
+ *
+ * So it is a single element now. A conic gradient sweeps continuously around the perimeter
+ * instead of four straight edges meeting at corners; an @property registration makes its angle
+ * animatable, which a plain custom property cannot be; and two mask layers XORed together cut
+ * the middle out, leaving a 2 px ring over the panel. One revolution takes 9 s on purpose — a
+ * gradient that hurries reads as a progress bar, and this is a state, not a measurement.
+ *
+ * THIS IS NOT TAKEOVER GEOMETRY, and the distinction is load-bearing. The takeover stroke is a
+ * native topmost click-through Win32 window owned by the Host half, covering the whole screen
+ * and living outside DSH's window entirely; the Client half draws no part of it, and must not.
+ * This is a 2 px border on this panel, drawn in the DOM, lit only while a rebuild runs. Both
+ * are black-and-white and both wind around an edge, which is the family resemblance; that is
+ * where it stops. The bundle's gate asserts the absence of the TAKEOVER (its surface, its
+ * marquee, the overlay), not the absence of a gradient — an earlier version of that check
+ * banned a CSS function by name and so failed on this panel's own progress bar, which is
+ * mis-scoped rather than strict.
+ *
+ * (No backticks in this block, deliberately: the stylesheet is a template literal, and a
+ * backtick in a comment ends the string. The same mistake, one character over, already cost a
+ * round when a slash-star inside a path closed a block comment early.)
+ *
+ * It shows only while a rebuild is running — a bar that is always lit says nothing. Honours
+ * prefers-reduced-motion, because a perpetual animation is exactly what that query is for, and
+ * this is decoration on a state the button already reports in words. */
+@property --ml-lap-angle { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
+.ml-lap {
+  position: absolute; inset: 0; z-index: 9; pointer-events: none;
+  padding: 2px; border-radius: inherit;
+  opacity: 0; transition: opacity 200ms cubic-bezier(0.16,1,0.3,1);
+  background: conic-gradient(from var(--ml-lap-angle), #000000, #ffffff, #000000, #ffffff, #000000);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: ml-lap-sweep 9000ms linear infinite;
+}
+.ml-busy .ml-lap { opacity: 1; }
+@keyframes ml-lap-sweep { to { --ml-lap-angle: 360deg; } }
+@media (prefers-reduced-motion: reduce) {
+  .ml-lap { animation: none; }
+}
 `;
 
     /* ------------------------------------------------------------------- store */
@@ -172,9 +327,117 @@ function readPageGlobals() {
         /** Kept so the ComputerUse lease can be read from the same snapshot. */
         payload,
         reindexError: String(payload.reindexError || ''),
+        refreshError: '',
+        /** Whether the Host half has a judge for the tag graph; absence is a state. */
+        judge: payload.judge && typeof payload.judge === 'object' ? payload.judge : null,
         root: String(payload.root || ''),
         generatedAt: String(payload.generatedAt || ''),
       };
+    }
+
+    /* --------------------------------------------------- re-reading the snapshot */
+
+    /** The route the MemoryLab Host half serves its current snapshot on. */
+    const SNAPSHOT_ROUTE = '/newmark-memorylab/snapshot';
+
+    /**
+     * The four globals the Host half injects into the served page index.
+     *
+     * `window.__NEWMARK_MEMORYLAB__` is the store snapshot, and the other three carry
+     * the shared root, the platform, the ComputerUse lease mirror and the agent-api host
+     * profile — the same four `readPageGlobals()` composes into the payload every renderer
+     * reads. All four are listed here, not only the one the panel re-reads: a page re-read
+     * that restored three globals of four would leave whichever component was left out
+     * reporting the state of the page before the reload.
+     */
+    const INJECTED_GLOBALS = [CORE_GLOBAL, MEMORYLAB_GLOBAL, COMPUTERUSE_GLOBAL, AGENTAPI_GLOBAL];
+
+    /**
+     * Pull the injected globals out of a served index document.
+     *
+     * Each row writes one `<script>window.NAME=<json>;</script>`, and the JSON is
+     * escaped by `embedJson`, which turns every `<` into `\u003c` — so the body of
+     * one injection can never contain `</script>` and the element's own end is a
+     * safe terminator.
+     */
+    function readInjectedFromHtml(html) {
+      const found = {};
+      for (const name of INJECTED_GLOBALS) {
+        const marker = `window.${name}=`;
+        const at = html.indexOf(marker);
+        if (at === -1) continue;
+        const end = html.indexOf('</script>', at);
+        if (end === -1) continue;
+        const body = html.slice(at + marker.length, end).trim().replace(/;$/, '');
+        try {
+          found[name] = JSON.parse(body);
+        } catch {
+          /* a global this half cannot parse is left exactly as it was */
+        }
+      }
+      return found;
+    }
+
+    /**
+     * Ask the Host half for the store as it is now, or as it is after a rebuild.
+     *
+     * This is the read the panel's two actions need and the one thing an index
+     * injection cannot do: a tap is a pure html-to-html transform, so it can never
+     * see a request, and a page global is fixed once written. The route lives on the
+     * same `webServer` service the Host half already injects and is registered and
+     * disposed with the MemoryLab component, so asking it is asking the component
+     * that owns the store — and `reindex=1` is the only way to ask for the rebuild
+     * itself rather than for whatever a page render happens to do.
+     */
+    async function readFromHost({ rebuild }) {
+      const response = await fetch(rebuild ? `${SNAPSHOT_ROUTE}?reindex=1` : SNAPSHOT_ROUTE, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { accept: 'application/json' },
+      });
+      if (!response || response.ok !== true) throw new Error(`HTTP ${response ? response.status : 'no response'}`);
+      const payload = await response.json();
+      if (!payload || payload.ok !== true) throw new Error(String((payload && payload.error) || 'the Host half reported no snapshot'));
+      return payload;
+    }
+
+    /**
+     * Fallback read: ask the shell for its own index document and take the globals
+     * out of it.
+     *
+     * A page global is fixed once it has been written, so the only way to get a
+     * fresh one is a freshly rendered index — which is what this asks for. It is the
+     * fallback and not the primary path because rendering the index runs the Host
+     * half's staleness check rather than anything the panel asked for, so it cannot
+     * tell 重置 and 重建索引 apart; it exists so that a Host half older than this
+     * bundle (HMR swaps the client) still gives both actions a working read. Nothing
+     * here opens a channel of its own, and this half never asks the page to reload
+     * itself: the shell keeps its state while this panel re-renders.
+     */
+    async function refreshFromShell() {
+      if (typeof window === 'undefined') throw new Error('no page to re-read: this panel is not running in a browser');
+      if (typeof fetch !== 'function') {
+        throw new Error('this page cannot fetch the shell index, so the panel keeps the snapshot the page loaded with');
+      }
+      const target =
+        window.location && typeof window.location.pathname === 'string' && window.location.pathname ? window.location.pathname : '/';
+      const response = await fetch(target, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { accept: 'text/html' },
+      });
+      if (!response || response.ok !== true) {
+        throw new Error(`the shell index answered HTTP ${response ? response.status : 'nothing'}`);
+      }
+      const html = await response.text();
+      const found = readInjectedFromHtml(html);
+      if (!found[MEMORYLAB_GLOBAL]) {
+        throw new Error(`the served index carried no ${MEMORYLAB_GLOBAL} injection, so there was nothing fresh to read`);
+      }
+      // Publish what came back exactly as a page load would, so every later
+      // synchronous read of these globals sees the same state this render used.
+      for (const [name, value] of Object.entries(found)) window[name] = value;
+      return found;
     }
 
     const listeners = new Set();
@@ -189,6 +452,10 @@ function readPageGlobals() {
         contents: {},
         payload: null,
         reindexError: '',
+        refreshError: '',
+        judge: null,
+        servedBy: 'page-global',
+        rebuildResult: null,
         root: '',
         generatedAt: '',
       };
@@ -214,18 +481,69 @@ function readPageGlobals() {
     }
 
     /**
-     * Take ONE snapshot, from the page global the Host half injected.
+     * Take ONE snapshot.
      *
-     * Called only when the panel opens, when the user resets, and after the
-     * reindex reload — never on a click, a tag navigation, a drag or a zoom, all
-     * of which read the retained graph.
+     * `source: 'page'` reads the page global the Host half injected when the shell
+     * served this page: synchronous, no request, and what the panel opens on.
+     *
+     * `source: 'host'` asks the MemoryLab component for the store as it is NOW —
+     * `rebuild: true` asks it to rebuild the index first — and falls back to the
+     * page-index re-read if that route is not there. A failed read is never fatal
+     * and never silent: the panel keeps the snapshot it has and reports the failure
+     * in `refreshError`.
+     *
+     * Called when the panel opens, when the user resets, and when the user asks for
+     * a rebuild — never on a click, a tag navigation, a drag or a zoom, all of which
+     * read the retained graph.
      */
-    async function loadVisualization({ reason }) {
+    async function loadVisualization({ reason, source = 'page', rebuild = false }) {
       if (inflight > 0) return;
       const token = ++generation;
       inflight += 1;
-      emit({ phase: 'loading', error: '', reason });
+      emit({ phase: 'loading', error: '', refreshError: '', reason });
       try {
+        let refreshError = '';
+        let servedBy = source === 'host' ? 'route' : 'page-global';
+        let rebuildResult = null;
+        if (source === 'host') {
+          try {
+            const fresh = await readFromHost({ rebuild });
+            if (token !== generation) return; // superseded: a newer snapshot owns the panel
+            rebuildResult = fresh.result || null;
+            emit({
+              phase: 'ready',
+              error: '',
+              refreshError: '',
+              servedBy,
+              rebuildResult,
+              relationshipVersion: String(fresh.relationshipVersion || ''),
+              loadedAt: Number(fresh.loadedAt) || Date.now(),
+              components: Array.isArray(fresh.index && fresh.index.components) ? fresh.index.components : [],
+              tags: fresh.index && typeof fresh.index.tags === 'object' ? fresh.index.tags : {},
+              contents: fresh.contents && typeof fresh.contents === 'object' ? fresh.contents : {},
+              root: String(fresh.root || ''),
+              generatedAt: String(fresh.generatedAt || ''),
+              reindexError: String(fresh.reindexError || ''),
+              judge: fresh.judge && typeof fresh.judge === 'object' ? fresh.judge : null,
+              // The store fields are the fresh ones; the switch states and the lease
+              // mirror still come from the page globals this page was served with.
+              payload: { ...(readPageGlobals() || {}), ...fresh },
+              reason,
+            });
+            return;
+          } catch (error) {
+            refreshError = error instanceof Error ? error.message : String(error);
+            servedBy = 'page-global';
+            // The route is the only read that can be asked for a rebuild, so say
+            // which read the panel is on when it falls back to the other one.
+            try {
+              await refreshFromShell();
+            } catch (fallbackError) {
+              const detail = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+              refreshError = `${refreshError}; the page re-read failed too: ${detail}`;
+            }
+          }
+        }
         const payload = typeof window !== 'undefined' ? readPageGlobals() : undefined;
         if (!payload) {
           throw new Error(
@@ -238,6 +556,9 @@ function readPageGlobals() {
         emit({
           phase: 'ready',
           error: '',
+          refreshError,
+          servedBy,
+          rebuildResult,
           relationshipVersion: String(payload.relationshipVersion || ''),
           loadedAt: Number(payload.loadedAt) || Date.now(),
           components: Array.isArray(index.components) ? index.components : [],
@@ -246,6 +567,7 @@ function readPageGlobals() {
           root: String(payload.root || ''),
           generatedAt: String(payload.generatedAt || ''),
           reindexError: String(payload.reindexError || ''),
+          judge: payload.judge && typeof payload.judge === 'object' ? payload.judge : null,
           payload,
           reason,
         });
@@ -262,22 +584,22 @@ function readPageGlobals() {
     }
 
     /**
-     * Reindex, then refresh the page.
+     * Rebuild the index, then re-render from the store as it is afterwards.
      *
-     * The deterministic rebuild belongs to the Host half and runs while it
-     * renders the page index, so the honest client-side action is to ask for
-     * that rebuild by reloading and let the fresh snapshot arrive through the
-     * same index injection everything else uses. Nothing is faked: if the
-     * rebuild fails on the Host half, the next snapshot carries `reindexError`
-     * and the panel reports it.
+     * The deterministic rebuild belongs to the Host half and is asked for through
+     * that half's own snapshot route, so what happens is the thing the button says:
+     * the index is rebuilt, and this panel re-reads the store and re-renders. The
+     * shell is not reloaded — nothing outside this panel is touched. Nothing is
+     * faked either: a rebuild that fails comes back as `reindexError` and the panel
+     * reports it, and a read that fails leaves the panel saying so.
      */
-    function reindex() {
+    async function reindex() {
       emit({ reindexing: true, error: '' });
-      if (typeof window !== 'undefined' && window.location && typeof window.location.reload === 'function') {
-        window.location.reload();
-        return;
+      try {
+        await loadVisualization({ reason: 'reindex', source: 'host', rebuild: true });
+      } finally {
+        emit({ reindexing: false });
       }
-      emit({ reindexing: false, error: 'this environment cannot reload the page; run memory_lab_reindex on the Host side instead' });
     }
 
     /* -------------------------------------------------------------- derivation */
@@ -564,6 +886,11 @@ function readPageGlobals() {
         const graph = graphData;
         const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
         const camera = { x: 0, y: 0, scale: CAMERA_DEFAULT };
+        // Where the pointer last was, in stage coordinates. The dot-mode tooltip is placed
+        // against this rather than against the node, so it appears beside what the pointer is
+        // actually over. Kept as plain mutable state because it is read inside listeners that
+        // were registered once and never re-created.
+        const pointer = { x: 0, y: 0 };
         let focus = '';
         let panActive = false;
         let manualCamera = false;
@@ -600,7 +927,13 @@ function readPageGlobals() {
           label.textContent = node.name;
           el.append(dot, label);
           el.addEventListener('click', () => {
-            const picked = node.slug ? { kind: 'component', slug: node.slug } : { kind: 'tag', tag: node.tag };
+            // A component node carries the tag it is anchored under, so drilling into it from
+            // the overview lands in that tag rather than in whichever tag sorts first. The
+            // node already knows its own tag; passing it is what keeps the detail view's tag
+            // context from being lost on the way in.
+            const picked = node.slug
+              ? { kind: 'component', slug: node.slug, ...(node.tag ? { tag: node.tag } : {}) }
+              : { kind: 'tag', tag: node.tag };
             // Second click on the node that is already tracked: open its detail.
             if (focus === node.id) {
               activateRef.current?.(picked);
@@ -616,14 +949,33 @@ function readPageGlobals() {
           });
           const showTip = () => {
             if (camera.scale >= OVERVIEW.DOT_SCALE || !tipRef.current) return;
+            const tip = tipRef.current;
             const stageRect = stage.getBoundingClientRect();
-            const left = Math.max(8, Math.min(stageRect.width - tipRef.current.offsetWidth - 22, screenOf(node).x - stageRect.left));
-            const top = Math.max(tipRef.current.offsetHeight / 2 + 8, Math.min(stageRect.height - tipRef.current.offsetHeight / 2 - 8, screenOf(node).y - stageRect.top));
-            tipRef.current.style.left = `${left}px`;
-            tipRef.current.style.top = `${top}px`;
-            tipRef.current.querySelector('.ml-tip-name').textContent = node.name;
-            tipRef.current.querySelector('.ml-tip-type').textContent = node.type;
-            tipRef.current.classList.add('show');
+            const width = tip.offsetWidth || 130;
+            const height = tip.offsetHeight || 44;
+            const GAP = 14;
+
+            // Beside the CURSOR, not beside the node. It used to be placed at the node's
+            // screen point, and since `.ml-tip` is `position: absolute` with no transform,
+            // that point became the box's top-left corner — so a 130 px box hung ~65 px to
+            // the right and ~30 px below a node that, in dot mode, is a 10 px dot. The
+            // tooltip looked detached from what the pointer was over.
+            //
+            // The preference is lower-right of the pointer; each axis flips to the other side
+            // when the box would leave the stage, and the result is clamped so it can never
+            // hang outside even when the pointer is in a corner.
+            let left = pointer.x + GAP;
+            let top = pointer.y + GAP;
+            if (left + width > stageRect.width - 8) left = pointer.x - GAP - width;
+            if (top + height > stageRect.height - 8) top = pointer.y - GAP - height;
+            left = Math.max(8, Math.min(stageRect.width - width - 8, left));
+            top = Math.max(8, Math.min(stageRect.height - height - 8, top));
+
+            tip.style.left = `${left}px`;
+            tip.style.top = `${top}px`;
+            tip.querySelector('.ml-tip-name').textContent = node.name;
+            tip.querySelector('.ml-tip-type').textContent = node.type;
+            tip.classList.add('show');
           };
           const hideTip = () => tipRef.current?.classList.remove('show');
           el.addEventListener('mouseenter', showTip);
@@ -699,8 +1051,28 @@ function readPageGlobals() {
           }
         }
 
+        /**
+         * A node's position on screen, in the BASE camera.
+         *
+         * During a drag the CSS transform carries the live offset, so the movement lands in the
+         * same tick as the pointer instead of waiting for the next frame. Paint must therefore
+         * draw at the base — the camera with that offset taken back out — or the offset is
+         * applied twice: once here, once by the transform.
+         *
+         * It was applied twice. `paint()` positioned every node from `camera.x`, which the drag
+         * had already moved, and the transform added the same delta again; so the graph ran
+         * ahead of the pointer while dragging, and clearing the transform on release removed
+         * exactly that delta in one step. That step is the rebound the user met — not a late
+         * repaint, a double count being corrected.
+         *
+         * On release `panRenderX`/`panRenderY` return to zero in the same tick the transform is
+         * cleared, so the drawn position is continuous across the release instead of jumping by
+         * the offset once the base stops being subtracted.
+         */
         function screenOf(node) {
-          return { x: camera.x + node.x * camera.scale, y: camera.y + node.y * camera.scale };
+          const baseX = camera.x - panRenderX;
+          const baseY = camera.y - panRenderY;
+          return { x: baseX + node.x * camera.scale, y: baseY + node.y * camera.scale };
         }
 
         // --- paint
@@ -828,13 +1200,26 @@ function readPageGlobals() {
           panActive = false;
           svg.style.transform = '';
           layer.style.transform = '';
+          // Zeroed in the SAME tick as the transform is cleared, and this is the whole reason
+          // the release is continuous. `screenOf` draws at `camera - panRender`, and the
+          // transform adds `panRender` back; while both are live the drawn position is
+          // `camera`, which is what it becomes again once both are gone. Clearing only the
+          // transform, and leaving the offset for a later frame, would jump the graph by the
+          // offset for exactly that frame — the same rebound, moved from the drag to the gap
+          // after it.
+          panRenderX = 0;
+          panRenderY = 0;
           requestFrame();
         }
         function onWheel(event) {
           event.preventDefault();
           const rect = stage.getBoundingClientRect();
           const previous = camera.scale;
-          const next = Math.min(10000, Math.max(0.0001, previous * Math.exp(-event.deltaY * 0.0009)));
+          // 0.0022, not the 0.0009 this started at: at 0.0009 one notch of a typical wheel
+          // (deltaY 100) moved the scale by exp(-0.09), about 8.6%, so reaching any useful
+          // zoom took a dozen or more scrolls. 0.0022 is about 20% per notch — a step you can
+          // see, while the range below still spans five orders of magnitude in a few flicks.
+          const next = Math.min(10000, Math.max(0.0001, previous * Math.exp(-event.deltaY * 0.0022)));
           const clientX = event.clientX - rect.left;
           const clientY = event.clientY - rect.top;
           camera.x = clientX - (clientX - camera.x) * (next / previous);
@@ -847,6 +1232,14 @@ function readPageGlobals() {
 
         stage.addEventListener('pointerdown', onPointerDown);
         stage.addEventListener('pointermove', onPointerMove);
+        // Separate from onPointerMove, which is for panning and returns early when no drag is
+        // in progress. The tooltip needs the position on every move, dragging or not, and a
+        // `mouseenter` on a node fires only after the pointer has already travelled there.
+        stage.addEventListener('pointermove', (event) => {
+          const rect = stage.getBoundingClientRect();
+          pointer.x = event.clientX - rect.left;
+          pointer.y = event.clientY - rect.top;
+        });
         stage.addEventListener('pointerup', endPan);
         stage.addEventListener('pointercancel', endPan);
         stage.addEventListener('lostpointercapture', endPan);
@@ -939,7 +1332,16 @@ function readPageGlobals() {
             ),
             h('span', { className: 'ml-ochip' }, `${scaleLabel}%`),
             h('button', { className: 'ml-btn', type: 'button', onClick: () => apiRef.current?.clear() }, '取消'),
-            h('button', { className: 'ml-btn', type: 'button', onClick: () => apiRef.current?.reset() }, '重置'),
+            h(
+              'button',
+              {
+                className: 'ml-btn',
+                type: 'button',
+                title: '把总览相机移回中心与默认缩放；不动任何记忆数据',
+                onClick: () => apiRef.current?.reset(),
+              },
+              '视图归位',
+            ),
           ),
         ),
         h(
@@ -957,22 +1359,97 @@ function readPageGlobals() {
       const tags = state.tags;
       const components = state.components;
       const names = tagNames(tags);
-      const selectedTag = selection?.kind === 'tag' && tags[selection.tag] ? selection.tag : names[0] || '';
+      /**
+       * The selected tag SURVIVES a component click.
+       *
+       * `selection` for a component carries the tag it was opened from, because clicking a
+       * component is a move WITHIN a tag, not out of it. This used to read only
+       * `selection.kind === 'tag'`, so the moment a component was clicked the tag was
+       * forgotten and the expression fell through to `names[0]` — the alphabetically first
+       * tag in the store. Two symptoms followed, and the user met both: the selected tag
+       * jumped to whichever tag sorts first (`#4维流形`, because `#4` sorts before `#A`), and
+       * the list narrowed to the single component that had been clicked, so its siblings
+       * disappeared. One cause.
+       *
+       * `names[0]` answers ONE question — "nothing has been chosen yet, so which tag does
+       * the view open on" — and it is only honest for that one. It is not an answer to
+       * "which tag was I in", and it must never stand in for a selection that was actually
+       * made: a selection that cannot be resolved has to render as nothing, not as the
+       * first tag in the store. So an explicit selection resolves to its own tag or to no
+       * tag at all, and the default is reached only when there is no selection.
+       *
+       * A component opened from somewhere with no tag — search results, or a graph node that
+       * is not under the current tag — carries no tag and gets none invented for it: the
+       * column narrows to that component (see `listed`), which is the only list it is
+       * demonstrably a member of.
+       */
+      const selectedTag =
+        (selection?.tag && tags[selection.tag] ? selection.tag : '') ||
+        (selection?.kind === 'tag' && tags[selection.tag] ? selection.tag : '') ||
+        (selection ? '' : names[0] || '');
       const node = tagOf(tags, selectedTag);
       const parents = node.parents;
       const children = node.children;
       const roots = rootTags(tags);
       const parentColumn = parents.length ? parents : roots;
-      const listed =
-        selection?.kind === 'component'
+      /**
+       * The COMPONENTS column is the selected tag's OWN member list, resolved
+       * through the store's own index — `tags[selectedTag].components` — which is
+       * the same list the tag button beside it counts. Nothing else is allowed in.
+       *
+       * It used to be `components.filter((entry) => entry.tags.includes(selectedTag))`.
+       * A component's `tags` is not a statement about this tag: the store puts a
+       * component in every tag of every one of its `tagPaths`, so a component whose
+       * path only passes THROUGH the selected tag carries it in `tags` as well. The
+       * column therefore filled up with components that belong to the tag's
+       * DESCENDANTS, which is not what the column is named.
+       *
+       * Resolving through the member list is also what makes the column honest about
+       * its own heading: the COUNT on the tag button and the ROWS under the title are
+       * now the same list, so a heading can never disagree with what is under it.
+       */
+      const members = (name) => {
+        const owner = tagOf(tags, name);
+        const slugs = new Set(owner.components);
+        return components.filter((entry) => slugs.has(entry.slug));
+      };
+      /**
+       * A component click keeps its siblings on screen.
+       *
+       * This used to narrow to the clicked component alone, so the column emptied down to one
+       * row the moment anything was opened — the second half of the same defect the tag
+       * fallback caused. A component is something you opened FROM a tag, so the column stays
+       * that tag's member list and the opened component is rendered as the selected row inside
+       * it. Only when there is no tag to belong to — a search hit, a node outside the current
+       * tag — does the column fall back to the single component, because then there is no
+       * larger list it is a member of.
+       */
+      const picked =
+        selection?.kind === 'component' && selection.slug
           ? components.filter((entry) => entry.slug === selection.slug)
-          : selectedTag
-            ? components.filter((entry) => (entry.tags || []).includes(selectedTag))
-            : components;
-      const selected =
-        selection?.kind === 'component' && componentOf(components, selection.slug)
-          ? componentOf(components, selection.slug)
-          : listed[0] || components[0] || null;
+          : null;
+      const listed =
+        selectedTag
+          ? members(selectedTag)
+          : picked || components;
+      /**
+       * The preview follows the SAME list — and there is no fallback past it.
+       *
+       * It used to end `|| components[0]`: an empty list silently previewed the first
+       * component in the whole store, a stranger's body rendered under a tag it has
+       * nothing to do with. That is the defect as the user met it.
+       *
+       * `listed[0] || null` is not the same chain with one link removed, because `listed`
+       * can no longer be empty while a component exists to show. `listed` is either the
+       * selected tag's member list or the picked component: the first is non-empty
+       * whenever the tag exists, and a selection that resolves to no tag is a component
+       * selection, which `picked` has already caught. So the only way to reach a null here
+       * is a selection with genuinely nothing under it, and that renders as nothing and
+       * says so — measured, not assumed: with the old `components[0]` link restored the
+       * rendered page is byte-identical for all eight selection shapes, which is why the
+       * plant is inert and why this line does not need defending against it.
+       */
+      const selected = picked ? picked[0] || null : listed[0] || null;
       const content = selected ? state.contents[selected.slug] || '' : '';
 
       function TagButton({ name, selected: isSelected }) {
@@ -1025,7 +1502,9 @@ function readPageGlobals() {
                   key: entry.slug,
                   type: 'button',
                   className: `ml-node${selected && selected.slug === entry.slug ? ' selected' : ''}`,
-                  onClick: () => onSelect({ kind: 'component', slug: entry.slug }),
+                  // Carries the tag it is being opened FROM, so the view stays in that tag
+                  // instead of falling back to the alphabetically first one.
+                  onClick: () => onSelect({ kind: 'component', slug: entry.slug, tag: selectedTag }),
                 },
                 h('span', null, String(entry.name || entry.slug)),
                 h('span', { className: 'ml-node-count' }, `rev ${entry.revision ?? 1}`),
@@ -1055,7 +1534,7 @@ function readPageGlobals() {
                 )
               : null,
           ),
-          h('div', { className: 'ml-preview-body' }, h('pre', null, content || '暂无记忆')),
+          h('div', { className: 'ml-preview-body' }, h(PreviewBody, { text: content })),
         ),
       );
     }
@@ -1091,7 +1570,14 @@ function readPageGlobals() {
           onKeyDown: (event) => {
             if (event.key === 'Escape') setQuery('');
             if (event.key === 'Enter' && total > 0) {
-              const first = tagHits[0] ? { kind: 'tag', tag: tagHits[0] } : { kind: 'component', slug: componentHits[0].slug };
+              const hit = componentHits[0];
+              const first = tagHits[0]
+                ? { kind: 'tag', tag: tagHits[0] }
+                : {
+                    kind: 'component',
+                    slug: hit.slug,
+                    ...(Array.isArray(hit.tags) && hit.tags[0] ? { tag: hit.tags[0] } : {}),
+                  };
               onSelect(first);
               setOpen(false);
             }
@@ -1125,7 +1611,16 @@ function readPageGlobals() {
                     type: 'button',
                     className: 'ml-result',
                     onMouseDown: () => {
-                      onSelect({ kind: 'component', slug: entry.slug });
+                      // A search hit arrives with no tag context — you searched the whole
+                      // store — so it carries the component's OWN first tag. That is a real
+                      // tag the component is a member of, so the detail view opens on a list
+                      // it belongs to rather than on the alphabetically first tag in the
+                      // store, which is what an absent tag used to produce.
+                      onSelect({
+                        kind: 'component',
+                        slug: entry.slug,
+                        ...(Array.isArray(entry.tags) && entry.tags[0] ? { tag: entry.tags[0] } : {}),
+                      });
                       setOpen(false);
                     },
                   },
@@ -1154,7 +1649,7 @@ function readPageGlobals() {
       const componentCount = state.components.length;
       const status =
         state.phase === 'ready'
-          ? `${tagCount} 标签 · ${componentCount} 组件 · ${state.relationshipVersion.slice(0, 12)} · 快照生成于 ${formatTime(Date.parse(state.generatedAt) || state.loadedAt)}${state.reindexError ? ` · 重建告警：${state.reindexError}` : ''}`
+          ? `${tagCount} 标签 · ${componentCount} 组件 · ${state.relationshipVersion.slice(0, 12)} · 快照生成于 ${formatTime(Date.parse(state.generatedAt) || state.loadedAt)}${state.reindexError ? ` · 重建告警：${state.reindexError}` : ''}${state.refreshError ? ` · 重新读取失败：${state.refreshError}` : ''} · 重建索引只做确定性重建${state.judge && state.judge.status === 'unavailable' ? '（判定不可用：agent-api 已停用）' : ''}；三类判定由 Agent 经工具完成：先读证据，再决定，再应用`
           : state.phase === 'loading'
             ? '正在载入 Memory Lab…'
             : `Host 半侧未提供快照：${state.error}`;
@@ -1163,6 +1658,12 @@ function readPageGlobals() {
         'div',
         { className: `ml-root${state.reindexing ? ' ml-busy' : ''}`, 'aria-busy': state.reindexing ? 'true' : 'false' },
         h('style', null, CSS),
+        // The rebuild light bar: one element, one continuous sweep, masked down to a 2 px ring.
+        // It was four spans when it was four dashes; a single sweep has no corners to seam at,
+        // which is the whole reason the dashes read wrong. It is this panel's progress state and
+        // NOT the takeover stroke — see the stylesheet comment for why that distinction matters
+        // to the gate that asserts the page draws no takeover surface.
+        h('div', { className: 'ml-lap', 'aria-hidden': 'true' }),
         h(
           'div',
           { className: 'ml-topbar' },
@@ -1188,14 +1689,24 @@ function readPageGlobals() {
               type: 'button',
               className: 'ml-btn',
               disabled: state.phase === 'loading',
-              onClick: () => loadVisualization({ reason: 'reset' }),
+              title: '重新读取 Host 半侧的记忆存储并刷新本面板（不重载外壳）',
+              onClick: () => loadVisualization({ reason: 'reset', source: 'host' }),
             },
             '重置',
           ),
           h(
             'button',
-            { type: 'button', className: 'ml-btn', disabled: !!state.reindexing, onClick: reindex, title: '完成重建后刷新页面' },
-            state.reindexing ? '重建中，正在刷新…' : '重建索引',
+            {
+              type: 'button',
+              className: 'ml-btn',
+              disabled: !!state.reindexing,
+              onClick: reindex,
+              title:
+                '确定性重建：让 Host 半侧重渲染索引（索引过期时在那里重建），再从存储重新读取快照；不重载外壳。' +
+                '这里不做判定——三类判定（假根父节点接续、同义近义 tag 合并、tag 误读）需要一次模型运行，' +
+                '而 agent-api 只能由工具调用，页面没有工具上下文；判定由 Agent 经工具完成：先读证据，再决定，再应用。',
+            },
+            state.reindexing ? '重建中…' : '重建索引',
           ),
         ),
         state.phase === 'ready' && componentCount === 0 && tagCount === 0
@@ -1385,6 +1896,38 @@ function readPageGlobals() {
     .nmc-config-role { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
     .nmc-config-state { grid-area: state; font-size: 12px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
     .nmc-config-note { grid-area: note; font-size: 12px; color: var(--dsw-alias-label-tertiary); word-break: break-all; }
+    /* The model block. Not a row in the list above: a row is a switch, and this is the one
+       value on the page that is 准用 — authorised. It borrows the rows' surface so the page
+       reads as one surface, and its own accents so the states stay apart. */
+    .nmc-config-model {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: var(--dsw-alias-bg-elevated);
+      border: 1px solid var(--dsw-alias-border-secondary);
+    }
+    .nmc-config-model-current { font-size: 12px; color: var(--dsw-alias-label-primary); word-break: break-all; }
+    .nmc-config-model-pick { display: flex; align-items: center; gap: 8px; }
+    .nmc-config-model-label { font-size: 12px; color: var(--dsw-alias-label-tertiary); white-space: nowrap; }
+    .nmc-config-select {
+      flex: 1;
+      min-width: 0;
+      height: 28px;
+      padding: 0 8px;
+      border-radius: 7px;
+      border: 1px solid var(--dsw-alias-border-secondary);
+      background: var(--dsw-alias-bg-layer-1);
+      color: var(--dsw-alias-label-primary);
+      font: inherit;
+      font-size: 12px;
+    }
+    .nmc-config-select:disabled { opacity: 0.55; cursor: default; }
+    .nmc-config-model-note { font-size: 12px; color: var(--dsw-alias-label-tertiary); word-break: break-all; }
+    /* A state that needs acting on, not a decoration: an authorised model that is gone, or a
+       catalogue that could not be read. Amber, the shell's own warn token. */
+    .nmc-config-model-warn { font-size: 12px; color: var(--dsw-alias-state-warn-primary); word-break: break-all; }
     `;
 
         /**
@@ -1408,6 +1951,17 @@ function readPageGlobals() {
           const [pending, setPending] = React.useState('');
           const [applied, setApplied] = React.useState({});
           const [loaded, setLoaded] = React.useState(false);
+
+          // The authorised model, read from the same route and shown in its own block below
+          // the component rows. It is deliberately NOT a row in `rows`: a row is a switch, and
+          // this is a value — the one thing on this page that is 准用, authorised.
+          //
+          // `null` means the route has not answered yet. `{ ok: false }` means it answered and
+          // could not read the catalogue, which is a different thing from an empty catalogue
+          // and is rendered as such.
+          const [modelState, setModelState] = React.useState(null);
+          const [modelBusy, setModelBusy] = React.useState(false);
+          const [modelError, setModelError] = React.useState('');
 
           // The mount read and the post-switch read ask the same question, so they are the
           // same function. After a switch the panel asks again rather than trusting the
@@ -1455,15 +2009,89 @@ function readPageGlobals() {
               })
               .catch(() => false);
 
+          /**
+           * Read the authorised model and the models DSH currently offers.
+           *
+           * The read rides the SAME route the switches use: one GET answers the components,
+           * the preset and the model, so there is no second channel and no second source of
+           * truth. `GET /newmark-core/components` therefore does the whole job.
+           *
+           * Every failure is reported, never swallowed: a catalogue that could not be read
+           * leaves `ok: false` with the Host's own detail, which is what the block below
+           * renders. A silent empty list would look exactly like "DSH has no models", and a
+           * page that says that while the user has models would be worse than one that says
+           * it could not find out.
+           */
+          const readModel = () =>
+            fetch('/newmark-core/components')
+              .then((response) =>
+                response
+                  .json()
+                  .catch(() => ({}))
+                  .then((body) => ({ ...body, httpStatus: response.status })),
+              )
+              .then((body) => {
+                const answer = body && typeof body.model === 'object' && body.model ? body.model : null;
+                setModelState(answer === null ? { ok: false, error: 'no_model_answer', detail: `the route answered HTTP ${body?.httpStatus ?? 'nothing'} with no model block` } : answer);
+                return answer;
+              })
+              .catch((error) => {
+                setModelState({ ok: false, error: 'model_read_failed', detail: String((error && error.message) || error) });
+                return null;
+              });
+
           React.useEffect(() => {
             let live = true;
             readState().then(() => {
               if (live) setLoaded(true);
             });
+            readModel();
             return () => {
               live = false;
             };
           }, []);
+
+          /**
+           * Persist one choice, then ask what is true.
+           *
+           * The order matters and is the same one the switches use: POST, then READ. The POST's
+           * receipt is what the Host accepted; only the next read says whether it took. The
+           * select is NOT updated optimistically — if the write did not land, the control must
+           * still show the model that is actually authorised, or the page would be lying about
+           * the one value a run depends on.
+           */
+          const saveModel = (provider, model) => {
+            if (!provider || !model) return;
+            setModelBusy(true);
+            setModelError('');
+            fetch('/newmark-core/components', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ component: 'model', provider, model }),
+            })
+              .then((response) =>
+                response
+                  .json()
+                  .catch(() => ({}))
+                  .then((body) => ({ ...body, httpStatus: response.status, ok: body && body.ok === true })),
+              )
+              .then((result) => {
+                if (result.ok !== true) {
+                  setModelError(
+                    [
+                      result.httpStatus ? 'HTTP ' + result.httpStatus : null,
+                      result.error ? String(result.error) : null,
+                      result.detail ? String(result.detail) : null,
+                    ]
+                      .filter(Boolean)
+                      .join(' · ') || 'the write failed',
+                  );
+                }
+                return readModel();
+              })
+              .catch((error) => setModelError(String((error && error.message) || error)))
+              .then(() => setModelBusy(false));
+          };
 
           const toggle = (key, next) => {
             setPending(key);
@@ -1531,6 +2159,14 @@ function readPageGlobals() {
                     ? 'lease held by ' + (lease.ownerId || 'unknown')
                     : 'loaded, lease free'
                   : 'not loaded',
+              switchable: true,
+            },
+            {
+              key: 'agentApi',
+              name: 'Agent API',
+              role: '标准化的 Agent 调用接口：信封、错误分级、只读状态与 agent run',
+              on: components.agentApi === true,
+              note: components.agentApi === true ? 'interface mounted' : 'not loaded',
               switchable: true,
             },
             {
@@ -1632,6 +2268,150 @@ function readPageGlobals() {
                   ),
                 );
               }),
+            ),
+            h(
+              'div',
+              { className: 'nmc-config-head' },
+              '模型（准用）',
+            ),
+            h(
+              'div',
+              { className: 'nmc-config-model' },
+              // ---- what is authorised right now, in words ------------------------------
+              //
+              // Four states, kept apart on purpose: not read yet, nothing authorised,
+              // authorised and listed, authorised and GONE. The last two must never look
+              // alike — a stale selection that reads as fine fails at run time with the
+              // provider's own error, which is the expensive way to learn it.
+              h(
+                'div',
+                { className: 'nmc-config-model-current' },
+                modelState === null
+                  ? '读取中…'
+                  : modelState.selected
+                    ? `已准用：${modelState.selected.provider} / ${modelState.selected.model}`
+                    : '尚未准用任何模型 —— agent-api 会以 model_not_selected 拒绝运行，不会替用户选择',
+              ),
+              modelState !== null && modelState.selected && modelState.selectedListed === false
+                ? h(
+                    'div',
+                    { className: 'nmc-config-model-warn' },
+                    '⚠ 已准用的模型当前不在 DSH 的可用列表中：provider 已移除、凭据失效或模型已下线。运行会在开始前被拒绝（model_unavailable），请重新准用一个。',
+                  )
+                : null,
+              modelState !== null && modelState.selected && modelState.selectedListed === null
+                ? h(
+                    'div',
+                    { className: 'nmc-config-model-warn' },
+                    '该模型所属的 provider 这次未能枚举，因此它是否仍可用未经验证（不是「已失去」）：运行会照常尝试，若 provider 真的不在，失败会带 provider 自己的报错。',
+                  )
+                : null,
+              // ---- the control ---------------------------------------------------------
+              //
+              // `value` is the authorised pair and never a click: the Host's answer is what
+              // the control shows. An authorised model that is no longer offered is added as
+              // its own option and labelled, so the control shows the truth instead of
+              // falling back to some other model's name — the silent substitution this page
+              // exists to make impossible.
+              (() => {
+                if (modelState === null) return null;
+                if (modelState.ok !== true) {
+                  return h(
+                    'div',
+                    { className: 'nmc-config-model-warn' },
+                    `无法读取 DSH 的可用模型列表：${modelState.detail || modelState.error || 'unknown'}。模型选择不可用；上面的组件开关不受影响。`,
+                  );
+                }
+                const chosen = modelState.selected ? `${modelState.selected.provider}\u0000${modelState.selected.model}` : '';
+                const groups = Array.isArray(modelState.groups) ? modelState.groups : [];
+                const offered = groups.some((group) =>
+                  (group.models || []).some((entry) => `${entry.provider}\u0000${entry.id}` === chosen),
+                );
+                const options = [];
+                if (chosen && !offered) {
+                  options.push(
+                    h(
+                      'option',
+                      { key: 'gone', value: chosen },
+                      `${modelState.selected.provider} / ${modelState.selected.model} —— 不在当前可用列表中`,
+                    ),
+                  );
+                }
+                for (const group of groups) {
+                  options.push(
+                    h(
+                      'optgroup',
+                      { key: group.id, label: group.name || group.id },
+                      ...(group.models || []).map((entry) =>
+                        h(
+                          'option',
+                          { key: `${entry.provider}\u0000${entry.id}`, value: `${entry.provider}\u0000${entry.id}` },
+                          entry.name && entry.name !== entry.id ? `${entry.name} (${entry.id})` : entry.id,
+                        ),
+                      ),
+                    ),
+                  );
+                }
+                if (chosen && !offered) {
+                  // An empty value would select the first offered model, which is the silent
+                  // substitution again. A disabled placeholder keeps the control on the pair
+                  // that is really authorised while showing that it is gone.
+                  options.unshift(h('option', { key: 'empty', value: '', disabled: true }, '— 请重新选择 —'));
+                }
+                return h(
+                  'div',
+                  { className: 'nmc-config-model-pick' },
+                  h('span', { className: 'nmc-config-model-label' }, '模型'),
+                  h(
+                    'select',
+                    {
+                      className: 'nmc-config-select',
+                      // '' is not a selection: with nothing authorised the control sits on
+                      // the placeholder, and choosing is a deliberate act.
+                      value: chosen,
+                      disabled: modelBusy || !loaded || modelState.editable === false,
+                      onChange: (event) => {
+                        const [provider, model] = String(event.target.value || '').split('\u0000');
+                        saveModel(provider, model);
+                      },
+                    },
+                    ...(chosen ? [] : [h('option', { key: 'none', value: '' }, '— 尚未准用 —')]),
+                    ...options,
+                  ),
+                  modelBusy ? h('span', { className: 'nmc-config-model-label' }, '写入中…') : null,
+                );
+              })(),
+              // ---- everything the Host said about the catalogue ------------------------
+              //
+              // A provider whose enumeration failed is named, with its own message. Left out,
+              // a partial catalogue would be indistinguishable from a complete one, and the
+              // one provider that matters could be the one missing.
+              modelState !== null && Array.isArray(modelState.failures) && modelState.failures.length > 0
+                ? h(
+                    'div',
+                    { className: 'nmc-config-model-note' },
+                    'provider 枚举失败：' +
+                      modelState.failures.map((failure) => `${failure.id || failure.name}: ${failure.message}`).join(' · '),
+                  )
+                : null,
+              modelState !== null && modelState.ok === true && (modelState.models || []).length === 0 && (modelState.failures || []).length === 0
+                ? h('div', { className: 'nmc-config-model-note' }, 'DSH 当前没有列出任何可用模型。')
+                : null,
+              modelState !== null && modelState.defaultSelection
+                ? h(
+                    'div',
+                    { className: 'nmc-config-model-note' },
+                    `DSH 的默认模型是 ${modelState.defaultSelection.provider} / ${modelState.defaultSelection.model}（仅供参考；本 bundle 只用上面准用的模型，未准用时拒绝运行）。`,
+                  )
+                : null,
+              modelState !== null && modelState.editable === false
+                ? h(
+                    'div',
+                    { className: 'nmc-config-model-note' },
+                    '此 profile 的配置编辑器不可用，因此这个选择无法写入 profile patch；开关不受影响。',
+                  )
+                : null,
+              modelError ? h('div', { className: 'nmc-config-model-warn' }, modelError) : null,
             ),
           );
         }

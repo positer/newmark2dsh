@@ -1,6 +1,6 @@
 {
   "name": "newmark2dsh",
-  "version": "0.1.6",
+  "version": "0.2.2",
   "type": "module",
   "description": "Newmark Core for DeepSeek Harness：一个插件包携带 Newmark 的 MemoryLab、ComputerUse 与 Dev 智能体预设，共用 ~/.Newmark 用户库，各组件可在插件页独立启用。",
   "meta": {

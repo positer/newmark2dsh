@@ -125,6 +125,43 @@ export const PLAN_BRAND = 'memorylab-plan-v1';
 export const FIELD_WEIGHTS = Object.freeze({ name: 12, tags: 9, description: 6, content: 2 });
 
 /**
+ * The tag-graph repairs that need a judgement the deterministic rebuild cannot
+ * make. Each one is REVIEWED (reported with its evidence) and then, if the caller
+ * decides so, APPLIED as a recorded decision — never applied by a rule.
+ */
+export const TAG_FINDING_KINDS = Object.freeze([
+  /** A root tag the components that carry it already file under some other tag. */
+  'false-root',
+  /** Tags whose names are near-duplicates, near-synonyms or the same idea twice. */
+  'synonym-candidate',
+  /** One stored name that may be a chain the normalizer collapsed into a tag. */
+  'single-tag-path',
+  /** A parent -> child edge whose joined spelling exists: maybe one tag, not two. */
+  'path-might-be-one-tag',
+  /** A stored value today's rule does not reproduce (grandfathering, or drift). */
+  'rule-not-reproducible',
+]);
+
+/** How many findings one review returns unless the caller asks for another window. */
+export const DEFAULT_TAG_FINDING_LIMIT = 25;
+
+/** Hard cap on `limit`, so a review can never dump an unbounded graph. */
+export const MAX_TAG_FINDING_LIMIT = 200;
+
+/**
+ * The tag-graph decisions `applyTagDecisions()` accepts. `merge`, `reparent`,
+ * `split` and `join` are the four repairs; `set-tags` and `unfold` exist so an
+ * applied decision can be reversed exactly (see the `undo` in every receipt).
+ */
+export const TAG_DECISION_KINDS = Object.freeze(['merge', 'reparent', 'split', 'join', 'set-tags', 'unfold']);
+
+/** The `action` every tag-graph decision batch records in `policy.jsonl`. */
+export const TAG_EDIT_ACTION = 'TAG-EDIT';
+
+/** Where a pre-change index snapshot is archived, beside the revision archives. */
+export const TAG_ARCHIVE_DIR = '_tag-graph';
+
+/**
  * Bilingual synonym table. Every group folds to ONE canonical tag; the other
  * spellings are preserved in that tag node's `aliases`. `options.language`
  * (`'zh'` | `'en'`) selects which spelling of a group is canonical.
@@ -472,6 +509,50 @@ function notFoundError(selector) {
   return new MemoryLabStoreError('NOT_FOUND', `Memory component not found: ${selector}`, { selector });
 }
 
+/**
+ * The shape of a tag name with every separator removed, so `#AI-Agent`,
+ * `#ai agent` and `#AI_Agent` compare equal. The reviews use it to find names
+ * that are near-duplicates; it never rewrites a name.
+ */
+function nameShape(value) {
+  return String(value ?? '')
+    .replace(/^#+/, '')
+    .toLowerCase()
+    .replace(/[\s\-_.·/|+,，、;:]+/g, '');
+}
+
+/** Levenshtein distance, bounded: the review only tests whether it is <= 2. */
+function editDistance(a, b, limit = 3) {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) >= limit) return limit;
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    if (Math.min(...current) >= limit) return limit;
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+/**
+ * Whether a name survives the input parser as exactly one tag node.
+ *
+ * `splitLegacyPath()` splits `/`, `>` and `→`, and `splitTagValue()` splits the
+ * comma family, so a name carrying any of them can never come back as one tag:
+ * the next rebuild would split it again. `join` refuses such a target by name
+ * rather than writing a name that silently becomes two tags.
+ */
+function survivesAsOneTag(name) {
+  const text = String(name ?? '');
+  if (!text || normalizeTagName(text) !== text) return false;
+  if (/[/>,，、;\n|]/.test(text)) return false;
+  const parts = splitLegacyPath(text);
+  return parts.length === 1 && parts[0] === text;
+}
+
 function pathEscapeError(candidate, root) {
   return new MemoryLabStoreError('PATH_ESCAPE', `Path escapes the Memory Lab root: ${candidate}`, {
     candidate: String(candidate ?? ''),
@@ -631,6 +712,7 @@ export class MemoryLabStore {
       'memory_lab_query is bounded task-relevant retrieval: prefer it over injecting the whole index.',
       'memory_lab_update creates or replaces a component; pass expectedUpdatedAt from the latest read so a stale write is rejected instead of overwriting newer memory.',
       'For small edits prefer contentAppend or oldText/newText over resending the whole body. memory_lab_delete forgets a component only when the user asks.',
+      'memory_lab_reindex is the deterministic rebuild; memory_lab_tag_review reports the tag-graph repairs that need your judgement (near-synonyms, a false root, a collapsed or over-split path) and memory_lab_tag_apply records the decisions you make from it, reversibly.',
       'Tag names carry one leading "#"; a tag that stands alone still gets its own single-node tagPath. Express hierarchy with tagPaths, for example [["#研究","#论文"]].',
       'Every revision is archived under archive/<slug>/ and every mutation appends one policy.jsonl line (action, slug, reason, source, timestamps, archive path, content hash) — never memory content.',
       'Never inject index or component content into the system prompt; retrieve it through these tools only when needed.',
@@ -902,10 +984,18 @@ export class MemoryLabStore {
    * group is therefore left untouched, with no invented aliases: the real store
    * keeps every one of its 91 tag names.
    */
-  tagAliasGroups(rawIndex) {
+  tagAliasGroups(rawIndex, options = {}) {
+    /**
+     * Spellings an applied `unfold` decision has taken back out of the fold
+     * table. Without this the alias a `merge` wrote would be re-observed from the
+     * stored node on every later rebuild, so undoing a merge would silently fail:
+     * the restored spelling would canonicalise straight back into the merged tag.
+     */
+    const dropKeys = new Set((options.aliasDrops || []).map((name) => comparisonKey(name)));
+    const dropped = (name) => dropKeys.has(comparisonKey(name));
     const observed = new Map();
     const add = (key, name) => {
-      if (!key || !name) return;
+      if (!key || !name || dropped(name)) return;
       if (!observed.has(key)) observed.set(key, new Set());
       observed.get(key).add(name);
     };
@@ -933,11 +1023,13 @@ export class MemoryLabStore {
     for (const [key, names] of observed) {
       const all = sortedUnique(Array.from(names));
       if (all.length < 2) continue;
-      const pool = sortedUnique([...all, ...(SYNONYM_GROUPS_BY_KEY.get(key) || [])]);
-      const canonical = this.chooseCanonicalTag(pool, new Set(all));
+      const pool = sortedUnique([...all, ...(SYNONYM_GROUPS_BY_KEY.get(key) || [])]).filter((name) => !dropped(name));
+      if (pool.length < 2) continue;
+      const canonical = this.chooseCanonicalTag(pool, new Set(all.filter((name) => !dropped(name))));
       canonicalByGroup.set(canonical, pool.filter((name) => name !== canonical));
       for (const name of pool) aliasIndex.set(comparisonKey(name), canonical);
     }
+    for (const key of dropKeys) aliasIndex.delete(key);
     return { aliasIndex, canonicalByGroup };
   }
 
@@ -1085,6 +1177,10 @@ export class MemoryLabStore {
    *
    * Existing key order is preserved so that reindexing the real store reorders
    * nothing; new tags and components are appended in code-unit order.
+   *
+   * `options.aliasHints` adds the fold links an applied `merge` decided on;
+   * `options.aliasDrops` removes the links an applied `unfold` decided against.
+   * Both are per-call: nothing about them is stored outside the index they write.
    */
   normalizeIndex(rawIndex, options = {}) {
     const warnings = [];
@@ -1097,7 +1193,9 @@ export class MemoryLabStore {
       throw new MemoryLabStoreError('INDEX_MALFORMED', 'Memory Lab index.json has a non-object "components" field.', {});
     }
 
-    const { aliasIndex, canonicalByGroup } = this.tagAliasGroups(raw);
+    const { aliasIndex, canonicalByGroup } = this.tagAliasGroups(raw, {
+      aliasDrops: options && Array.isArray(options.aliasDrops) ? options.aliasDrops : [],
+    });
     // Fold hints carried by the update that produced this index (see prepareUpdate).
     for (const hint of options && Array.isArray(options.aliasHints) ? options.aliasHints : []) {
       if (!hint || typeof hint !== 'object' || !hint.canonical) continue;
@@ -1933,6 +2031,884 @@ export class MemoryLabStore {
     };
   }
 
+  // -- tag graph judgement --------------------------------------------------
+  //
+  // `reindex()` is a rule: it folds the spellings the built-in table names, keeps
+  // every tagPath it was handed, and drops tags no component references. Three
+  // things a tag graph needs are NOT rules and never can be:
+  //
+  //   * 假根父节点接续 — a root tag whose components are already filed under some
+  //     other tag. Nothing in the data says whether that is wrong; only a reader of
+  //     the memories can say.
+  //   * 同义近义 tag 合并 — near-synonyms outside the built-in table (`#Harness`
+  //     and `#Harness工程` are one idea to a reader and two tags to the fold table,
+  //     which folds only the spellings it lists and only when two are observed).
+  //   * 未被正确解析的 tag — a name the input parser collapsed into one tag
+  //     (`AI Agent 协作` -> `#AI-Agent-协作`), or a `/` it split into a path that
+  //     was really one tag (`CI/CD` -> `#CI` -> `#CD`). `splitLegacyPath()` has to
+  //     decide at write time and cannot know which of the two it is looking at.
+  //
+  // So the judgement is the CALLER's, and the store's job is to put the facts in
+  // front of it (`tagReview()`, read-only) and to record and reverse what it
+  // decides (`applyTagDecisions()`). Nothing here rewrites a tag as a side effect
+  // of a read, and nothing here invents a decision.
+
+  /**
+   * The tag graph as a review reads it: names in index order, each node with the
+   * components that really carry it, and each component with its tagPaths.
+   */
+  tagGraphView(index) {
+    const tags = index && index.tags && typeof index.tags === 'object' && !Array.isArray(index.tags) ? index.tags : {};
+    const names = Object.keys(tags);
+    const components = componentList(index && index.components);
+    const bySlug = new Map(components.map((component) => [String(component.slug), component]));
+    const membersOf = (name) => {
+      const node = tags[name] || {};
+      return sortedUnique(toArray(node.components)).filter((slug) => bySlug.has(slug));
+    };
+    return { tags, names, components, bySlug, membersOf };
+  }
+
+  /** Every tag name any component references, in tags or in a tagPath node. */
+  referencedTagNames(index) {
+    const referenced = new Set();
+    for (const component of componentList(index && index.components)) {
+      for (const name of this.normalizeTagInput(toArray(component.tags), toArray(component.tagPaths)).tags) referenced.add(name);
+    }
+    return referenced;
+  }
+
+  /** A finding: the facts, the question they raise, and the decisions that answer it. */
+  tagFinding(id, kind, question, evidence, options) {
+    return { id, kind, question, evidence, options };
+  }
+
+  /**
+   * Why two tag names might be one tag. Facts, never a verdict.
+   *
+   * Only a NAME reason raises a candidate. Two tags sharing a component is normal
+   * — a memory carries many tags — so on its own it raises nothing; it is reported
+   * beside the candidate as the fact that decides whether the merge is worth it.
+   */
+  synonymReasons(a, b, membersA, membersB) {
+    const reasons = [];
+    const shapeA = nameShape(a);
+    const shapeB = nameShape(b);
+    if (shapeA && shapeA === shapeB) {
+      reasons.push('the two names are identical once case and separators are removed');
+    } else if (shapeA && shapeB && (shapeA.includes(shapeB) || shapeB.includes(shapeA))) {
+      reasons.push('one name contains the other');
+    } else {
+      const distance = editDistance(shapeA, shapeB);
+      // Character closeness is only evidence inside one script: a CJK name and a
+      // latin one that differ by two characters are two unrelated names, and
+      // treating them as near-duplicates merged whole graphs into one cluster.
+      if (isCjk(a) === isCjk(b) && Math.min(shapeA.length, shapeB.length) >= 5 && distance <= 2) {
+        reasons.push(`the names differ by ${distance} character(s)`);
+      }
+    }
+    const shared = membersA.filter((slug) => membersB.includes(slug));
+    if (!reasons.length && isCjk(a) !== isCjk(b)) {
+      const union = sortedUnique([...membersA, ...membersB]).length;
+      // Two memories have to use both tags, and together they have to account for
+      // at least half of the union: one component carrying a CJK tag and a latin
+      // one is the normal shape of a memory, not a duplicate spelling.
+      if (shared.length >= 2 && union >= 2 && shared.length / union >= 0.5) {
+        reasons.push('the components that use them are the same, in different scripts');
+      }
+    }
+    return { reasons, shared };
+  }
+
+  /**
+   * One review pass over the tag graph: the five finding kinds above, each with
+   * the evidence needed to decide and the decision shapes that would apply it.
+   *
+   * READ-ONLY. It loads the index, folds nothing, writes nothing and creates no
+   * directory: a review of a store that has never been written still writes
+   * nothing (`loadIndex()` on a missing index returns the empty index in memory).
+   */
+  tagReview(options = {}) {
+    const loaded = this.loadIndex();
+    if (!loaded.ok) throw new MemoryLabStoreError(loaded.error.code, loaded.error.message, loaded.error.details);
+    const index = loaded.index;
+    const graph = this.tagGraphView(index);
+    const unknown = sortedUnique(options && Array.isArray(options.kinds) ? options.kinds.map(String) : []).filter(
+      (kind) => !TAG_FINDING_KINDS.includes(kind),
+    );
+    if (unknown.length) {
+      throw new MemoryLabStoreError('UNKNOWN_FINDING_KIND', `Unknown tag review kind(s): ${unknown.join(', ')}`, {
+        kinds: unknown,
+        known: TAG_FINDING_KINDS.slice(),
+      });
+    }
+    const wanted = options && Array.isArray(options.kinds) && options.kinds.length ? new Set(options.kinds.map(String)) : null;
+    const wants = (kind) => !wanted || wanted.has(kind);
+    const findings = [];
+    const members = new Map(graph.names.map((name) => [name, graph.membersOf(name)]));
+    const referenced = this.referencedTagNames(index);
+
+    /* 1. false roots ------------------------------------------------------- */
+
+    if (wants('false-root')) {
+      for (const root of graph.names) {
+        const node = graph.tags[root] || {};
+        if (toArray(node.parents).length) continue;
+        const own = members.get(root) || [];
+        if (!own.length) continue; // an unreferenced node is finding 5, not this one
+        const descendants = new Set();
+        const walk = (name) => {
+          for (const child of toArray((graph.tags[name] || {}).children)) {
+            if (descendants.has(child)) continue;
+            descendants.add(child);
+            walk(child);
+          }
+        };
+        walk(root);
+        const support = new Map();
+        const note = (parent, via) => {
+          if (parent === root || descendants.has(parent)) return;
+          if (!support.has(parent)) support.set(parent, new Set());
+          support.get(parent).add(via);
+        };
+        for (const name of graph.names) {
+          if (name === root) continue;
+          const other = members.get(name) || [];
+          const shared = other.filter((slug) => own.includes(slug));
+          if (!shared.length || shared.length / own.length < 0.5) continue;
+          const parents = toArray((graph.tags[name] || {}).parents);
+          // A tag that is itself a root is a candidate parent too: two roots can be
+          // two halves of one hierarchy (`#数学` beside `#研究`).
+          for (const parent of parents.length ? parents : [name]) note(parent, name);
+        }
+        const candidates = Array.from(support.entries())
+          .map(([tag, via]) => ({ tag, sharedComponents: own.slice(), supportingTags: sortedUnique(Array.from(via)) }))
+          .sort((a, b) => b.supportingTags.length - a.supportingTags.length || compareStrings(a.tag, b.tag))
+          .slice(0, 6);
+        if (!candidates.length) continue;
+        findings.push(
+          this.tagFinding(
+            `false-root:${root}`,
+            'false-root',
+            `Is ${root} a true root, or does it continue under one of the candidate parents?`,
+            {
+              tag: root,
+              components: own,
+              childTags: sortedUnique(toArray(node.children)),
+              candidates,
+              why: [
+                `every component carrying ${root} also carries tags that already place them under ${candidates[0].tag}`,
+                `${root} has no parent in any component tagPath, so a rebuild keeps it a root until something says otherwise`,
+              ],
+            },
+            candidates.map((candidate) => ({ kind: 'reparent', tag: root, under: candidate.tag })),
+          ),
+        );
+      }
+    }
+
+    /* 2. synonym candidates ------------------------------------------------ */
+
+    if (wants('synonym-candidate')) {
+      const pairs = new Map();
+      for (let i = 0; i < graph.names.length; i += 1) {
+        for (let j = i + 1; j < graph.names.length; j += 1) {
+          const a = graph.names[i];
+          const b = graph.names[j];
+          const { reasons } = this.synonymReasons(a, b, members.get(a) || [], members.get(b) || []);
+          if (!reasons.length) continue;
+          pairs.set(`${a}\u0000${b}`, { a, b, reasons });
+        }
+      }
+      // Group the pairs into clusters, so a stem used by six tags is one finding
+      // with six members instead of fifteen pairwise ones.
+      const parent = new Map(graph.names.map((name) => [name, name]));
+      const find = (name) => {
+        let current = name;
+        while (parent.get(current) !== current) current = parent.get(current);
+        return current;
+      };
+      for (const pair of pairs.values()) {
+        const rootA = find(pair.a);
+        const rootB = find(pair.b);
+        if (rootA !== rootB) parent.set(rootA, rootB);
+      }
+      const clusters = new Map();
+      for (const name of graph.names) {
+        const key = find(name);
+        if (!clusters.has(key)) clusters.set(key, []);
+        clusters.get(key).push(name);
+      }
+      for (const cluster of clusters.values()) {
+        if (cluster.length < 2) continue;
+        const ranked = cluster
+          .slice()
+          .sort((a, b) => (members.get(b) || []).length - (members.get(a) || []).length || compareStrings(a, b));
+        const membersOfCluster = ranked.map((tag) => ({
+          tag,
+          components: members.get(tag) || [],
+          count: (members.get(tag) || []).length,
+          aliases: sortedUnique(toArray((graph.tags[tag] || {}).aliases)),
+          parents: sortedUnique(toArray((graph.tags[tag] || {}).parents)),
+        }));
+        const reasons = sortedUnique(
+          Array.from(pairs.values())
+            .filter((pair) => ranked.includes(pair.a) && ranked.includes(pair.b))
+            .flatMap((pair) => pair.reasons.map((reason) => `${pair.a} / ${pair.b}: ${reason}`)),
+        ).slice(0, 12);
+        // What the deterministic fold would call this group if it ever saw it: the
+        // language-preferred, shortest spelling. A merge into anything else lasts,
+        // but a later plain rebuild moves the spelling here — the receipt says so.
+        const stableInto = this.chooseCanonicalTag(ranked, new Set(ranked));
+        findings.push(
+          this.tagFinding(
+            `synonym-candidate:${ranked.map((name) => name.replace(/^#/, '')).join('|').slice(0, 80)}`,
+            'synonym-candidate',
+            'Are these one tag? If so, which spelling is canonical, and is that decision worth the rewrite?',
+            {
+              tags: membersOfCluster,
+              aliases: Object.fromEntries(membersOfCluster.map((entry) => [entry.tag, entry.aliases])),
+              why: reasons,
+              stableInto,
+              stableIntoWhy:
+                'the deterministic fold keeps the language-preferred shortest spelling of a group; a merge in another direction stays merged but the next plain reindex moves the spelling here',
+            },
+            [
+              ...ranked.filter((name) => name !== stableInto).map((name) => ({ kind: 'merge', tags: [name], into: stableInto })),
+              ...ranked
+                .filter((name) => name !== ranked[0])
+                .map((name) => ({ kind: 'merge', tags: ranked.filter((other) => other !== name), into: name })),
+              { kind: 'none', note: 'leave them as separate tags' },
+            ],
+          ),
+        );
+      }
+    }
+
+    /* 3. one name that may be a chain -------------------------------------- */
+
+    if (wants('single-tag-path')) {
+      for (const name of graph.names) {
+        const bare = name.replace(/^#/, '');
+        const separators = ['/', '>', '→', ',', '，', '、', ';', '|', '::', '_'].filter((separator) => bare.includes(separator));
+        const hyphenParts = bare.includes('-')
+          ? bare
+              .split('-')
+              .filter(Boolean)
+              .map((part) => ({ part: `#${part}`, isTag: Boolean(graph.tags[`#${part}`]) }))
+          : [];
+        let prefixTag = '';
+        let remainder = '';
+        for (const other of graph.names.slice().sort((a, b) => b.length - a.length || compareStrings(a, b))) {
+          if (other === name) continue;
+          const head = other.replace(/^#/, '');
+          if (!head || bare.length <= head.length || !bare.startsWith(head)) continue;
+          const tail = bare.slice(head.length);
+          if (!isCjk(tail)) continue;
+          prefixTag = other;
+          remainder = tail;
+          break;
+        }
+        const namedParts = hyphenParts.some((part) => part.isTag);
+        if (!separators.length && !namedParts && !prefixTag) continue;
+        const options = [];
+        if (prefixTag) options.push({ kind: 'split', tag: name, into: [prefixTag, `#${remainder}`] });
+        if (namedParts) options.push({ kind: 'split', tag: name, into: hyphenParts.map((part) => part.part) });
+        options.push({ kind: 'none', note: 'keep the name as one tag' });
+        findings.push(
+          this.tagFinding(
+            `single-tag-path:${name}`,
+            'single-tag-path',
+            `Is ${name} one tag, or a chain the parser collapsed into one name?`,
+            {
+              tag: name,
+              components: members.get(name) || [],
+              separators,
+              parts: hyphenParts,
+              prefixTag,
+              remainder,
+              parents: sortedUnique(toArray((graph.tags[name] || {}).parents)),
+              why: [
+                'a tag name cannot carry "/", ">" or ",": the input parser splits them, so a name holding one was written outside the parser',
+                ...(prefixTag ? [`${name} starts with ${prefixTag}, which is already a tag of its own`] : []),
+                ...(namedParts ? ['the hyphen-separated parts include names that are already tags'] : []),
+                'the normalizer turns a space into a hyphen, so `A B` and `A-B` are the same stored name and only a reader can tell them apart',
+              ],
+            },
+            options,
+          ),
+        );
+      }
+    }
+
+    /* 4. a chain that may be one tag --------------------------------------- */
+
+    if (wants('path-might-be-one-tag')) {
+      for (const name of graph.names) {
+        for (const child of sortedUnique(toArray((graph.tags[name] || {}).children))) {
+          const bareParent = name.replace(/^#/, '');
+          const bareChild = String(child).replace(/^#/, '');
+          const joined = [`#${bareParent}${bareChild}`, `#${bareParent}-${bareChild}`].filter((candidate) => graph.tags[candidate]);
+          if (!joined.length) continue;
+          const own = sortedUnique([...(members.get(name) || []), ...(members.get(child) || [])]);
+          findings.push(
+            this.tagFinding(
+              `path-might-be-one-tag:${name}>${child}`,
+              'path-might-be-one-tag',
+              `Is ${name} > ${child} a chain, or is it the single tag ${joined[0]}?`,
+              {
+                chain: [name, child],
+                existingTags: joined,
+                components: own,
+                why: [
+                  `${joined.join(' and ')} already exists as a tag, spelled exactly like the two nodes joined`,
+                  'the input parser splits "/" and ">" into a chain, so a single tag written with one becomes two nodes',
+                ],
+              },
+              [...joined.map((into) => ({ kind: 'join', path: [name, child], into })), { kind: 'none', note: 'keep the chain' }],
+            ),
+          );
+        }
+      }
+    }
+
+    /* 5. stored values today's rule does not reproduce --------------------- */
+
+    if (wants('rule-not-reproducible')) {
+      for (const name of graph.names) {
+        if (referenced.has(name)) continue;
+        findings.push(
+          this.tagFinding(
+            `rule-not-reproducible:tag:${name}`,
+            'rule-not-reproducible',
+            `${name} is indexed but no component references it: keep it, or let the rebuild drop it?`,
+            {
+              storedKind: 'tag',
+              stored: name,
+              rule: 'a rebuild builds the tag dictionary from the components it indexes',
+              ruleYields: 'dropped',
+              components: [],
+              why: ['a deterministic rebuild drops every tag node no component references, so this node does not survive one'],
+            },
+            [
+              {
+                kind: 'none',
+                note: 'informational: memory_lab_tag_apply cannot keep an unreferenced tag; a component would have to reference it',
+              },
+            ],
+          ),
+        );
+      }
+      for (const component of graph.components) {
+        const slug = String(component.slug);
+        const produced = slugify(String(component.name ?? slug));
+        if (produced === slug) continue;
+        findings.push(
+          this.tagFinding(
+            `rule-not-reproducible:slug:${slug}`,
+            'rule-not-reproducible',
+            `${slug} is stored under a slug today's rule does not produce from its name: keep it, or bring it back onto the rule?`,
+            {
+              storedKind: 'component-slug',
+              stored: slug,
+              name: String(component.name ?? ''),
+              rule: 'slugify(name)',
+              ruleYields: produced,
+              components: [slug],
+              why: [
+                'a rebuild preserves a stored slug verbatim, so the divergence is grandfathered rather than repaired by a reindex',
+                'renaming a component slug is not one of the decisions memory_lab_tag_apply accepts',
+              ],
+            },
+            [{ kind: 'none', note: 'informational: every rebuild preserves the slug and no tag decision renames it' }],
+          ),
+        );
+      }
+    }
+
+    /* the window ----------------------------------------------------------- */
+
+    const limit = clampInt(options && options.limit, DEFAULT_TAG_FINDING_LIMIT, 1, MAX_TAG_FINDING_LIMIT);
+    const offset = Math.max(0, Math.floor(Number(options && options.offset) || 0));
+    const order = new Map(TAG_FINDING_KINDS.map((kind, index) => [kind, index]));
+    findings.sort((a, b) => (order.get(a.kind) ?? 99) - (order.get(b.kind) ?? 99) || compareStrings(a.id, b.id));
+    const counts = {};
+    for (const kind of TAG_FINDING_KINDS) counts[kind] = findings.filter((finding) => finding.kind === kind).length;
+    const page = findings.slice(offset, offset + limit);
+    return {
+      ok: true,
+      root: this.root,
+      indexPath: this.indexPath,
+      loadedAt: isoNow(),
+      relationshipVersion: String(index.relationshipVersion || ''),
+      counts: { tags: graph.names.length, components: graph.components.length, findings: findings.length, byKind: counts },
+      findings: page,
+      window: { offset, limit, returned: page.length, total: findings.length, omitted: Math.max(0, findings.length - offset - page.length) },
+      warnings: sortedUnique(loaded.warnings),
+      instructions: [
+        'A review reports candidates and their evidence; it never rewrites a tag. Decide each finding yourself and pass the decisions you accept to memory_lab_tag_apply.',
+        'A finding whose only option is {"kind":"none"} is informational: no apply decision can act on it.',
+      ],
+    };
+  }
+
+  /**
+   * Apply the tag-graph decisions a caller made from a review.
+   *
+   * Everything a decision changes lives in `index.json` — the component markdown
+   * files hold no tags — so this rewrites the components' `tags`/`tagPaths` in the
+   * index, renormalizes and writes once. Before it writes it archives the current
+   * `index.json` verbatim under `archive/<TAG_ARCHIVE_DIR>/`, and it appends one
+   * `policy.jsonl` line carrying the decisions, every affected component's
+   * previous tags/tagPaths, the archive path and an `undo` list that restores the
+   * previous graph. Reversal is therefore mechanical, not a reconstruction.
+   *
+   * `dryRun` computes exactly the same answer and writes nothing.
+   */
+  applyTagDecisions(input = {}) {
+    const decisions = Array.isArray(input && input.decisions) ? input.decisions : null;
+    if (!decisions || !decisions.length) {
+      throw new MemoryLabStoreError('INVALID_DECISION', 'applyTagDecisions() needs at least one decision.', {
+        kinds: TAG_DECISION_KINDS.slice(),
+      });
+    }
+    const dryRun = input && input.dryRun === true;
+    const index = this.openForWrite();
+    const expected = input && input.expectedRelationshipVersion ? String(input.expectedRelationshipVersion).trim() : '';
+    if (expected && expected !== String(index.relationshipVersion || '')) {
+      throw new MemoryLabStoreError('STALE_WRITE', 'The tag graph changed since it was reviewed.', {
+        expectedRelationshipVersion: expected,
+        storedRelationshipVersion: String(index.relationshipVersion || ''),
+        action: TAG_EDIT_ACTION,
+      });
+    }
+
+    const components = componentList(index.components);
+    const bySlug = new Map(components.map((component) => [String(component.slug), component]));
+    const nodeNames = new Set(Object.keys(index.tags || {}));
+    const before = new Map();
+    const remember = (component) => {
+      const slug = String(component.slug);
+      if (before.has(slug)) return;
+      before.set(slug, {
+        tags: sortedUnique(toArray(component.tags)),
+        tagPaths: toArray(component.tagPaths)
+          .filter(Array.isArray)
+          .map((chain) => chain.map(String)),
+      });
+    };
+    const name = (value) => normalizeTagName(value);
+    const requireTag = (tag, field) => {
+      const cleaned = name(tag);
+      if (!cleaned) throw new MemoryLabStoreError('INVALID_DECISION', `${field} must name a tag.`, { field, value: String(tag) });
+      if (!nodeNames.has(cleaned)) {
+        throw new MemoryLabStoreError('NOT_FOUND', `Tag not found in the index: ${cleaned}`, { field, tag: cleaned });
+      }
+      return cleaned;
+    };
+    /**
+     * Resolve a tag name that may currently be spelled as one of a node's aliases.
+     *
+     * A fold can move a group's surviving spelling to the language-preferred one on
+     * the next read, so the name a receipt recorded can come back as an alias of the
+     * node it named. Resolution keeps an `unfold` working across that move — without
+     * it, undoing a merge into a longer spelling failed with NOT_FOUND.
+     */
+    const resolveNode = (tag) => {
+      const cleaned = name(tag);
+      if (!cleaned) return null;
+      if (nodeNames.has(cleaned)) return cleaned;
+      for (const candidate of nodeNames) {
+        if (sortedUnique(toArray(((index.tags || {})[candidate] || {}).aliases)).includes(cleaned)) return candidate;
+      }
+      return null;
+    };
+    const descendantOf = (candidate, subject) => {
+      const seen = new Set();
+      const walk = (current) => {
+        if (current === candidate) return true;
+        if (seen.has(current)) return false;
+        seen.add(current);
+        const node = (index.tags || {})[current] || {};
+        return toArray(node.children).some((child) => walk(child));
+      };
+      return walk(subject);
+    };
+    const writeTags = (component, tags, tagPaths) => {
+      remember(component);
+      const normalized = this.normalizeTagInput(sortedUnique(tags), tagPaths);
+      component.tags = normalized.tags;
+      component.tagPaths = normalized.tagPaths;
+    };
+    const rewrite = (component, mapTag) => {
+      const tags = sortedUnique(toArray(component.tags).map(mapTag));
+      const paths = [];
+      for (const chain of toArray(component.tagPaths).filter(Array.isArray)) {
+        const mapped = [];
+        for (const node of chain) {
+          const next = mapTag(String(node));
+          if (mapped.length && mapped[mapped.length - 1] === next) continue;
+          mapped.push(next);
+        }
+        if (mapped.length) paths.push(mapped);
+      }
+      return { tags, tagPaths: paths };
+    };
+
+    const applied = [];
+    const skipped = [];
+    const aliasHints = [];
+    const aliasDrops = [];
+    const warnings = [];
+
+    for (const raw of decisions) {
+      const decision = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+      const kind = decision ? String(decision.kind || '') : '';
+      if (!decision || !TAG_DECISION_KINDS.includes(kind)) {
+        throw new MemoryLabStoreError('UNKNOWN_DECISION', `Unknown tag decision: ${kind || '(none)'}`, {
+          decision: raw,
+          known: TAG_DECISION_KINDS.slice(),
+        });
+      }
+
+      if (kind === 'merge') {
+        const into = requireTag(decision.into, 'into');
+        const from = sortedUnique(toArray(decision.tags).map((tag) => name(tag))).filter((tag) => tag && tag !== into);
+        if (!from.length) throw new MemoryLabStoreError('INVALID_DECISION', 'merge needs the tags to fold away from.', { decision });
+        for (const tag of from) requireTag(tag, 'tags');
+        const keys = new Set(from.map((tag) => comparisonKey(tag)));
+        const affected = [];
+        for (const component of components) {
+          const mentions = this.normalizeTagInput(toArray(component.tags), toArray(component.tagPaths)).tags.some((tag) =>
+            keys.has(comparisonKey(tag)),
+          );
+          if (!mentions) continue;
+          const { tags, tagPaths } = rewrite(component, (tag) => (keys.has(comparisonKey(tag)) ? into : tag));
+          writeTags(component, tags, tagPaths);
+          affected.push(String(component.slug));
+        }
+        if (!affected.length) {
+          skipped.push({ kind, into, tags: from, why: 'no component carries those tags, so nothing changed' });
+          continue;
+        }
+        const stableInto = this.chooseCanonicalTag(sortedUnique([into, ...from]), new Set(sortedUnique([into, ...from])));
+        /**
+         * A fold link is only recorded when the store's own spelling rule would keep
+         * `into` as the group's name. The rule picks the language-preferred shortest
+         * spelling on every read, so a link in the other direction would move the
+         * group's name (and `relationshipVersion`) on the next rebuild, and would
+         * re-spell the components that had used the canonical one — which no undo
+         * could put back. Without the link the merge is a plain, exact rewrite.
+         */
+        const linked = stableInto === into;
+        if (linked) aliasHints.push({ canonical: into, names: from });
+        else {
+          warnings.push(
+            `merge-direction:${from.join('+')}->${into}: no fold link recorded, because the spelling rule would move this group to ${stableInto} on the next rebuild; the components are rewritten, and a later write using ${from.join('/')} starts a new tag`,
+          );
+        }
+        applied.push({ kind, into, tags: from, linked, affected });
+        continue;
+      }
+
+      if (kind === 'reparent') {
+        const tag = requireTag(decision.tag, 'tag');
+        const under = requireTag(decision.under, 'under');
+        if (under === tag) throw new MemoryLabStoreError('TAG_CYCLE', `A tag cannot be its own parent: ${tag}`, { tag, under });
+        if (descendantOf(tag, under)) {
+          throw new MemoryLabStoreError('TAG_CYCLE', `${tag} is already inside ${under}; continuing ${under} under it would close a cycle.`, {
+            tag,
+            under,
+          });
+        }
+        const affected = [];
+        for (const component of components) {
+          const state = this.normalizeTagInput(toArray(component.tags), toArray(component.tagPaths));
+          if (!state.tags.includes(tag)) continue;
+          // Every chain that STARTS at the root tag now starts at its parent; a
+          // chain that already nests it deeper is left exactly as it is.
+          const paths = [];
+          for (const chain of state.tagPaths) {
+            const mapped = chain[0] === tag ? [under, ...chain] : chain.slice();
+            if (mapped.length) paths.push(mapped);
+          }
+          // A component can carry the tag without any chain through it; it then
+          // needs the one chain that gives the tag its parent.
+          if (!paths.some((chain) => chain.includes(tag))) paths.push([under, tag]);
+          writeTags(component, state.tags, paths);
+          affected.push(String(component.slug));
+        }
+        if (!affected.length) {
+          skipped.push({ kind, tag, under, why: 'no component carries that tag, so nothing changed' });
+          continue;
+        }
+        applied.push({ kind, tag, under, affected });
+        continue;
+      }
+
+      if (kind === 'set-tags') {
+        const slug = String(decision.slug || '').trim();
+        const component = bySlug.get(slug) || components.find((entry) => String(entry.name || '') === slug);
+        if (!component) throw new MemoryLabStoreError('NOT_FOUND', `Memory component not found: ${slug}`, { slug });
+        const tags = toArray(decision.tags)
+          .map((tag) => name(tag))
+          .filter(Boolean);
+        const tagPaths = toArray(decision.tagPaths)
+          .filter(Array.isArray)
+          .map((chain) => chain.map((node) => name(node)).filter(Boolean));
+        // A restore reintroduces tag names the change it reverses had removed, so a
+        // name that is not a node yet is allowed — and named, because it means this
+        // call is creating one rather than restoring one.
+        const fresh = sortedUnique([...tags, ...tagPaths.flat()]).filter((tag) => !nodeNames.has(tag));
+        if (fresh.length) warnings.push(`set-tags:${component.slug}: reintroduces ${fresh.join(', ')}`);
+        writeTags(component, tags, tagPaths);
+        applied.push({ kind, slug: String(component.slug), reintroduced: fresh, affected: [String(component.slug)] });
+        continue;
+      }
+
+      if (kind === 'split') {
+        const tag = requireTag(decision.tag, 'tag');
+        const into = sortedUnique(
+          toArray(decision.into)
+            .map((entry) => name(entry))
+            .filter(Boolean),
+        );
+        if (into.length < 2) throw new MemoryLabStoreError('INVALID_DECISION', 'split needs at least two tag names to split into.', { decision });
+        if (into.includes(tag)) throw new MemoryLabStoreError('INVALID_DECISION', `split cannot keep ${tag} as one of its own parts.`, { decision });
+        const affected = [];
+        for (const component of components) {
+          const state = this.normalizeTagInput(toArray(component.tags), toArray(component.tagPaths));
+          if (!state.tags.includes(tag)) continue;
+          const tags = sortedUnique([...state.tags.filter((entry) => entry !== tag), ...into]);
+          const tagPaths = state.tagPaths.map((chain) => chain.flatMap((node) => (node === tag ? into.slice() : [node])));
+          writeTags(component, tags, tagPaths);
+          affected.push(String(component.slug));
+        }
+        if (!affected.length) {
+          skipped.push({ kind, tag, into, why: 'no component carries that tag, so nothing changed' });
+          continue;
+        }
+        applied.push({ kind, tag, into, affected });
+        continue;
+      }
+
+      if (kind === 'join') {
+        const path = toArray(decision.path)
+          .map((entry) => name(entry))
+          .filter(Boolean);
+        const into = name(decision.into);
+        if (path.length < 2 || !into) {
+          throw new MemoryLabStoreError('INVALID_DECISION', 'join needs a path of at least two tags and the single tag it is.', { decision });
+        }
+        if (!survivesAsOneTag(into)) {
+          throw new MemoryLabStoreError(
+            'UNREPRESENTABLE_TAG_NAME',
+            `${into} cannot be one tag in this store: the input parser splits it, so a rebuild would turn it back into a chain. Name the tag without "/", ">", "→" or a comma.`,
+            { into, path, rule: 'splitLegacyPath()/splitTagValue() run on every write and every rebuild' },
+          );
+        }
+        for (const tag of path) requireTag(tag, 'path');
+        if (path.includes(into)) throw new MemoryLabStoreError('INVALID_DECISION', `join cannot fold a chain into one of its own nodes (${into}).`, { decision });
+        const affected = [];
+        for (const component of components) {
+          const state = this.normalizeTagInput(toArray(component.tags), toArray(component.tagPaths));
+          let touched = false;
+          const joinedPaths = [];
+          for (const chain of state.tagPaths) {
+            const mapped = [];
+            for (let index = 0; index < chain.length; index += 1) {
+              const matches = path.every((node, offset) => chain[index + offset] === node);
+              if (matches) {
+                mapped.push(into);
+                index += path.length - 1;
+                touched = true;
+                continue;
+              }
+              mapped.push(chain[index]);
+            }
+            if (mapped.length) joinedPaths.push(mapped);
+          }
+          if (!touched) continue;
+          /* The store materialises a single-node tagPath for every tag a component
+           * declares, so the collapsed nodes also sit in paths of their own. They are
+           * part of what this decision removes — unless the component still uses one
+           * of them in another chain, which means it asserted that tag for real. */
+          const stillChained = new Set(joinedPaths.filter((chain) => chain.length > 1).flat());
+          const dropped = path.filter((node) => !stillChained.has(node));
+          const tagPaths = joinedPaths.filter((chain) => !(chain.length === 1 && dropped.includes(chain[0])));
+          const stillUsed = new Set(tagPaths.flat());
+          const tags = sortedUnique([...state.tags.filter((entry) => stillUsed.has(entry) || !path.includes(entry)), into]);
+          writeTags(component, tags, tagPaths);
+          affected.push(String(component.slug));
+        }
+        if (!affected.length) {
+          skipped.push({ kind, path, into, why: 'no component carries that chain, so nothing changed' });
+          continue;
+        }
+        applied.push({ kind, path, into, affected });
+        continue;
+      }
+
+      // unfold: take a merge's fold link back out of the fold table.
+      const named = name(decision.canonical);
+      const canonical = resolveNode(named);
+      if (!canonical) {
+        throw new MemoryLabStoreError('NOT_FOUND', `Tag not found in the index: ${named}`, { field: 'canonical', tag: named });
+      }
+      const aliases = sortedUnique([
+        ...toArray(decision.aliases)
+          .map((entry) => name(entry))
+          .filter(Boolean),
+        ...(canonical === named ? [] : [named]),
+      ]);
+      const stored = sortedUnique(toArray(((index.tags || {})[canonical] || {}).aliases));
+      const present = aliases.filter((alias) => stored.includes(alias));
+      if (!present.length) {
+        skipped.push({ kind, canonical, aliases, why: 'the canonical tag does not carry those aliases, so nothing changed' });
+        continue;
+      }
+      aliasDrops.push(...present);
+      applied.push({ kind, canonical, aliases: present, affected: [] });
+      warnings.push(
+        `unfold:${canonical}<-${present.join('+')}: the fold link is gone and the spellings are separate tags again; the archived index is the only record that restores the link itself`,
+      );
+    }
+
+    const changed = applied.some((entry) => entry.affected.length > 0 || entry.kind === 'unfold');
+    if (!applied.length) {
+      return {
+        ok: true,
+        action: TAG_EDIT_ACTION,
+        applied: [],
+        skipped,
+        changed: false,
+        dryRun,
+        relationshipVersionBefore: String(index.relationshipVersion || ''),
+        relationshipVersionAfter: String(index.relationshipVersion || ''),
+        undo: [],
+        warnings: sortedUnique(warnings),
+        receipt: { operation: 'tag-apply', completed: true, changed: false, verifiedAt: isoNow(), decisions: 0 },
+      };
+    }
+
+    const { index: normalized, warnings: normalizeWarnings } = this.normalizeIndex(cloneJson(index), {
+      aliasHints,
+      aliasDrops,
+      refreshContent: !dryRun,
+    });
+    warnings.push(...normalizeWarnings);
+    const affectedBefore = Array.from(before.entries()).map(([slug, state]) => ({ slug, before: state }));
+
+    if (dryRun) {
+      return {
+        ok: true,
+        action: TAG_EDIT_ACTION,
+        applied,
+        skipped,
+        changed,
+        dryRun: true,
+        relationshipVersionBefore: String(index.relationshipVersion || ''),
+        relationshipVersionAfter: String(normalized.relationshipVersion || ''),
+        affected: affectedBefore,
+        undo: this.tagUndo(before, applied),
+        warnings: sortedUnique(warnings),
+        receipt: { operation: 'tag-apply', completed: true, dryRun: true, changed, decisions: applied.length, verifiedAt: isoNow() },
+      };
+    }
+
+    const archivePath = this.archiveIndexSnapshot();
+    this.writeIndex(normalized);
+    const undo = this.tagUndo(before, applied);
+    const policy = this.appendPolicy({
+      action: TAG_EDIT_ACTION,
+      kinds: sortedUnique(applied.map((entry) => entry.kind)),
+      slug: sortedUnique(applied.flatMap((entry) => entry.affected)).join(','),
+      reason: input && input.reason ? String(input.reason).trim() : 'Apply reviewed tag-graph decisions.',
+      source: input && input.source ? String(input.source).trim() : 'memory_lab_tag_apply',
+      decisions: applied,
+      skipped,
+      affected: affectedBefore,
+      undo,
+      archivePath,
+      relationshipVersion: normalized.relationshipVersion,
+      previousRelationshipVersion: String(index.relationshipVersion || ''),
+      warnings: sortedUnique(warnings),
+    });
+
+    return {
+      ok: true,
+      action: TAG_EDIT_ACTION,
+      applied,
+      skipped,
+      changed,
+      dryRun: false,
+      relationshipVersionBefore: String(index.relationshipVersion || ''),
+      relationshipVersionAfter: String(normalized.relationshipVersion || ''),
+      tags: Object.keys(normalized.tags || {}).length,
+      components: componentList(normalized.components).length,
+      archived: archivePath,
+      policyEventId: policy.id,
+      undo,
+      warnings: sortedUnique(warnings),
+      receipt: {
+        operation: 'tag-apply',
+        completed: true,
+        changed,
+        decisions: applied.length,
+        indexPath: this.indexPath,
+        indexUpdatedAt: normalized.updatedAt,
+        verifiedAt: isoNow(),
+        relationshipVersion: normalized.relationshipVersion,
+        previousRelationshipVersion: String(index.relationshipVersion || ''),
+        archivePath,
+        policyEventId: policy.id,
+        warnings: sortedUnique(warnings),
+      },
+    };
+  }
+
+  /**
+   * The decision list that restores the graph this call changed: one `set-tags`
+   * per affected component with its exact previous tags/tagPaths, plus one
+   * `unfold` per fold link the call created. Passing it back to
+   * `applyTagDecisions()` returns `relationshipVersion` to its previous value.
+   */
+  tagUndo(before, applied) {
+    const undo = [];
+    for (const [slug, state] of before.entries()) {
+      undo.push({ kind: 'set-tags', slug, tags: state.tags.slice(), tagPaths: state.tagPaths.map((chain) => chain.slice()) });
+    }
+    for (const entry of applied) {
+      if (entry.kind !== 'merge' || entry.linked !== true) continue;
+      undo.push({ kind: 'unfold', canonical: entry.into, aliases: entry.tags.slice() });
+    }
+    return undo;
+  }
+
+  /**
+   * Archive the current `index.json` verbatim, as the reversible record of a
+   * tag-graph edit. It lives beside the per-component revision archives
+   * (`archive/<TAG_ARCHIVE_DIR>/`) and is the exact document that was on disk
+   * before the edit — the graph's own prior revision.
+   */
+  archiveIndexSnapshot(label = 'pre-tag-edit') {
+    if (!fs.existsSync(this.indexPath)) return null;
+    const raw = readTextOrNull(this.indexPath);
+    if (raw === null) return null;
+    const directory = this.resolveInsideRoot(`archive/${TAG_ARCHIVE_DIR}`);
+    fs.mkdirSync(directory, { recursive: true });
+    const stamp = isoNow().replace(/[:.]/g, '-');
+    let target = path.join(directory, `${stamp}-${label}.json`);
+    let counter = 1;
+    while (fs.existsSync(target)) {
+      counter += 1;
+      target = path.join(directory, `${stamp}-${label}-${counter}.json`);
+    }
+    if (!isInside(this.archiveDir, target)) throw pathEscapeError(target, this.root);
+    writeFileAtomic(target, raw);
+    return target;
+  }
+
   // -- write side helpers ---------------------------------------------------
 
   readComponentContent(component) {
@@ -2007,6 +2983,14 @@ export class MemoryLabStore {
 
   formatWrite(result) {
     return `[memory_lab_write]\n${JSON.stringify(result, null, 2)}`;
+  }
+
+  formatTagReview(result) {
+    return `[memory_lab_tag_review]\n${JSON.stringify(result, null, 2)}`;
+  }
+
+  formatTagApply(result) {
+    return `[memory_lab_tag_apply]\n${JSON.stringify(result, null, 2)}`;
   }
 }
 

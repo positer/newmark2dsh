@@ -1,0 +1,17 @@
+{
+  "name": "newmark2dsh-agent-api",
+  "version": "0.2.2",
+  "private": true,
+  "type": "module",
+  "description": "Newmark Core component: the agent-api contract — the standardised envelope, the error classification, the explicit host profile, and the in-process agent-run invocation surface.",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./presence": "./lib/presence.js"
+  },
+  "files": [
+    "index.js",
+    "component.js",
+    "lib/*.js"
+  ]
+}
