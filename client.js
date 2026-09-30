@@ -1284,6 +1284,17 @@ function readPageGlobals() {
     /* ------------------------------------------------------------------- plugin */
 
     return {
+      // `slots` and nothing else. The shell's plugin page declares
+      // `["remote", "remote.settings"]` because it calls Remote methods; this half does
+      // not, so it must not declare a remote namespace.
+      //
+      // It declared `['slots', 'remote', 'remote.pluginManager']` while the preset was
+      // switched through `pluginManager.setPluginEnabled`. That call could not reach the
+      // row — `listPlugins()` inventories the profile's INSTALLED packages and
+      // `@deepseek-ai/dsh-agent-preset` lives in the DSH installation, so the call
+      // answered `preset row not listed` — and the namespace is now simply a dependency
+      // this half does not need. The preset switch goes through this bundle's own route
+      // like the other two, so nothing here resolves a remote service at all.
       inject: ['slots'],
       apply(ctx) {
         // The two component switches, read from the same injected snapshot the
@@ -1398,18 +1409,57 @@ function readPageGlobals() {
           const [applied, setApplied] = React.useState({});
           const [loaded, setLoaded] = React.useState(false);
 
+          // The mount read and the post-switch read ask the same question, so they are the
+          // same function. After a switch the panel asks again rather than trusting the
+          // POST's receipt: the POST reports whether the Host accepted the change, and only
+          // the next read reports whether it took effect. Those are not the same thing — a
+          // preset switch that changed nothing still resolved without error, and the panel
+          // said nothing was wrong while the preset stayed on.
+          //
+          // All three switches — the two composed components and the preset row — now come
+          // from this one route. The Host half reads the preset's state out of
+          // `<profile>/cordis.patch.yml` — the `agent-preset-registry` entry's
+          // `selectedDefault` — so the state the panel shows is the state the registry
+          // will read.
+          const readState = () =>
+            fetch('/newmark-core/components')
+              .then((response) =>
+                response
+                  .json()
+                  .catch(() => ({}))
+                  .then((body) => ({ ...body, httpStatus: response.status })),
+              )
+              .then((result) => {
+                if (!result || !Array.isArray(result.components)) return false;
+                const next = {};
+                // Carry `detail` through too: it is the Host's own description of what it
+                // read, and dropping it left the panel able to show only a boolean, which
+                // is not enough to tell "off" from "the edit did nothing".
+                for (const entry of result.components) {
+                  next[entry.name] = { ok: true, mounted: entry.mounted === true, detail: entry.detail };
+                }
+                // The preset answers in the same shape as the composed components, from
+                // the same route and the same read-back, so one renderer serves all three.
+                const preset = result.presetDev;
+                if (preset && typeof preset === 'object') {
+                  next.presetDev = {
+                    ok: preset.ok === true,
+                    mounted: preset.mounted === true,
+                    error: preset.error,
+                    detail: preset.detail,
+                    httpStatus: result.httpStatus,
+                  };
+                }
+                setApplied((current) => ({ ...current, ...next }));
+                return true;
+              })
+              .catch(() => false);
+
           React.useEffect(() => {
             let live = true;
-            fetch('/newmark-core/components')
-              .then((response) => response.json())
-              .then((result) => {
-                if (!live || !result || !Array.isArray(result.components)) return;
-                const next = {};
-                for (const entry of result.components) next[entry.name] = { ok: true, mounted: entry.mounted === true };
-                setApplied((current) => ({ ...current, ...next }));
-                setLoaded(true);
-              })
-              .catch(() => setLoaded(true));
+            readState().then(() => {
+              if (live) setLoaded(true);
+            });
             return () => {
               live = false;
             };
@@ -1417,13 +1467,38 @@ function readPageGlobals() {
 
           const toggle = (key, next) => {
             setPending(key);
+
+            // ONE path for all three switches, the preset included.
+            //
+            // The preset used to be special-cased here, through the shell's own
+            // `remote.pluginManager.setPluginEnabled`. That call cannot reach this row:
+            // `listPlugins()` maps `readPluginInventory(ctx).entries`, which inventories the
+            // profile's INSTALLED packages, and `@deepseek-ai/dsh-agent-preset` lives in the
+            // DSH installation — so the row was never listed and the call answered
+            // `preset row not listed`. The Host half now writes the
+            // `agent-preset-registry` entry's `selectedDefault` into the profile patch and
+            // reads the state back from the file, and this half does what it does for the
+            // other two: post, then ask what is true.
             fetch('/newmark-core/components', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ component: key, enabled: next }),
             })
-              .then((response) => response.json())
-              .then((result) => setApplied((current) => ({ ...current, [key]: result })))
+              .then((response) =>
+                // Keep the status. A rejected request or an error page has no JSON body,
+                // and swallowing that into a generic message throws away the one fact
+                // that identifies the failure. Reading the status costs nothing.
+                response
+                  .json()
+                  .catch(() => ({}))
+                  .then((body) => ({ ...body, httpStatus: response.status, ok: body && body.ok === true })),
+              )
+              .then((result) => {
+                setApplied((current) => ({ ...current, [key]: result }));
+                // Ask what is true now. If the change did not take, this read will show the
+                // old state and the row will keep saying so.
+                return readState();
+              })
               .catch((error) => setApplied((current) => ({ ...current, [key]: { ok: false, error: String(error) } })))
               .then(() => setPending(''));
           };
@@ -1461,9 +1536,27 @@ function readPageGlobals() {
             {
               key: 'presetDev',
               name: 'Dev preset',
-              role: 'agent preset this bundle declares and selects',
+              // The row says what the switch does, which is a *selection* and not a
+              // lifecycle: the Loader row that declares the preset is left alone, and no
+              // field hides a preset from the picker — the registry's Config has `default`
+              // and `selectedDefault` and nothing else
+              // (`@deepseek-ai/dsh-agent-preset-registry/lib/index.js:471-474`).
+              //
+              // The words are the same ones the two component rows use — 已启用 / 已禁用 and
+              // 启用 / 禁用 — because the panel is one surface with one vocabulary. What the
+              // words mean differs per row and the note says how; the words themselves must
+              // not, or a reader has to learn the panel twice.
+              role: 'the agent preset this bundle declares; the default the registry selects',
+              // `on` here is only the pre-read placeholder. The real state is the
+              // `agent-preset-registry` entry's `selectedDefault` in the profile patch, read
+              // by the Host half from the file; the panel shows that answer as soon as the
+              // read lands.
               on: true,
-              note: 'declared by this bundle; the active preset is chosen in Settings',
+              note: '选中即新会话以 Dev 预设启动；由 Host 半写 profile patch',
+              stateOn: '已启用',
+              stateOff: '已禁用',
+              actionOn: '禁用',
+              actionOff: '启用',
               switchable: true,
             },
           ];
@@ -1478,7 +1571,8 @@ function readPageGlobals() {
               { className: 'nmc-config-list' },
               ...rows.map((row) => {
                 const answer = applied[row.key];
-                const on = answer && answer.ok === true && typeof answer.mounted === 'boolean' ? answer.mounted : row.on;
+                const answered = answer && answer.ok === true && typeof answer.mounted === 'boolean';
+                const on = answered ? answer.mounted : row.on;
                 const failed = answer && answer.ok === false;
                 return h(
                   'li',
@@ -1490,7 +1584,15 @@ function readPageGlobals() {
                     h('span', { className: 'nmc-config-name' }, row.name),
                     h('span', { className: 'nmc-config-role' }, row.role),
                   ),
-                  h('span', { className: 'nmc-config-state' }, failed ? '切换失败' : on ? '运行中' : '已关闭'),
+                  h(
+                    'span',
+                    { className: 'nmc-config-state' },
+                    // One vocabulary across the panel: 已启用 / 已禁用, 启用 / 禁用. What each
+                    // row's words mean is the row's own business and its note says so — the
+                    // composed components load and unload, the preset row selects the default
+                    // a new session starts in. The words do not vary; the notes do.
+                    failed ? '切换失败' : on ? row.stateOn || '已启用' : row.stateOff || '已禁用',
+                  ),
                   row.switchable
                     ? h(
                         'button',
@@ -1501,13 +1603,32 @@ function readPageGlobals() {
                           'aria-pressed': on,
                           onClick: () => toggle(row.key, !on),
                         },
-                        pending === row.key ? '…' : on ? '关闭' : '开启',
+                        pending === row.key
+                          ? '…'
+                          : on
+                            ? row.actionOn || '禁用'
+                            : row.actionOff || '启用',
                       )
                     : null,
                   h(
                     'span',
                     { className: 'nmc-config-note' },
-                    failed ? String(answer.error || 'failed') : row.note,
+                    // On failure show everything the Host said: the status identifies a
+                    // rejected request, `error` names the branch, `detail` carries the
+                    // underlying message. Showing only one of them has already cost a
+                    // diagnosis round.
+                    failed
+                      ? [
+                          answer.httpStatus ? 'HTTP ' + answer.httpStatus : null,
+                          answer.error ? String(answer.error) : null,
+                          answer.detail ? String(answer.detail) : null,
+                        ]
+                          .filter(Boolean)
+                          .join(' · ') || 'failed'
+                      : // On success the Host's own `detail` wins over the row's prose: it
+                        // is what the file holds, named by line, and a state the panel
+                        // cannot see is exactly the failure this row exists to show.
+                        (answered && answer.detail ? String(answer.detail) : row.note),
                   ),
                 );
               }),
