@@ -1,6 +1,6 @@
 {
   "name": "newmark2dsh",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Newmark Core for DeepSeek Harness: one bundle carrying Newmark's MemoryLab, ComputerUse and the Dev agent preset as four independently switchable components, over the shared ~/.Newmark user store.",
   "meta": {
