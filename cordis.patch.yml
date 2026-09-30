@@ -28,7 +28,7 @@
       config:
         id: dev
         name: Dev
-        description: 'PTC mode plus project management: reads and keeps README.md, OVERVIEW.md, taste.md and archive/ current.'
+        description: 'PTC 模式 + 项目管理：读取并维护 README.md、OVERVIEW.md、taste.md 与 archive/ 的最新状态。'
         order: 2.5
         plugins:
           # --- dev identity: this is where the extra constraints live ---------

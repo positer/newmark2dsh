@@ -1,6 +1,6 @@
 {
   "name": "newmark2dsh-computeruse",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "description": "Newmark Core component: the Windows and Linux automation backends and the two ComputerUse tools.",
