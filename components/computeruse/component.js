@@ -25,8 +25,15 @@ export const COMPUTER_USE_ACTIONS = [
   'app_scroll', 'app_type', 'app_key', 'mode_report',
 ];
 
-/** Newmark's lease TTL, as a named constant rather than a repeated literal. */
-export const LEASE_TTL_MS = 120_000;
+/**
+ * The takeover lease has no time limit, so there is no TTL constant.
+ *
+ * A lease ends when `takeover_stop` releases it, or when the owning process dies. The
+ * mirror below reports `expiresAt`, `ttlMs` and `remainingMs` as `null` rather than as a
+ * number, because any number there would be read as a real deadline by a caller that
+ * trusts it.
+ */
+export const LEASE_EXPIRY = 'none';
 
 /**
  * The value a tool returns.
@@ -54,24 +61,37 @@ function toolText(value) {
   return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }];
 }
 
-export function createComputerUse({ captionDir, logger, leaseTtlMs = LEASE_TTL_MS } = {}) {
-  /** The lease lifetime this instance uses; the exported constant is the default. */
-  const ttlMs = Number.isFinite(leaseTtlMs) && leaseTtlMs > 0 ? Math.floor(leaseTtlMs) : LEASE_TTL_MS;
+export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
+  /**
+   * The frozen Loader row (`index.js`) still declares a `leaseTtlMs` setting and passes it
+   * here. There is no TTL any more, so it is deliberately inert - but it is reported as
+   * `ignored_lease_ttl_ms` rather than swallowed, so a caller that sets it can see it had
+   * no effect instead of believing it shortened or lengthened the lease.
+   */
+  const ignoredLeaseTtlMs = Number.isFinite(leaseTtlMs) && leaseTtlMs > 0 ? Math.floor(leaseTtlMs) : null;
   /** The last lease this component observed; refreshed on every lease action. */
-  let lease = { ownerId: '', mouseMode: 'real', acquiredAt: 0, expiresAt: 0 };
+  let lease = { ownerId: '', mouseMode: 'real', acquiredAt: 0 };
 
-  /** Read the mirror without mutating it: an expired lease reads as free. */
+  /**
+   * Read the mirror without mutating it.
+   *
+   * A held lease stays held: the mirror has no clock, matching the backend, which no longer
+   * expires a lease on a timer. The three duration fields are `null` - "no expiry" - and
+   * `expiry` says so in words.
+   */
   function leaseView() {
-    const now = Date.now();
-    const held = Boolean(lease.ownerId) && lease.expiresAt > now;
+    const held = Boolean(lease.ownerId);
     return {
       held,
       ownerId: held ? lease.ownerId : '',
       mouseMode: held ? lease.mouseMode : 'real',
       acquiredAt: held ? lease.acquiredAt : 0,
-      expiresAt: held ? lease.expiresAt : 0,
-      ttlMs: ttlMs,
-      remainingMs: held ? lease.expiresAt - now : 0,
+      expiry: LEASE_EXPIRY,
+      expiresAt: null,
+      ttlMs: null,
+      remainingMs: null,
+      releasedBy: 'takeover_stop',
+      ignored_lease_ttl_ms: ignoredLeaseTtlMs,
     };
   }
 
@@ -121,15 +141,15 @@ export function createComputerUse({ captionDir, logger, leaseTtlMs = LEASE_TTL_M
     const action = String(args?.action || '');
     if (action === 'takeover_start') {
       const requested = args?.mouse_mode === 'virtual' ? 'virtual' : 'real';
-      lease = { ownerId: String(args?.owner_id || 'dsh'), mouseMode: requested, acquiredAt: Date.now(), expiresAt: Date.now() + ttlMs };
+      lease = { ownerId: String(args?.owner_id || 'dsh'), mouseMode: requested, acquiredAt: Date.now() };
     } else if (action === 'takeover_stop') {
-      lease = { ownerId: '', mouseMode: 'real', acquiredAt: 0, expiresAt: 0 };
+      lease = { ownerId: '', mouseMode: 'real', acquiredAt: 0 };
     } else if (typeof result === 'string') {
-      // A refusal that names another owner is authoritative: mirror it.
+      // A refusal that names another owner is authoritative: mirror it. It does not expire.
       try {
         const parsed = JSON.parse(result);
         if (parsed && parsed.lock_owner && parsed.ok === false) {
-          lease = { ...lease, ownerId: String(parsed.lock_owner), expiresAt: Math.max(lease.expiresAt, Date.now() + ttlMs) };
+          lease = { ...lease, ownerId: String(parsed.lock_owner) };
         }
       } catch {
         /* a non-JSON result carries no lease information */

@@ -29,10 +29,18 @@
  * inside the lane's request/response host.
  *
  * A leaked topmost click-through window is worse than no overlay at all, so every exit
- * path - `takeover_stop`, lease expiry, `stopAll()`, process exit - funnels into one
+ * path - `takeover_stop`, `stopAll()`, process exit - funnels into one
  * idempotent stopper, every host is identified by its command line rather than by a pid
  * alone, and the window additionally closes itself within ~1 s when its owning process
  * disappears.
+ *
+ * There is deliberately **no time limit** on the takeover overlay. A lease used to expire
+ * after 120 s and take the window down with it; that path is gone, so stopping is the job
+ * of an explicit `takeover_stop`. The one path that is *not* an explicit tool call is the
+ * window's own 1 s owner-process watchdog: if the owning process dies, this topmost,
+ * click-through, screen-wide window would otherwise cover the user's desktop with nothing
+ * inside the app left to remove it. It is kept for exactly that reason and is reported in
+ * `overlay_contract.implicit_stop_paths` so it is never a silent stop path.
  */
 
 import fs from 'node:fs';
@@ -814,9 +822,27 @@ export function overlayContractReport() {
     brush_count: OVERLAY_BRUSH_STEPS,
     owner_watchdog_ms: OVERLAY_OWNER_WATCHDOG_MS,
     pulse_ms: OVERLAY_PULSE_MS,
-    lifecycle: ['owner-process-bound', 'duration-bound'],
+    lifecycle: ['owner-process-bound'],
+    duration_bound_note: 'durationMs is the *pulse* lifetime only (pulseTakeoverOverlay); the takeover overlay itself is started with durationMs 0 and never expires on a clock',
     dpi: 'the host stays system-DPI-unaware, exactly like the original',
-    stop_paths: ['takeover_stop', 'lease_expiry', 'stopAll', 'process_exit', 'owner watchdog'],
+    stop_paths: ['takeover_stop', 'stopAll', 'process_exit', 'owner watchdog'],
+    explicit_stop_paths: ['takeover_stop'],
+    /**
+     * The one stop path that is not an explicit tool call, kept on purpose.
+     *
+     * This window is topmost, click-through and covers every monitor. If the process that
+     * owns it dies, nothing inside the app can reach it any more, so without this path the
+     * user would be left with a screen-wide window they cannot dismiss. It is the single
+     * non-explicit stop path that remains, and it fires only on owner death.
+     */
+    implicit_stop_paths: [
+      {
+        path: 'owner watchdog',
+        trigger: 'owner-process-death',
+        watchdog_ms: OVERLAY_OWNER_WATCHDOG_MS,
+        reason: 'a topmost click-through window outliving its owner would cover the user screen with no in-app way to remove it',
+      },
+    ],
   };
 }
 
@@ -1218,12 +1244,12 @@ export function stopOverlaySync(reason = 'synchronous_stop') {
 
 /**
  * The lease hook: `win32.js` calls this whenever the takeover lease is released, so
- * `takeover_stop`, lease expiry, `stopAll()` and process exit all reach the window.
- * Terminal reasons stop synchronously, because there is no event loop left to await in.
+ * `takeover_stop`, `stopAll()` and process exit all reach the window. There is no expiry
+ * reason any more - the lease has no time limit. Terminal reasons stop synchronously,
+ * because there is no event loop left to await in.
  */
 export function releaseOverlay(reason = 'lease_released') {
   const mapped = {
-    expired: 'lease_expired',
     takeover_stop: 'takeover_stop',
     stop_all: 'stop_all',
     process_exit: 'process_exit',

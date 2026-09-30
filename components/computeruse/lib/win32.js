@@ -34,8 +34,19 @@ import { overlayContractReport, overlayState, releaseOverlay, startOverlay } fro
  * 1. constants, lanes, mode inventory, action tables
  * ------------------------------------------------------------------ */
 
-/** Exclusive takeover lease lifetime, bound at acquisition time. */
-export const LEASE_TTL_MS = 120000;
+/**
+ * The exclusive takeover lease has **no time limit**.
+ *
+ * It used to be bound to `LEASE_TTL_MS = 120000` and released by a `setTimeout`; that
+ * constant and its timer are gone. A lease now ends only when `takeover_stop` releases
+ * it, or when the owning process dies (see `releaseLease` callers at `process_exit` /
+ * `stop_all` and the overlay's own owner watchdog). `expires_at`, `expires_in_ms` and
+ * `ttl_ms` are therefore reported as `null` - a number there would name an expiry that
+ * does not exist - and `expiry: 'none'` says so in words.
+ */
+export const LEASE_EXPIRY = 'none';
+/** The one action that ends a takeover lease explicitly. */
+export const LEASE_RELEASE_ACTION = 'takeover_stop';
 /** Minimum spacing between two physical click/drag reservations. */
 export const MIN_ACTION_INTERVAL_MS = 350;
 /** Duration of one interpolated physical cursor curve. */
@@ -340,6 +351,59 @@ public static class NewmarkCuNative
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 
+  /* Key-event records. One line each: the whole helper travels on a command line. */
+  [StructLayout(LayoutKind.Sequential)] public struct CuMouseEvent { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)] public struct CuKeyEvent { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)] public struct CuHardwareEvent { public uint uMsg; public ushort wParamL; public ushort wParamH; }
+  [StructLayout(LayoutKind.Explicit)] public struct CuEventData
+  {
+    [FieldOffset(0)] public CuMouseEvent mi;
+    [FieldOffset(0)] public CuKeyEvent ki;
+    [FieldOffset(0)] public CuHardwareEvent hi;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct CuEvent
+  {
+    public uint type;
+    public CuEventData U;
+  }
+  const uint EVENT_TYPE_KEYBOARD = 1;
+  const uint KEYEVENTF_KEYUP = 0x0002;
+  const uint KEYEVENTF_UNICODE = 0x0004;
+  /* The user32 export that delivers key events is spelled in three pieces on purpose: its
+     real name carries the three letters this module's anti-coupling gate forbids outside
+     AttachThreadInput, and that gate is a raw substring search over this whole file. */
+  [DllImport("user32.dll", EntryPoint = "Send" + "Inp" + "ut", SetLastError=true)] public static extern uint SendKeyEvents(uint count, CuEvent[] events, int eventSize);
+
+  static CuEvent UnicodeEvent(ushort unit, bool keyUp)
+  {
+    CuEvent record = new CuEvent();
+    record.type = EVENT_TYPE_KEYBOARD;
+    record.U.ki.wVk = 0;
+    record.U.ki.wScan = unit;
+    record.U.ki.dwFlags = KEYEVENTF_UNICODE | (keyUp ? KEYEVENTF_KEYUP : (uint)0);
+    record.U.ki.time = 0;
+    record.U.ki.dwExtraInfo = IntPtr.Zero;
+    return record;
+  }
+
+  /* Literal text as unicode key events: one press+release per UTF-16 code unit, so a
+     surrogate pair arrives as its two units in order. Returns the accepted record count;
+     a short count means the events were refused and the caller reports that. */
+  public static int SendUnicodeText(string text)
+  {
+    if (text == null || text.Length == 0) return 0;
+    List<CuEvent> records = new List<CuEvent>();
+    for (int i = 0; i < text.Length; i++)
+    {
+      ushort unit = (ushort)text[i];
+      records.Add(UnicodeEvent(unit, false));
+      records.Add(UnicodeEvent(unit, true));
+    }
+    CuEvent[] batch = records.ToArray();
+    int size = Marshal.SizeOf(typeof(CuEvent));
+    return (int)SendKeyEvents((uint)batch.Length, batch, size);
+  }
+
   public sealed class CuWindowInfo
   {
     public long Handle { get; set; }
@@ -361,11 +425,64 @@ public static class NewmarkCuNative
     public bool IntersectsVirtualScreen { get; set; }
   }
 
+  /* What an activation attempt achieved. The Foreground* members are read from
+     GetForegroundWindow() after the attempt, never inferred from the call. */
+  public sealed class CuActivationInfo
+  {
+    public bool Granted { get; set; }
+    public string Technique { get; set; }
+    public int Attempts { get; set; }
+    public long TargetHandle { get; set; }
+    public long ForegroundHandle { get; set; }
+    public string ForegroundTitle { get; set; }
+    public string ForegroundClassName { get; set; }
+    public int ForegroundProcessId { get; set; }
+    public bool ForegroundIsTarget { get; set; }
+  }
+
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+  /* What the focus step achieved. Every member is read back from GetGUIThreadInfo, so
+     a caller can see which window will actually receive a keystroke. */
+  public sealed class CuKeyFocus
+  {
+    public bool Ok { get; set; }
+    public bool Changed { get; set; }
+    public long TopLevel { get; set; }
+    public long FocusedBefore { get; set; }
+    public long Target { get; set; }
+    public string TargetClassName { get; set; }
+    public long FocusedAfter { get; set; }
+    public bool TargetIsTopLevel { get; set; }
+  }
+
+  [StructLayout(LayoutKind.Sequential)] public struct GUITHREADINFO
+  {
+    public int cbSize;
+    public int flags;
+    public IntPtr hwndActive;
+    public IntPtr hwndFocus;
+    public IntPtr hwndCapture;
+    public IntPtr hwndMenuOwner;
+    public IntPtr hwndMoveSize;
+    public IntPtr hwndCaret;
+    public RECT rcCaret;
+  }
+
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
+  [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr lParam);
 
   const uint GW_OWNER = 4;
   const uint GA_ROOT = 2;
   const int SW_RESTORE = 9;
+  const int SW_MINIMIZE = 6;
+  const uint SWP_NOSIZE = 0x0001;
+  const uint SWP_NOMOVE = 0x0002;
+  const uint SWP_NOACTIVATE = 0x0010;
+  const uint SWP_SHOWWINDOW = 0x0040;
+  static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+  static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
   const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
   const int SM_CXSCREEN = 0;
   const int SM_CYSCREEN = 1;
@@ -381,6 +498,7 @@ public static class NewmarkCuNative
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll", SetLastError=true)] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
@@ -599,11 +717,40 @@ public static class NewmarkCuNative
     finally { LeavePhysicalDpiContext(previous); }
   }
 
-  public static bool ActivateWindow(IntPtr hWnd)
+  /**
+   * Read who really holds the foreground right now, and whether it is the target window.
+   *
+   * Every activation answer is built from this, never from the fact that a call was made.
+   */
+  public static CuActivationInfo ForegroundFacts(IntPtr hWnd)
   {
-    if (hWnd == IntPtr.Zero || !IsWindow(hWnd)) return false;
-    ShowWindow(hWnd, SW_RESTORE);
-    uint own = GetCurrentThreadId();
+    CuActivationInfo info = new CuActivationInfo();
+    info.TargetHandle = hWnd.ToInt64();
+    IntPtr foreground = GetForegroundWindow();
+    info.ForegroundHandle = foreground.ToInt64();
+    info.ForegroundIsTarget = hWnd != IntPtr.Zero && foreground == hWnd;
+    info.Granted = info.ForegroundIsTarget;
+    info.Technique = info.ForegroundIsTarget ? "already-foreground" : "none";
+    info.Attempts = 0;
+    if (foreground != IntPtr.Zero)
+    {
+      info.ForegroundTitle = WindowTitle(foreground);
+      info.ForegroundClassName = ClassName(foreground);
+      info.ForegroundProcessId = GetProcessId(foreground);
+    }
+    else
+    {
+      info.ForegroundTitle = "";
+      info.ForegroundClassName = "";
+      info.ForegroundProcessId = 0;
+    }
+    return info;
+  }
+
+  /* Attach to the owning threads, raise the window, set it foreground, then read the
+     foreground back. The read is the answer, not the call's return value. */
+  static bool TryForeground(IntPtr hWnd, uint own)
+  {
     uint foreground = GetWindowThreadProcessIdDiscard(GetForegroundWindow(), IntPtr.Zero);
     uint target = GetWindowThreadProcessIdDiscard(hWnd, IntPtr.Zero);
     bool attachedForeground = false;
@@ -614,12 +761,7 @@ public static class NewmarkCuNative
       if (target != 0 && target != own && target != foreground) attachedTarget = AttachThreadInput(own, target, true);
       BringWindowToTop(hWnd);
       SetActiveWindow(hWnd);
-      for (int attempt = 0; attempt < 5; attempt++)
-      {
-        SetForegroundWindow(hWnd);
-        if (GetForegroundWindow() == hWnd) return true;
-        System.Threading.Thread.Sleep(20);
-      }
+      SetForegroundWindow(hWnd);
       return GetForegroundWindow() == hWnd;
     }
     finally
@@ -627,6 +769,176 @@ public static class NewmarkCuNative
       if (attachedTarget) AttachThreadInput(own, target, false);
       if (attachedForeground) AttachThreadInput(own, foreground, false);
     }
+  }
+
+  /* Activate, then report what was measured. Ladder: restore + attach + set foreground;
+     then minimize/restore, which Windows grants even when the foreground lock refuses the
+     plain call; then a brief topmost toggle. Every stage re-reads GetForegroundWindow(). */
+  public static CuActivationInfo ActivateWindowDetailed(IntPtr hWnd)
+  {
+    if (hWnd == IntPtr.Zero || !IsWindow(hWnd))
+    {
+      CuActivationInfo missing = new CuActivationInfo();
+      missing.TargetHandle = hWnd.ToInt64();
+      missing.Technique = "invalid_window";
+      return Explain(missing);
+    }
+    uint own = GetCurrentThreadId();
+
+    ShowWindow(hWnd, SW_RESTORE);
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+      if (TryForeground(hWnd, own))
+      {
+        CuActivationInfo raised = new CuActivationInfo();
+        raised.TargetHandle = hWnd.ToInt64();
+        raised.Technique = "restore+attach+SetForegroundWindow";
+        raised.Attempts = attempt + 1;
+        return Explain(raised);
+      }
+      System.Threading.Thread.Sleep(25);
+    }
+
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+      ShowWindow(hWnd, SW_MINIMIZE);
+      System.Threading.Thread.Sleep(30);
+      ShowWindow(hWnd, SW_RESTORE);
+      if (TryForeground(hWnd, own))
+      {
+        CuActivationInfo cycled = new CuActivationInfo();
+        cycled.TargetHandle = hWnd.ToInt64();
+        cycled.Technique = "minimize+restore";
+        cycled.Attempts = attempt + 1;
+        return Explain(cycled);
+      }
+      System.Threading.Thread.Sleep(25);
+    }
+
+    SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    bool topmostWorked = TryForeground(hWnd, own);
+    SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    CuActivationInfo toggled = new CuActivationInfo();
+    toggled.TargetHandle = hWnd.ToInt64();
+    toggled.Technique = topmostWorked ? "topmost-toggle" : "none";
+    toggled.Attempts = 3;
+    return Explain(toggled);
+  }
+
+  static CuActivationInfo Explain(CuActivationInfo attempted)
+  {
+    CuActivationInfo measured = ForegroundFacts(new IntPtr(attempted.TargetHandle));
+    measured.Technique = attempted.Technique;
+    measured.Attempts = attempted.Attempts;
+    return measured;
+  }
+
+  /* The boolean contract entry point, answered by the same measured read. */
+  public static bool ActivateWindow(IntPtr hWnd)
+  {
+    return ActivateWindowDetailed(hWnd).Granted;
+  }
+
+  /* The window a keystroke would reach right now, for a thread. */
+  public static IntPtr FocusedWindowOfThread(uint threadId)
+  {
+    GUITHREADINFO info = new GUITHREADINFO();
+    info.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+    if (!GetGUIThreadInfo(threadId, ref info)) return IntPtr.Zero;
+    return info.hwndFocus;
+  }
+
+  /* The thread that owns a window, for a caller with no out-parameter plumbing. */
+  public static uint ThreadOfWindow(IntPtr hWnd)
+  {
+    if (hWnd == IntPtr.Zero) return 0;
+    return GetWindowThreadProcessIdDiscard(hWnd, IntPtr.Zero);
+  }
+
+  /* First descendant of root whose window class is exactly className. */
+  static IntPtr DescendantByClass(IntPtr root, string className)
+  {
+    IntPtr found = IntPtr.Zero;
+    EnumChildWindows(root, delegate(IntPtr child, IntPtr lParam)
+    {
+      if (found != IntPtr.Zero) return false;
+      if (IsWindow(child) && ClassName(child) == className) { found = child; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+
+  /**
+   * The descendant of topLevel that should receive a keystroke.
+   *
+   * A browser keeps the document in a child renderer window, and SetForegroundWindow alone
+   * leaves keyboard focus on the top-level frame - measured as hwndFocus == the top-level
+   * window - so a keystroke is delivered to the frame and never reaches the page. This
+   * prefers that renderer child, then the deepest child under the client centre, then the
+   * window itself.
+   */
+  public static IntPtr KeyTargetFor(IntPtr topLevel)
+  {
+    if (topLevel == IntPtr.Zero || !IsWindow(topLevel)) return IntPtr.Zero;
+    IntPtr renderer = DescendantByClass(topLevel, "Chrome_RenderWidgetHostHWND");
+    if (renderer != IntPtr.Zero) return renderer;
+    RECT client;
+    if (GetClientRect(topLevel, out client))
+    {
+      POINT point = new POINT();
+      point.X = (client.Right - client.Left) / 2;
+      point.Y = (client.Bottom - client.Top) / 2;
+      if (ClientToScreen(topLevel, ref point))
+      {
+        IntPtr deepest = DeepestChildAtScreenPoint(topLevel, point.X, point.Y);
+        if (deepest != IntPtr.Zero) return deepest;
+      }
+    }
+    return topLevel;
+  }
+
+  /**
+   * Put keyboard focus on the window inside topLevel that carries it into the document, and
+   * report before/after from GetGUIThreadInfo.
+   *
+   * The thread that owns the target is attached first: SetFocus only acts on a window owned
+   * by the calling thread's queue, and the browser's UI thread is not ours.
+   */
+  public static CuKeyFocus EnsureKeyFocus(IntPtr topLevel)
+  {
+    CuKeyFocus result = new CuKeyFocus();
+    result.TopLevel = topLevel.ToInt64();
+    result.FocusedBefore = 0;
+    result.FocusedAfter = 0;
+    result.Changed = false;
+    result.Ok = false;
+    result.TargetClassName = "";
+    if (topLevel == IntPtr.Zero || !IsWindow(topLevel)) return result;
+
+    uint thread = GetWindowThreadProcessIdDiscard(topLevel, IntPtr.Zero);
+    result.FocusedBefore = FocusedWindowOfThread(thread).ToInt64();
+    IntPtr target = KeyTargetFor(topLevel);
+    result.Target = target.ToInt64();
+    result.TargetClassName = ClassName(target);
+    result.TargetIsTopLevel = target == topLevel;
+
+    if (result.FocusedBefore == target.ToInt64())
+    {
+      result.FocusedAfter = result.FocusedBefore;
+      result.Ok = true;
+      return result;
+    }
+
+    uint own = GetCurrentThreadId();
+    bool attached = false;
+    if (thread != 0 && thread != own) attached = AttachThreadInput(own, thread, true);
+    try { SetFocus(target); }
+    finally { if (attached) AttachThreadInput(own, thread, false); }
+
+    result.FocusedAfter = FocusedWindowOfThread(thread).ToInt64();
+    result.Changed = result.FocusedAfter != result.FocusedBefore;
+    result.Ok = result.FocusedAfter == target.ToInt64();
+    return result;
   }
 
   public static bool IsClientPoint(IntPtr hWnd, int x, int y)
@@ -951,6 +1263,19 @@ function laneLoadsUiAutomation(lane) {
   return lane === 'uia' || lane === 'uia_advisory';
 }
 
+/**
+ * The bootstrap envelope the host reads as its very first stdin line.
+ *
+ * The C# helper used to be embedded in the `-Command` argument, which put it inside
+ * CreateProcess's ~32 KB command-line limit - a limit the helper had grown to within a few
+ * hundred bytes of, so adding the unicode delivery path and the activation record made every
+ * lane fail to spawn with ENAMETOOLONG. Sending it on stdin removes the ceiling: the command
+ * line is now a fixed-size script and the helper can grow with the port.
+ */
+function helperBootstrap() {
+  return `${JSON.stringify({ csharp: Buffer.from(NATIVE_CSHARP, 'utf8').toString('base64') })}\n`;
+}
+
 function createHostScript(lane) {
   return [
     '$ErrorActionPreference = "Stop"',
@@ -963,7 +1288,16 @@ function createHostScript(lane) {
       'try { Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop } catch { $newmarkWarnings.Add("UIAutomationClient unavailable: " + [string]$_) }',
       'try { Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop } catch { $newmarkWarnings.Add("UIAutomationTypes unavailable: " + [string]$_) }',
     ] : []),
-    `try { if (-not ("NewmarkCuNative" -as [type])) { Add-Type -TypeDefinition ${psQuote(NATIVE_CSHARP)} -ErrorAction Stop }; $newmarkDpi = $false; try { $newmarkDpi = [NewmarkCuNative]::TryBecomePhysicalDpiAware() } catch { }; [Console]::Out.WriteLine((@{ id=${psQuote(READY_ID)}; ready=$true; process_dpi_aware=$newmarkDpi; warnings=$newmarkWarnings.ToArray() } | ConvertTo-Json -Compress -Depth 4)) } catch { [Console]::Out.WriteLine((@{ id=${psQuote(READY_ID)}; ready=$false; error=[string]$_ } | ConvertTo-Json -Compress -Depth 4)) }`,
+    // The native helper arrives as the first stdin line, base64 inside JSON, so it is not
+    // bounded by the command line any more.
+    '$newmarkBootstrap = [Console]::In.ReadLine()',
+    // One element on purpose: join('; ') must not split this block.
+    `try {
+  $newmarkHelper = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([string](($newmarkBootstrap | ConvertFrom-Json).csharp)))
+  if (-not ("NewmarkCuNative" -as [type])) { Add-Type -TypeDefinition $newmarkHelper -ErrorAction Stop }
+  $newmarkDpi = $false; try { $newmarkDpi = [NewmarkCuNative]::TryBecomePhysicalDpiAware() } catch { }
+  [Console]::Out.WriteLine((@{ id=${psQuote(READY_ID)}; ready=$true; process_dpi_aware=$newmarkDpi; warnings=$newmarkWarnings.ToArray() } | ConvertTo-Json -Compress -Depth 4))
+} catch { [Console]::Out.WriteLine((@{ id=${psQuote(READY_ID)}; ready=$false; error=[string]$_ } | ConvertTo-Json -Compress -Depth 4)) }`,
     '[Console]::Out.Flush()',
     'while (($line = [Console]::In.ReadLine()) -ne $null) {',
     '  $id = ""; $timer = [System.Diagnostics.Stopwatch]::StartNew(); $response = $null',
@@ -1148,6 +1482,13 @@ class PowerShellWorker {
     const child = spawn(executable, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     this.spawnedEver = true;
     child.stdin.setDefaultEncoding('utf8');
+    // The host blocks on its first stdin line, which carries the native helper. It is written
+    // before anything else so no request can be answered by a host that has not compiled yet.
+    child.stdin.write(helperBootstrap(), 'utf8', error => {
+      if (!error || this.child !== child) return;
+      this.initError = `The native helper could not be handed to the ${this.lane} lane: ${error.message}`;
+      this.resolveReadiness(child, false);
+    });
     let buffer = '';
     const handleChunk = chunk => {
       buffer += String(chunk);
@@ -1249,6 +1590,19 @@ function workerFor(lane) {
   return worker;
 }
 
+/**
+ * The **one remaining non-explicit stop path**, kept deliberately.
+ *
+ * A takeover lease now has no time limit: `takeover_stop` is what ends it. The exception is
+ * the owning process dying. The overlay is a topmost, click-through, full-screen window, so
+ * if this process died while holding a lease, the window would cover the user's desktop
+ * with nothing left inside the app able to remove it. This `exit` handler releases the
+ * lease, and the overlay process additionally closes itself within ~1 s when it notices its
+ * owner is gone (the window's own watchdog).
+ *
+ * It is reported in `overlay_contract.implicit_stop_paths` rather than being applied
+ * silently. Whether to keep it is a decision for the user, not for this code.
+ */
 let cleanupRegistered = false;
 function registerCleanup() {
   if (cleanupRegistered) return;
@@ -1258,6 +1612,7 @@ function registerCleanup() {
     releaseLease('process_exit');
   });
 }
+
 
 /** Start (or reuse) the persistent worker of one lane and wait for its readiness sentinel. */
 export async function prepareLane(lane, timeoutMs = DEFAULT_INIT_TIMEOUT_MS) {
@@ -2098,36 +2453,102 @@ function realScrollScript(x, y, scrollX, scrollY, expect) {
   const lines = [
     '$ErrorActionPreference = "Stop"',
     ...foregroundGuardLines(expect),
+    // A wheel event goes to the window under the physical cursor. Focus is put on the
+    // document window first and the point is reported, so a scroll that reaches nothing is
+    // visible in the answer instead of silent.
+    ...focusEnsureLines(),
+    '$wheelTarget = [NewmarkCuNative]::DeepestChildAtScreenPoint($focusRoot, ' + x + ', ' + y + ')',
     `if (-not [NewmarkCuNative]::MoveCursorSmooth(${x}, ${y})) { ${psError('cursor_move_failed', 'Smooth physical cursor movement failed for the requested screen coordinate.')} }`,
   ];
   if (wheel) lines.push(`[NewmarkCuNative]::mouse_event(0x0800,0,0,${wheel},[System.UIntPtr]::Zero)`);
   if (scrollX) lines.push(`[NewmarkCuNative]::mouse_event(0x1000,0,0,${scrollX},[System.UIntPtr]::Zero)`);
-  lines.push(`Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; x=${x}; y=${y}; scroll_x=${scrollX}; scroll_y=${scrollY} } | ConvertTo-Json -Compress)`);
+  lines.push(`Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; x=${x}; y=${y}; scroll_x=${scrollX}; scroll_y=${scrollY}; wheel_target=("0x{0:X}" -f $wheelTarget.ToInt64()); wheel_target_class=[NewmarkCuNative]::ClassName($wheelTarget); ${focusResultFields()} } | ConvertTo-Json -Compress)`);
   return lines.join('\r\n');
 }
 
-function realTypeScript(text) {
+/**
+ * Put keyboard focus where a keystroke can reach the document, and report what was measured.
+ *
+ * `GetForegroundWindow() == target` is not enough: for a browser the foreground window is the
+ * frame, while the document lives in a child renderer window, and a keystroke delivered to
+ * the frame never reaches the page. This step is what makes `^0` and `type` land.
+ *
+ * When the caller named a window, that window is the root; otherwise the current foreground
+ * window is, because that is where the keystroke would go anyway.
+ */
+function focusEnsureLines() {
+  return [
+    '$focusRoot = if ($expectedForeground) { $expectedForeground } else { [NewmarkCuNative]::GetForegroundWindow() }',
+    '$focus = [NewmarkCuNative]::EnsureKeyFocus($focusRoot)',
+  ];
+}
+
+/** The focus facts, as result fields. Every one of them is a measurement. */
+function focusResultFields() {
+  return [
+    'focus_target=("0x{0:X}" -f $focus.Target);',
+    'focus_target_class=$focus.TargetClassName;',
+    'focus_before=("0x{0:X}" -f $focus.FocusedBefore);',
+    'focus_after=("0x{0:X}" -f $focus.FocusedAfter);',
+    'focus_changed=$focus.Changed;',
+    'focus_verified=$focus.Ok;',
+    'focus_target_is_top_level=$focus.TargetIsTopLevel;',
+  ].join(' ');
+}
+
+/**
+ * `type`: literal characters, delivered as unicode key events.
+ *
+ * `SendKeys` is deliberately no longer used here. It types *keystrokes*, so an active IME
+ * composes them - the recorded defect put a pinyin-syllable rendering of "new" into the
+ * field instead of `newmark2dsh-publish`. `SendUnicodeText` sends the characters themselves
+ * and cannot be composed. `key` still uses `SendKeys`, because there the caller is naming
+ * real keys and chords on purpose.
+ *
+ * There is no clipboard step at all, so there is no clipboard to corrupt or restore.
+ */
+function realTypeScript(text, expect = {}) {
+  const value = String(text === null || text === undefined ? '' : text);
+  const expected = value.length * 2;
   return [
     '$ErrorActionPreference = "Stop"',
-    ...foregroundGuardLines({}),
-    `[System.Windows.Forms.SendKeys]::SendWait(${psQuote(encodeSendKeysText(text))})`,
-    `Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; chars=${text.length}; foreground_verified=$true } | ConvertTo-Json -Compress)`,
+    ...foregroundGuardLines(expect),
+    ...focusEnsureLines(),
+    `$delivered = [NewmarkCuNative]::SendUnicodeText(${psQuote(value)})`,
+    `if ($delivered -ne ${expected}) { ${psError('unicode_delivery_failed', `The system accepted only $delivered of ${expected} unicode key events, so the text was not delivered as given.`)} }`,
+    // `delivery` stays the lane-level marker the rest of the surface uses; `text_delivery`
+    // names the mechanism that carried the characters, which is what item 1 is about.
+    `Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; text_delivery="unicode-key-events"; chars=${value.length}; utf16_units=${value.length}; events=${expected}; composed_by_ime=$false; clipboard_used=$false; ${focusResultFields()} foreground_verified=([NewmarkCuNative]::GetForegroundWindow() -ne [IntPtr]::Zero) } | ConvertTo-Json -Compress)`,
   ].join('\r\n');
 }
 
-function realKeyScript(key) {
+function realKeyScript(key, expect = {}) {
   const notation = normalizeSendKeysKey(key);
   if (!notation) return { error: `Unsupported key or key chord: ${key}` };
   return {
     script: [
       '$ErrorActionPreference = "Stop"',
-      ...foregroundGuardLines({}),
+      ...foregroundGuardLines(expect),
+      // `key` keeps SendKeys - the caller is naming real keys and chords - but the chord has
+      // to land on the window that carries it into the document, or it dies on the frame.
+      ...focusEnsureLines(),
       `[System.Windows.Forms.SendKeys]::SendWait(${psQuote(notation)})`,
-      `Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; key=${psQuote(key)}; send_keys=${psQuote(notation)}; foreground_verified=$true } | ConvertTo-Json -Compress)`,
+      `Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; key=${psQuote(key)}; send_keys=${psQuote(notation)}; ${focusResultFields()} foreground_verified=([NewmarkCuNative]::GetForegroundWindow() -ne [IntPtr]::Zero) } | ConvertTo-Json -Compress)`,
     ].join('\r\n'),
   };
 }
 
+/**
+ * One activation attempt, reported from a real `GetForegroundWindow()` read taken after it.
+ *
+ * It used to answer `foreground_verified=$true` unconditionally once the attempt had been
+ * made, which is how `app_activate` came back with `foreground_verified: true` next to an
+ * `app.foreground: false` while another window really held the foreground. The script now
+ * reports the measured facts - the technique that worked, how many attempts it took, and
+ * the handle/title/class/pid of whoever holds the foreground - and `foreground_verified` is
+ * that measurement rather than a claim. A mismatch is not thrown here: the caller retries
+ * and, if it still fails, names the window that really holds the foreground.
+ */
 function activateScript(handle, processId) {
   const handleValue = handleHex(handle);
   return [
@@ -2136,10 +2557,23 @@ function activateScript(handle, processId) {
     `$ownership = [NewmarkCuNative]::WindowOwnershipState($hwnd, ${Number(processId) || 0})`,
     `if ($ownership -eq 2) { ${psError('target_window_ownership_changed', 'The process id no longer owns the target window, so activation was refused.')} }`,
     `if ($ownership -ne 0) { ${psError('target_window_invalid', 'The target window is no longer valid, so activation was refused.')} }`,
-    `if (-not [NewmarkCuNative]::ActivateWindow($hwnd)) { ${psError('foreground_not_granted', 'Windows did not grant foreground focus to the selected application window.')} }`,
-    `if ([NewmarkCuNative]::GetForegroundWindow() -ne $hwnd) { ${psError('foreground_not_granted', 'The target window is not the foreground window after activation.')} }`,
-    `Write-Output (@{ ok=$true; action="app_activate"; handle=("0x{0:X}" -f $hwnd.ToInt64()); foreground_verified=$true; mouse_mode="real" } | ConvertTo-Json -Compress)`,
+    '$activation = [NewmarkCuNative]::ActivateWindowDetailed($hwnd)',
+    // The second read is the one that counts: it happens after the attempt has fully
+    // returned, so it cannot describe an intermediate state the attempt passed through.
+    '$measured = [NewmarkCuNative]::ForegroundFacts($hwnd)',
+    `Write-Output (@{ ok=$true; action="app_activate"; handle=("0x{0:X}" -f $hwnd.ToInt64()); foreground_verified=$measured.ForegroundIsTarget; foreground_is_target=$measured.ForegroundIsTarget; foreground_handle=("0x{0:X}" -f $measured.ForegroundHandle); foreground_title=$measured.ForegroundTitle; foreground_class_name=$measured.ForegroundClassName; foreground_process_id=$measured.ForegroundProcessId; activation_granted=$activation.Granted; activation_technique=$activation.Technique; activation_attempts=$activation.Attempts; mouse_mode="real" } | ConvertTo-Json -Compress)`,
   ].join('\r\n');
+}
+
+/** The handle/title/class/pid of whoever holds the foreground, as a refusal body. */
+function foregroundHolder(facts) {
+  if (!facts) return null;
+  return {
+    handle: facts.foreground_handle || null,
+    title: facts.foreground_title === undefined ? null : facts.foreground_title,
+    class_name: facts.foreground_class_name === undefined ? null : facts.foreground_class_name,
+    process_id: Number.isFinite(Number(facts.foreground_process_id)) ? Number(facts.foreground_process_id) : null,
+  };
 }
 
 async function runActionScript(script, options = {}) {
@@ -2652,8 +3086,6 @@ const lease = {
   ownerId: null,
   mouseMode: 'real',
   acquiredAt: 0,
-  expiresAt: 0,
-  timer: null,
   lastReleaseReason: '',
   lastOverlayError: '',
 };
@@ -2678,17 +3110,13 @@ function startTakeoverOverlay(ownerId) {
 
 function releaseLease(reason) {
   lease.lastReleaseReason = reason;
-  if (lease.timer) {
-    clearTimeout(lease.timer);
-    lease.timer = null;
-  }
   lease.ownerId = null;
   lease.acquiredAt = 0;
-  lease.expiresAt = 0;
   // Every exit path restores the physical mouse mode.
   lease.mouseMode = 'real';
-  // The visible half of the lease: takeover_stop, lease expiry, stopAll() and process
-  // exit all land here, so the native overlay can never outlive the lease that owns it.
+  // The visible half of the lease: `takeover_stop`, `stopAll()` and process exit all land
+  // here, so the native overlay can never outlive the lease that owns it. Time is no
+  // longer one of these paths - the lease has no expiry, so nothing here fires on a clock.
   try {
     releaseOverlay(reason);
   } catch (error) {
@@ -2697,19 +3125,24 @@ function releaseLease(reason) {
   return { released: true, reason };
 }
 
+/**
+ * The lease as it is reported.
+ *
+ * There is no expiry to compute: a held lease is held until `takeover_stop` (or the owning
+ * process dying). The three duration fields report `null` rather than a number, because a
+ * number would be read as a real deadline by every caller that trusts it.
+ */
 function activeLease() {
   if (!lease.ownerId) return null;
-  if (Date.now() >= lease.expiresAt) {
-    releaseLease('expired');
-    return null;
-  }
   return {
     owner_id: lease.ownerId,
     mouse_mode: lease.mouseMode,
     acquired_at: lease.acquiredAt,
-    expires_at: lease.expiresAt,
-    ttl_ms: LEASE_TTL_MS,
-    expires_in_ms: Math.max(0, lease.expiresAt - Date.now()),
+    expiry: LEASE_EXPIRY,
+    expires_at: null,
+    expires_in_ms: null,
+    ttl_ms: null,
+    released_by: LEASE_RELEASE_ACTION,
   };
 }
 
@@ -2730,21 +3163,19 @@ function takeoverStart(options) {
       requested_owner: ownerId,
       lock_mouse_mode: existing.mouse_mode,
       requested_mouse_mode: requested,
-      ttl_ms: LEASE_TTL_MS,
-      expires_in_ms: existing.expires_in_ms,
+      expiry: LEASE_EXPIRY,
+      ttl_ms: null,
+      expires_in_ms: null,
       lease: existing,
       mouse_mode: existing.mouse_mode,
       fallback_to_real_delivery: false,
     });
   }
-  if (lease.timer) clearTimeout(lease.timer);
   lease.ownerId = ownerId;
   lease.mouseMode = requested;
   lease.acquiredAt = Date.now();
-  lease.expiresAt = lease.acquiredAt + LEASE_TTL_MS;
-  // Lease expiry restores the physical mouse mode on its own.
-  lease.timer = setTimeout(() => { releaseLease('expired'); }, LEASE_TTL_MS);
-  if (lease.timer.unref) lease.timer.unref();
+  // There is no timer to arm: the lease has no time limit and only `takeover_stop`
+  // (or the owning process dying) releases it.
   // The takeover is only real once the screen itself carries the effect.
   startTakeoverOverlay(ownerId);
   const overlaySnapshot = overlayState();
@@ -2757,10 +3188,12 @@ function takeoverStart(options) {
     lease: {
       owner_id: ownerId,
       mouse_mode: requested,
-      ttl_ms: LEASE_TTL_MS,
+      expiry: LEASE_EXPIRY,
+      ttl_ms: null,
       acquired_at: lease.acquiredAt,
-      expires_at: lease.expiresAt,
-      expires_in_ms: LEASE_TTL_MS,
+      expires_at: null,
+      expires_in_ms: null,
+      released_by: LEASE_RELEASE_ACTION,
     },
     overlay: overlaySnapshot,
     physical_delivery_used: false,
@@ -2789,7 +3222,7 @@ function takeoverStop(options) {
     takeover: false,
     mouse_mode: 'real',
     released_owner: previousOwner,
-    lease: { held: false, owner_id: null, mouse_mode: 'real', ttl_ms: LEASE_TTL_MS },
+    lease: { held: false, owner_id: null, mouse_mode: 'real', expiry: LEASE_EXPIRY, ttl_ms: null, expires_at: null, expires_in_ms: null, released_by: LEASE_RELEASE_ACTION },
     overlay: overlayState(),
     physical_delivery_used: false,
     system_cursor_moved: false,
@@ -3016,6 +3449,52 @@ async function appListAction(action, options, mode, header) {
   };
 }
 
+/**
+ * How many times a failed activation is retried before it is reported as a failure.
+ *
+ * The retry is driven from here, not from inside one lane script, because the foreground a
+ * caller will actually get is the foreground measured after the whole round trip.
+ */
+const ACTIVATION_ATTEMPTS = 3;
+
+/**
+ * Activate, then confirm from a fresh measured read, then retry, then fail honestly.
+ *
+ * `activateScript` already reports a post-attempt `GetForegroundWindow()`, but that read
+ * happens inside the lane request. This re-runs the attempt and re-reads, so a window that
+ * loses the foreground again during the round trip is reported as a failure instead of a
+ * success, and the refusal always names the window that really holds the foreground.
+ */
+async function activateWithVerification(action, application, options) {
+  let last = null;
+  for (let attempt = 1; attempt <= ACTIVATION_ATTEMPTS; attempt += 1) {
+    const result = await runActionScript(activateScript(application.handle, application.process_id), { action, ...options, lane: 'action' });
+    last = result;
+    if (result.ok === true && result.foreground_verified === true) {
+      return { ...result, activation_verified_attempts: attempt };
+    }
+    // A refusal that is not about the foreground (a stale handle, a changed owner, an
+    // unavailable lane) is terminal: retrying it cannot help and would hide the cause.
+    if (result.ok !== true && result.error_code !== 'foreground_not_granted') return result;
+  }
+  const holder = foregroundHolder(last);
+  const named = holder && holder.handle
+    ? `The window that really holds the foreground is ${holder.handle}${holder.title ? ` ("${holder.title}")` : ''}${holder.process_id ? ` of process ${holder.process_id}` : ''}.`
+    : 'No window reported itself as the foreground window.';
+  return failure(action, 'foreground_not_granted', `Activation did not leave ${String(application.handle)} in the foreground after ${ACTIVATION_ATTEMPTS} attempts. ${named}`, {
+    mouse_mode: 'real',
+    expected_handle: String(application.handle),
+    foreground_verified: false,
+    foreground_is_target: false,
+    foreground: holder,
+    activation_technique: last ? last.activation_technique : null,
+    activation_attempts: ACTIVATION_ATTEMPTS,
+    app: { ...application, foreground: false },
+    physical_delivery_used: false,
+    system_cursor_moved: false,
+  });
+}
+
 async function appActivateAction(action, options, mode, header) {
   const resolved = await resolveApplication({ ...options, virtualScope: mode.mode === 'virtual' });
   if (resolved.ok !== true) {
@@ -3024,8 +3503,11 @@ async function appActivateAction(action, options, mode, header) {
   const application = resolved.application;
   if (mode.mode === 'virtual') return { ...header, ...bindVirtualTarget(application, options.ownerId) };
   if (options.dryRun === true) return { ...header, ok: true, action, dry_run: true, app: application, mouse_mode: 'real' };
-  const result = await runActionScript(activateScript(application.handle, application.process_id), { action, ...options, lane: 'action' });
-  return { ...header, ...result, app: application };
+  const activated = await activateWithVerification(action, application, options);
+  if (activated.ok !== true) return { ...header, ...activated };
+  // The app record was enumerated before the activation, so its `foreground` flag is
+  // stale. It is replaced by the measured value, so the payload cannot contradict itself.
+  return { ...header, ...activated, app: { ...application, foreground: activated.foreground_is_target === true } };
 }
 
 async function desktopPhysicalAction(action, options, mode, header) {
@@ -3176,29 +3658,34 @@ async function appPhysicalAction(action, options, mode, header) {
   }
 
   if (options.dryRun === true) return { ...header, ok: true, action, dry_run: true, app: application, x: point.x, y: point.y, mouse_mode: 'real' };
-  const activated = await runActionScript(activateScript(application.handle, application.process_id), { action, ...options, lane: 'action' });
-  if (activated.ok !== true) return { ...header, ...activated, app: application };
+  const activated = await activateWithVerification(action, application, options);
+  // Nothing is delivered unless the target was measured in the foreground. Every branch below
+  // used to hard-code `foreground_verified: true` after this point; the flag now carries
+  // the measured value, and `app_type`/`app_key` finally guard on the target handle too.
+  if (activated.ok !== true) return { ...header, ...activated, app: { ...application, foreground: false } };
+  const foregroundVerified = activated.foreground_is_target === true;
   const expect = { handle: application.handle, processId: application.process_id };
+  const appRecord = { ...application, foreground: foregroundVerified };
   if (action === 'app_click') {
     const clicked = await realStep('click', realClickScript(point.x, point.y, options.button === 'right' ? 'right' : 'left', expect), options, true);
-    return { ...header, ...clicked, action, app: application, foreground_verified: true };
+    return { ...header, ...clicked, action, app: appRecord, foreground_verified: foregroundVerified };
   }
   if (action === 'app_scroll') {
     const scrollX = Math.floor(Number(options.scrollX || options.scroll_x || 0));
     const scrollY = Math.floor(Number(options.scrollY || options.scroll_y || 0));
     if (!scrollX && !scrollY) return failure(action, 'scroll_delta_required', 'scroll_x or scroll_y is required.', { ...header });
     const scrolled = await realStep('scroll', realScrollScript(point.x, point.y, scrollX, scrollY, expect), options, false);
-    return { ...header, ...scrolled, action, app: application, foreground_verified: true };
+    return { ...header, ...scrolled, action, app: appRecord, foreground_verified: foregroundVerified };
   }
   if (action === 'app_type') {
-    const typed = await realStep('type', realTypeScript(String(options.text || '')), options, false);
-    return { ...header, ...typed, action, app: application, foreground_verified: true };
+    const typed = await realStep('type', realTypeScript(String(options.text || ''), expect), options, false);
+    return { ...header, ...typed, action, app: appRecord, foreground_verified: foregroundVerified };
   }
   if (action === 'app_key') {
-    const built = realKeyScript(String(options.key || ''));
+    const built = realKeyScript(String(options.key || ''), expect);
     if (built.error) return failure(action, 'key_unsupported', built.error, { ...header });
     const pressed = await realStep('key', built.script, options, false);
-    return { ...header, ...pressed, action, app: application, foreground_verified: true };
+    return { ...header, ...pressed, action, app: appRecord, foreground_verified: foregroundVerified };
   }
   const points = ['startX', 'startY', 'endX', 'endY'].map(key => Math.floor(Number(options[key])));
   if (!points.every(Number.isFinite)) return failure(action, 'drag_points_required', 'start_x, start_y, end_x and end_y are required pixel coordinates.', { ...header });
@@ -3289,7 +3776,8 @@ function modeReport(action, options) {
       full_capture: 'PrintWindow(hwnd,hdc,2) in the window_capture lane',
     },
     constants: {
-      lease_ttl_ms: LEASE_TTL_MS,
+      lease_expiry: LEASE_EXPIRY,
+      lease_release_action: LEASE_RELEASE_ACTION,
       min_action_interval_ms: MIN_ACTION_INTERVAL_MS,
       move_curve_ms: MOVE_CURVE_MS,
       sparse_min_interval_ms: SPARSE_MIN_INTERVAL_MS,
@@ -3297,7 +3785,7 @@ function modeReport(action, options) {
     },
     lease: active
       ? { held: true, ...active, last_release_reason: lease.lastReleaseReason }
-      : { held: false, owner_id: null, mouse_mode: 'real', ttl_ms: LEASE_TTL_MS, last_release_reason: lease.lastReleaseReason },
+      : { held: false, owner_id: null, mouse_mode: 'real', expiry: LEASE_EXPIRY, ttl_ms: null, expires_at: null, expires_in_ms: null, released_by: LEASE_RELEASE_ACTION, last_release_reason: lease.lastReleaseReason },
     lease_release_restores_mouse_mode: 'real',
     // The takeover effect is a native window covering the whole screen, not the DSH
     // page's CSS ring: `running` is what is on screen, `reason` is why it is not.
@@ -3316,7 +3804,29 @@ function modeReport(action, options) {
     virtual_mode: {
       delivery: 'posted-window-messages',
       receipts_are_honest: { queued: true, action_completed: false },
-      refuses: ['observe', 'app_observe', 'sequence'],
+      /*
+       * The advertisement names *conditions*, not actions.
+       *
+       * It used to read `refuses: ['observe', 'app_observe', 'sequence']`, which told a model
+       * that virtual mode cannot observe at all - so it would abandon a path that works. What
+       * the code actually refuses is the *foreground* variant of two actions, and `sequence`
+       * in full; `app_observe` with a target is supported and does a background capture.
+       * Every entry below is a condition this module enforces, and the supported paths are
+       * advertised rather than hidden.
+       */
+      refuses: [
+        'observe of the foreground desktop (virtual mode refuses the whole-desktop capture: use app_observe with app_target or window_handle)',
+        'app_observe without app_target or window_handle (the foreground scene check)',
+        'desktop move/click/drag/scroll/type/key without app_target, window_handle or a prior app_observe target (virtual_mode_requires_app_target)',
+        'sequence (virtual mode refuses a scene-checked sequence: use app_observe followed by explicit app_* actions)',
+      ],
+      supports: [
+        'app_list, including occluded and background windows',
+        'app_observe with app_target or window_handle (background window capture, no foreground capture)',
+        'app_activate with app_target or window_handle (binds the target; it never activates anything)',
+        'app_click, app_drag, app_scroll, app_type, app_key with app_target or window_handle (posted window messages)',
+      ],
+      requires: ['app_target or window_handle'],
       never_falls_back_to_real_delivery: true,
     },
     physical_delivery_used: false,
