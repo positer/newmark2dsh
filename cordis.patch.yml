@@ -1,23 +1,29 @@
-# Newmark Core: one bundle, four components, each its own package and its own row.
+# Newmark Core: one bundle, two Loader rows, four components.
 #
-# The client-module registry allows ONE Loader entry per package — two entries
-# resolving to the same package are a fatal boot error ("resolves from multiple
-# active Loader sources ... remove one entry"), which put the app into safe mode —
-# so every component is a sibling package and this bundle's patch is what declares
-# them, which is why all four appear under one plugin card:
+#   newmark-core   newmark2dsh                      the shared Newmark root, and the row
+#                                                   that composes MemoryLab and
+#                                                   ComputerUse from paths inside this
+#                                                   package
+#   preset-dev     @deepseek-ai/dsh-agent-preset    the Dev agent preset declaration
 #
-#   newmark2dsh          the shared Newmark root and its config
-#   newmark2dsh-memorylab     the durable store and the five memory_lab_* tools
-#   newmark2dsh-computeruse   the automation backends and the two ComputerUse tools
-#   preset-dev                   the Dev agent preset declaration
+# The components are composed, not declared. Declaring them as rows put their module
+# paths on the plugin card, because the card renders a row's resolved specifier, and
+# every alternative that kept a package name needed a separate npm package per component.
+# Composing them means the card shows one row and the components are named by the
+# bundle's own config panel instead.
 #
-# Disabling a row retires that component completely: its tools are never
-# registered, it publishes no page global, and the Client half registers none of
-# its seats.
+# The client-module registry still matters: it allows ONE Loader entry per package, so a
+# component that were declared as a row would have to be its own package. That is why
+# components/*/package.json keep existing — with the core row composing them by path, the
+# nearest manifest is what gives each component its own package identity.
+#
+# A component switched off is genuinely unloaded: its fiber is disposed, its tools are
+# unregistered, and it publishes no page global. The bundle's config page renders these
+# switches and shows the Host's answer rather than the click.
 #
 # `root` is the shared Newmark user store. An empty value resolves to the same
-# conventional user path Newmark itself uses (`<home>/.Newmark`), so both products
-# read and write the same `Memory Lab/` files, in the same formats.
+# conventional user path Newmark itself uses (`<home>/.Newmark`), so both products read
+# and write the same `Memory Lab/` files, in the same formats.
 - insert:
     - id: newmark-core
       name: 'newmark2dsh'

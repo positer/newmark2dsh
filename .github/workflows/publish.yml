@@ -92,9 +92,18 @@ jobs:
             const deps = Object.keys(root.dependencies || {});
             if (deps.length > 0) { console.error('the bundle declares dependencies: ' + deps.join(', ')); process.exit(1); }
             if (JSON.stringify(root).includes('file:')) { console.error('a file: specifier is still present'); process.exit(1); }
+            // Match a row declaration, not any occurrence of the string: a mention in
+            // the header comment is prose, and treating prose as structure is what made
+            // this guard report a failure that did not exist.
             const patch = fs.readFileSync('cordis.patch.yml', 'utf8');
+            const rows = [...patch.matchAll(/^ {4}- id: (\S+)$/gm)].map((m) => m[1]);
+            if (rows.length !== 2 || rows[0] !== 'newmark-core' || rows[1] !== 'preset-dev') {
+              console.error('the patch must declare exactly the core row and the preset row, found: ' + rows.join(', '));
+              process.exit(1);
+            }
             for (const name of ['newmark2dsh-memorylab', 'newmark2dsh-computeruse']) {
-              if (patch.includes(name)) { console.error('the patch still addresses ' + name); process.exit(1); }
+              const row = new RegExp("^ {6}name: '" + name + "'$", 'm');
+              if (row.test(patch)) { console.error('the patch declares a row for ' + name); process.exit(1); }
             }
           " || fail=1
 
