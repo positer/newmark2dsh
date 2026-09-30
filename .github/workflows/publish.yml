@@ -55,27 +55,54 @@ jobs:
           echo "publishing newmark2dsh $version"
 
       # The two component packages live inside this bundle and are declared as its
-      # `file:` dependencies. If either manifest or any of their libraries is
-      # missing, the published tarball installs and then does nothing, so this is
-      # checked before publishing rather than discovered by a user.
+      # The components live inside this bundle and are loaded by the core row from paths
+      # in this package — they are NOT declared dependencies. An earlier version of this
+      # workflow required them to be, which is what its own guard reported when the
+      # design changed, and it correctly blocked the publish until the expectation was
+      # brought up to date. The point of the check is unchanged: if a component's
+      # manifest or any of its libraries is missing, the published tarball installs and
+      # then does nothing, so it is caught here rather than by a user.
       - name: The bundle must be self-contained
         run: |
           set -eu
           fail=0
+
+          # 1. Both components ship, with their manifests, and are composed by the core row.
           for component in memorylab computeruse; do
             manifest="components/$component/package.json"
             [ -f "$manifest" ] || { echo "::error::missing $manifest"; fail=1; continue; }
             node -e "
               const fs = require('fs');
               const m = JSON.parse(fs.readFileSync('$manifest', 'utf8'));
-              const root = JSON.parse(fs.readFileSync('package.json', 'utf8'));
               if (m.dsh?.client !== undefined) { console.error('$component must not declare dsh.client'); process.exit(1); }
-              if (root.dependencies?.[m.name] === undefined) { console.error('$component is not a declared dependency'); process.exit(1); }
+              const index = fs.readFileSync('index.js', 'utf8');
+              if (!index.includes(\"./components/$component/index.js\")) {
+                console.error('$component is not composed by the core row'); process.exit(1);
+              }
             " || fail=1
           done
-          for f in index.js client.js cordis.patch.yml components/memorylab/lib/memory-store.js; do
+
+          # 2. No component is addressed as a package. A `file:` dependency is resolved by
+          #    pnpm against the project root rather than this package, so it fails every
+          #    registry install; and a bare component name needs one npm package per
+          #    component, which is what composing them removed.
+          node -e "
+            const fs = require('fs');
+            const root = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const deps = Object.keys(root.dependencies || {});
+            if (deps.length > 0) { console.error('the bundle declares dependencies: ' + deps.join(', ')); process.exit(1); }
+            if (JSON.stringify(root).includes('file:')) { console.error('a file: specifier is still present'); process.exit(1); }
+            const patch = fs.readFileSync('cordis.patch.yml', 'utf8');
+            for (const name of ['newmark2dsh-memorylab', 'newmark2dsh-computeruse']) {
+              if (patch.includes(name)) { console.error('the patch still addresses ' + name); process.exit(1); }
+            }
+          " || fail=1
+
+          # 3. The files the bundle cannot work without.
+          for f in index.js client.js cordis.patch.yml components/memorylab/lib/memory-store.js components/computeruse/lib/win32.js components/computeruse/lib/overlay-win32.js; do
             [ -f "$f" ] || { echo "::error::missing $f"; fail=1; }
           done
+
           exit $fail
 
       # A tag that reaches here publishes. `npm stage publish` is the alternative
