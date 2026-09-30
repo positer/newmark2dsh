@@ -97,14 +97,19 @@ jobs:
             // double quote is bash syntax, not a regex anchor. That is exactly how the
             // previous version of this check failed inside the runner.
             const patch = fs.readFileSync('cordis.patch.yml', 'utf8');
-            const lines = patch.split('\n').map((line) => line.trim());
-            const rows = lines.filter((line) => line.startsWith('- id: ')).map((line) => line.slice(6));
+            // Keep the indentation. The preset row carries a nested plugin list whose
+            // entries also begin with a dash and an id, so trimming counted 'persona' as
+            // a third top-level row. A row of this patch is exactly four spaces deep.
+            const lines = patch.split('\n');
+            const rows = lines
+              .filter((line) => line.startsWith('    - id: '))
+              .map((line) => line.slice(10).trim());
             if (rows.length !== 2 || rows[0] !== 'newmark-core' || rows[1] !== 'preset-dev') {
               console.error('the patch must declare exactly the core row and the preset row, found: ' + rows.join(', '));
               process.exit(1);
             }
             for (const name of ['newmark2dsh-memorylab', 'newmark2dsh-computeruse']) {
-              if (lines.includes('name: ' + JSON.stringify(name))) {
+              if (lines.some((line) => line.trim() === 'name: ' + JSON.stringify(name))) {
                 console.error('the patch declares a row for ' + name);
                 process.exit(1);
               }
