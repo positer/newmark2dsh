@@ -1,0 +1,8 @@
+{
+  "name": "Newmark Core",
+  "description": "Newmark MemoryLab and Newmark ComputerUse as the two components of one plugin, over the shared ~/.Newmark user store.",
+  "panel": {
+    "title": "Memory Lab",
+    "subtitle": "Newmark persistent memory"
+  }
+}

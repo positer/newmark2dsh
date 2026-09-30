@@ -1,0 +1,8 @@
+{
+  "name": "Newmark Core",
+  "description": "Newmark 记忆实验室与 Newmark 电脑操作，作为同一插件的两个组件，共用 ~/.Newmark 用户存储。",
+  "panel": {
+    "title": "记忆实验室",
+    "subtitle": "Newmark 持久记忆"
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "name": "newmark2dsh",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Newmark Core for DeepSeek Harness: one bundle carrying Newmark's MemoryLab, ComputerUse and the Dev agent preset as four independently switchable components, over the shared ~/.Newmark user store.",
+  "meta": {
+    "title": "Newmark Core",
+    "description": "Newmark MemoryLab (persistent memory + sidebar renderer) and Newmark ComputerUse (all modes + takeover stroke), over the shared user store."
+  },
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/*.js",
+    "components/*/*.js",
+    "components/*/package.json",
+    "components/*/lib/*.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "author": {
+    "name": "Newmark AI",
+    "email": "support@newmark.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/positer/newmark2dsh.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "newmark",
+    "memorylab",
+    "computeruse"
+  ],
+  "dependencies": {
+    "newmark2dsh-memorylab": "file:./components/memorylab",
+    "newmark2dsh-computeruse": "file:./components/computeruse"
+  }
+}
