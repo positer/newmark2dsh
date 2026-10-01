@@ -315,8 +315,38 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
       return [
         {
           name: 'computer_use',
-          description:
+          /**
+           * The operating guide, and why it is in the description rather than only in a document.
+           *
+           * Every rule below was measured on this machine during a real ComputerUse session, and
+           * each one cost time to discover. Several are counter-intuitive enough that a caller
+           * gets them wrong without being told: the Windows key answers `ok: true` while doing
+           * nothing at all, `app_activate` reads like "start" but never launches a process,
+           * `observe` is a window capture rather than the screen, and a lease released without
+           * its owner id is refused. A parameter list cannot carry any of that, and a model
+           * chooses its next action from this text.
+           *
+           * The full record - each rule, the receipt field that carries it, the source line that
+           * implements it and the assertion that holds it - is
+           * `docs/03-computer-use-playbook.md` in the Newmark2DSH workspace. This text is kept
+           * short on purpose, and `scripts/verify-computeruse-win32.mjs` asserts it against the
+           * behaviour measured in the same run, so it cannot quietly drift from the code.
+           */
+          description: [
             'Drive this desktop through Newmark ComputerUse. Accepts the full action surface (observe, app_list, app_observe, wait_for, sequence, takeover_start, takeover_stop, move, click, drag, scroll, type, key, wait, app_activate and the app_* variants). Mouse mode is bound for the session at takeover_start only, and the takeover lease is exclusive to one owner.',
+            '',
+            'OPENING AN APPLICATION. The Windows key does not work on this machine and it fails silently: `key: "win"` and `key: "win+r"` both answer `ok: true` with `focus_changed: true` and nothing happens, because the shell ignores synthetic Windows keys. The receipt says `windows_key_effect: "not-observed"` rather than claiming the key worked. Use the ordinary chord instead: `key: "ctrl+esc"` opens the Start menu, `type: "<the application name>"` lands in the Start menu search box, then `key: "enter"` launches it. `app_activate` NEVER launches a process: it binds a window that already exists and answers `app_target_not_found` when nothing matches, so it cannot start an application - to open one, use `ctrl+esc`.',
+            '',
+            'OPERATING HABITS. Each was measured in a real session; the record and its evidence are in `docs/03-computer-use-playbook.md` (Newmark2DSH).',
+            '- Call `takeover_start` before your first input, and `takeover_stop` in a `finally`. The lease is exclusive to one owner, a leaked lease leaves a topmost click-through overlay on the desktop, and `takeover_stop` refuses without the exact `owner_id` (`takeover_lease_owned_by_another_owner`).',
+            '- `ok: true` does not mean it happened. Read the receipt fields themselves - `focus_changed`, `windows_key_effect`, `capture_scope`, `target_scope` - and where they are inconclusive verify from outside (`app_list`, or a foreground-window read) instead of trusting the return value of the action.',
+            '- `observe` captures ONE WINDOW - the foreground window unless you name one - not the desktop: `capture_scope: "window"`, `capture_method: "PrintWindow(hwnd,hdc,2)"`. For the screen itself use `screen_capture` with `target: "desktop"` and check that the payload says `capture_scope: "virtual-screen"` and `target_scope: "screen"` (`capture_method: "BitBlt(screen-dc,virtual-screen)"`).',
+            '- Prefer `window_handle` over `app_target`: `app_target` has failed to match a window that exists and that `app_list` had just listed with that title. `window_handle` is exact.',
+            '- `foreground_window_unavailable` usually means the Start menu is open: the shell windows are not enumerated, so `app_list` can answer `applications: []` while the desktop is not empty. Confirm from outside rather than concluding there is nothing on screen.',
+            '- `scroll` requires `x` and `y`: there is no "scroll whatever has focus", and `scroll` with only `scroll_y` answers `point_required`.',
+            '- `type` is delivered as unicode key events (`text_delivery: "unicode-key-events"`), so Chinese and other non-ASCII text works.',
+            '- A lone Windows key is refused by the shell, and a Windows chord is refused in virtual mode (`windows_key_requires_real_delivery`: a posted `WM_KEYDOWN` cannot open the Start menu). Use `ctrl+esc`.',
+          ].join('\n'),
           parameters: {
             type: 'object',
             properties: {
