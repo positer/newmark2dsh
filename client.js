@@ -1762,12 +1762,14 @@ function readPageGlobals() {
               className: 'ml-btn',
               disabled: !!state.reindexing,
               onClick: reindex,
-              title:
-                '重建索引：一次动作，两半，按这个顺序。' +
-                '（1）确定性重建——Host 半侧重写并核对索引与标签图，毫秒级；' +
-                '（2）判定——把这次重建后的标签图交给 agent-api 运行一次 agent 判定（假根父节点接续、同义近义 tag 合并、未被正确解析的 tag 误读为单 tag），' +
-                '运行在 Host 半侧通过工具发起，用你授权的模型，可能需要一两分钟。' +
-                '两半的结果分别报告：重建失败会说明，判定没运行、超时或失败也会说明，不会互相冒充。不重载外壳。',
+              /* The tooltip names the ACTION and stops there.
+               *
+               * It used to spell out what the judgement asks — the three classes, in the
+               * prompt's own words — and that is the built-in prompt leaking into a hover
+               * tooltip. A user hovering a button wants to know what the button does; the ask
+               * itself belongs to whoever receives it, and paraphrasing it here also meant the
+               * tooltip could drift from the prompt it was paraphrasing. */
+              title: '重建索引：先做确定性重建，再由 Agent 判定一次。不重载外壳。',
             },
             state.reindexing ? '重建并判定中…' : '重建索引',
           ),
