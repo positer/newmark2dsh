@@ -240,6 +240,17 @@ function readPageGlobals() {
 .ml-toolbar { position: absolute; top: 12px; right: 14px; display: flex; gap: 6px; align-items: center; padding: 5px 8px; border-radius: 9px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-overlay); }
 .ml-zoom { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary); min-width: 38px; text-align: center; }
 .ml-status { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-top: 1px solid var(--dsw-alias-border-l1); font-size: 11px; color: var(--dsw-alias-label-secondary); flex-shrink: 0; }
+/* The judgement prompt, offered beside the deterministic rebuild and not instead of it. The
+   text is the HOST half's — no tool context exists here, so this half cannot compose the ask and
+   does not try: it shows what it was served, and copies it. */
+.ml-prompt { border-bottom: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); flex-shrink: 0; }
+.ml-prompt-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px; }
+.ml-prompt-title { font-size: 11px; font-weight: 600; letter-spacing: .06em; color: var(--dsw-alias-label-primary); }
+.ml-prompt-note { font-size: 11px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
+.ml-prompt-spacer { flex: 1; }
+.ml-prompt-copy { height: 24px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--dsw-alias-border-l2); background: transparent; color: var(--dsw-alias-label-primary); font: inherit; font-size: 11px; cursor: pointer; flex-shrink: 0; }
+.ml-prompt-copy:hover { background: var(--dsw-alias-bg-layer-2); }
+.ml-prompt-body { max-height: 168px; overflow: auto; margin: 0; padding: 0 14px 10px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
 .ml-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); }
 .ml-status[data-state="ready"] .ml-dot { background: var(--dsw-alias-state-success-primary); }
 .ml-status[data-state="error"] .ml-dot { background: var(--dsw-alias-state-error-primary); }
@@ -330,6 +341,15 @@ function readPageGlobals() {
         refreshError: '',
         /** Whether the Host half has a judge for the tag graph; absence is a state. */
         judge: payload.judge && typeof payload.judge === 'object' ? payload.judge : null,
+        /**
+         * The judgement PROMPT, as the Host half rendered it.
+         *
+         * Read from the snapshot and never composed here. The ask names the tools a run must
+         * call, and this half has no tool context by construction — so a prompt it built itself
+         * would be a promise this page cannot keep. What it can do is show the text that came
+         * with the snapshot and copy it, and that is the whole of its part in a judgement run.
+         */
+        judgePrompt: payload.prompt && typeof payload.prompt === 'object' ? payload.prompt : null,
         root: String(payload.root || ''),
         generatedAt: String(payload.generatedAt || ''),
       };
@@ -454,6 +474,7 @@ function readPageGlobals() {
         reindexError: '',
         refreshError: '',
         judge: null,
+        judgePrompt: null,
         servedBy: 'page-global',
         rebuildResult: null,
         root: '',
@@ -525,6 +546,7 @@ function readPageGlobals() {
               generatedAt: String(fresh.generatedAt || ''),
               reindexError: String(fresh.reindexError || ''),
               judge: fresh.judge && typeof fresh.judge === 'object' ? fresh.judge : null,
+              judgePrompt: fresh.prompt && typeof fresh.prompt === 'object' ? fresh.prompt : null,
               // The store fields are the fresh ones; the switch states and the lease
               // mirror still come from the page globals this page was served with.
               payload: { ...(readPageGlobals() || {}), ...fresh },
@@ -568,6 +590,7 @@ function readPageGlobals() {
           generatedAt: String(payload.generatedAt || ''),
           reindexError: String(payload.reindexError || ''),
           judge: payload.judge && typeof payload.judge === 'object' ? payload.judge : null,
+          judgePrompt: payload.prompt && typeof payload.prompt === 'object' ? payload.prompt : null,
           payload,
           reason,
         });
@@ -1633,7 +1656,85 @@ function readPageGlobals() {
       );
     }
 
-    /* -------------------------------------------------------------------- panel */
+    /* ------------------------------------------------------- the offered prompt */
+
+    /**
+     * The prompt this half offers, built by the Host half, shown where the rebuild is.
+     *
+     * The user's report was exact: 重建索引 finished before a single Agent response could have
+     * begun, because it is the deterministic rebuild and the Agent was never in it. The fix is
+     * not to put a model behind the button — the constraint that governs this bundle is that the
+     * agent core is TOOL-INVOKED only, a button on this page has no tool context, and the gate
+     * that asserts no HTTP method produces a run must keep passing. So this half offers the
+     * judgement as what it actually is: a prompt, ready to hand to the Agent, under the button's
+     * own statement that the rebuild it performs is deterministic and nothing more.
+     *
+     * The text is the HOST half's, taken from the snapshot. Nothing here could compose the ask:
+     * the tool context that would make it real does not exist on this side. A snapshot from a
+     * Host half older than this bundle carries no prompt, and then there is no strip at all
+     * rather than an invented one.
+     */
+    function JudgementPrompt({ state }) {
+      const [copied, setCopied] = React.useState('');
+      const prompt = state.judgePrompt;
+      if (!prompt || typeof prompt !== 'object') return null;
+      const text = typeof prompt.text === 'string' ? prompt.text : '';
+      const status = String(prompt.status || '');
+      const found = prompt.counts && Number.isFinite(Number(prompt.counts.findings)) ? Number(prompt.counts.findings) : null;
+      const ready = status === 'ready' && text.length > 0;
+      const title = ready
+        ? `索引判定提示词${found === null ? '' : ` · ${found} 项待判定`}`
+        : '索引判定提示词';
+      const note = ready
+        ? '把这段提示词交给 Agent（例如粘贴到对话里）；它不在这里运行。重建索引是确定性重建，只有 Agent 能判定。'
+        : String(prompt.notice || '当前没有可用的索引判定提示词。');
+      const copy = (event) => {
+        const say = (label) => {
+          setCopied(label);
+          setTimeout(() => setCopied(''), 1600);
+        };
+        const fallback = () => {
+          try {
+            const field = event.currentTarget.closest('.ml-prompt')?.querySelector('.ml-prompt-body');
+            const range = document.createRange();
+            range.selectNodeContents(field);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            say(document.execCommand('copy') ? '已复制' : '请手动复制');
+          } catch {
+            say('请手动复制');
+          }
+        };
+        // `navigator.clipboard` is absent outside a secure context, and a copy button that
+        // silently does nothing is worse than one that says it could not: the panel selects
+        // the text instead, so the keystroke still finishes the job.
+        try {
+          const written = navigator.clipboard?.writeText?.(text);
+          if (written && typeof written.then === 'function') written.then(() => say('已复制'), fallback);
+          else fallback();
+        } catch {
+          fallback();
+        }
+      };
+      return h(
+        'div',
+        {
+          className: 'ml-prompt',
+          'data-ml-prompt': status,
+          'data-ml-prompt-version': String(prompt.relationshipVersion || ''),
+        },
+        h(
+          'div',
+          { className: 'ml-prompt-head' },
+          h('span', { className: 'ml-prompt-title' }, title),
+          h('span', { className: 'ml-prompt-note' }, `${note}${copied ? ` · ${copied}` : ''}`),
+          h('div', { className: 'ml-prompt-spacer' }),
+          ready ? h('button', { type: 'button', className: 'ml-prompt-copy', onClick: copy }, '复制提示词') : null,
+        ),
+        ready ? h('pre', { className: 'ml-prompt-body' }, text) : null,
+      );
+    }
 
     function MemoryLabPanel() {
       const state = useMemoryLab();
@@ -1703,12 +1804,18 @@ function readPageGlobals() {
               onClick: reindex,
               title:
                 '确定性重建：让 Host 半侧重渲染索引（索引过期时在那里重建），再从存储重新读取快照；不重载外壳。' +
-                '这里不做判定——三类判定（假根父节点接续、同义近义 tag 合并、tag 误读）需要一次模型运行，' +
-                '而 agent-api 只能由工具调用，页面没有工具上下文；判定由 Agent 经工具完成：先读证据，再决定，再应用。',
+                '这个按钮只做确定性重建，不做判定——三类判定（假根父节点接续、同义近义 tag 合并、tag 误读）需要一次模型运行，' +
+                '而 agent-api 只能由工具调用，页面没有工具上下文，所以判定是 Agent 经工具完成的：先读证据，再决定，再应用。' +
+                '下面给出的是这次判定要用的提示词，可以直接复制交给 Agent；复制本身不运行任何东西。',
             },
             state.reindexing ? '重建中…' : '重建索引',
           ),
         ),
+        // The prompt sits directly under the rebuild action, because they are the two halves of
+        // one job and the panel must never blur which half it did: the button rebuilt the index
+        // deterministically, and the strip below it is the judgement, offered as text for an
+        // Agent to pick up. Rendered only when the Host half carried one.
+        state.phase === 'ready' ? h(JudgementPrompt, { state }) : null,
         state.phase === 'ready' && componentCount === 0 && tagCount === 0
           ? h(
               'div',

@@ -12,6 +12,7 @@
  * one memory.
  */
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { MemoryLabStore, MemoryLabStoreError, TAG_DECISION_KINDS } from './lib/memory-store.js';
 // The presence probe belongs to the component that owns the tool being probed, and it works
@@ -261,6 +262,10 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
       },
       findings: {
         total: review.counts.findings,
+        // The graph's size travels with the findings because the prompt states it, and a
+        // caller reading the request alone must not have to look anywhere else for it.
+        tags: review.counts.tags,
+        components: review.counts.components,
         byKind: review.counts.byKind,
         returned: review.window.returned,
         omitted: review.window.omitted,
@@ -272,6 +277,211 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         reversible: 'every apply archives the pre-change index.json and returns the undo that restores it',
       },
     };
+  }
+
+  /**
+   * What a prompt says when there is nothing to send, and when there is nobody to send it to.
+   *
+   * A review finds nothing, a review cannot be taken, or a question has no evidence: each of
+   * those is a real answer, and none of them is a prompt. They are kept apart on purpose —
+   * "there is nothing to judge" and "the judgement half is switched off" are different states
+   * to be in, and collapsing them into one blank string is how a caller comes to believe a
+   * judgement was asked for and came back empty.
+   */
+  const PROMPT_NOTICES = Object.freeze({
+    none: '索引里没有需要判定的事项：确定性重建已经做完，标签图没有留下同义近义、假根父节点或误解析的候选。这不是跳过，也不是失败，是重建后的稳定状态。',
+    unavailable: `判定不可用：${AGENT_API_INTERFACE} 已停用，标签判定的三个问题都没有可用的运行来源。这不是跳过，也不是待办——确定性重建不受影响。`,
+  });
+  const NO_EVIDENCE_NOTICE = '（这一次的审查结果没有返回任何发现，因此没有证据可以呈现。）';
+  const REVIEW_UNAVAILABLE_NOTICE = '审查暂时读不出来，所以现在没有可复制的提示词：';
+
+  /**
+   * The judgement request as the PROMPT a model is actually sent.
+   *
+   * The request is the structured half — questions with ids and evidence kinds, the graph's
+   * relationship version, the finding counts, an answer shape. Handing that object to a model
+   * is handing it a payload. This renders the same thing as the prose a person would write, and
+   * it is the only place in this bundle where the three questions become a message:
+   *
+   *  - the three questions are asked in the USER'S OWN WORDS for them (同义近义 tag 合并 /
+   *    假根父节点接续 / 未被正确解析的 tag 误读为单 tag), with their finding kinds attached as
+   *    where-to-look, never as the thing being asked;
+   *  - the sequence is stated as a procedure: read the evidence, decide, then apply — two calls
+   *    with a decision between them, which is what this component has always said it is;
+   *  - the guard travels with the prompt (`expectedRelationshipVersion`, archive + undo), so a
+   *    run that decides correctly and applies late is refused rather than applied to a graph
+   *    something else has already changed;
+   *  - and it says what NOT to do, because this store holds real memory: no inventing tags, no
+   *    rewriting component bodies, no merging a near-synonym the evidence does not name.
+   *
+   * It takes the REQUEST, which is the one object both callers already have: `judgementRequest`
+   * builds it for a review, and the prompt points a run back at the review for the findings
+   * themselves. The one thing it reads about the findings is their count — the request carries
+   * them under `findings`, and OF ZERO it produces a notice and no task, because a prompt that
+   * asked a model to decide over an empty review would be asking it to invent the repairs. A
+   * review passed straight in from the store carries the same numbers as `counts`, so both
+   * shapes are read; passing the wrong one used to render `undefined` into the text.
+   *
+   * The guards below are the difference between a prompt and a trap, and each was a real defect
+   * before it was a guard: reading `counts` off the request root silently sent an empty review
+   * as a task, and reading the version from `request.graph` alone emitted the placeholder into a
+   * prompt that already had it — the request states it in `answer.expectedRelationshipVersion`.
+   */
+  function judgementPrompt(request) {
+    const source = request && typeof request === 'object' ? request : {};
+    const questions = Array.isArray(source.questions) ? source.questions : [];
+    const graph = source.graph && typeof source.graph === 'object' ? source.graph : {};
+    const counts = (source.counts && typeof source.counts === 'object' && source.counts) || (source.findings && typeof source.findings === 'object' && source.findings) || null;
+    /* The graph's identity, read from the one place the request states it — with the graph
+     * block as the fallback, so a request built the other way round still renders a version. */
+    const version = String(source.answer?.expectedRelationshipVersion || graph.relationshipVersion || '');
+    const workspace = String(source.workspace || '');
+
+    const notice = (status, text) => ({ status, text: '', notice: text, interface: AGENT_API_INTERFACE, workspace, relationshipVersion: version });
+
+    /* NOTHING TO JUDGE: a notice, and deliberately no task. A prompt that asked a model to decide
+     * with no findings would be asking it to invent the repairs, against a store holding real
+     * memory — so this branch is the one that must never grow a body. */
+    if (counts && Number(counts.total) === 0) return notice('none', PROMPT_NOTICES.none);
+    /* A question with no evidence in it is not asked: see the note on PROMPT_NOTICES. */
+    const asked = questions.filter((question) => question && Array.isArray(question.evidence) && question.evidence.length > 0);
+    if (!asked.length) return notice('none', NO_EVIDENCE_NOTICE);
+
+    const kinds = asked.flatMap((question) => question.evidence.map(String));
+    const body = asked.map((question, index) => `${index + 1}. ${String(question.ask || '')}\n   —— 这一类发现（kind）是：${question.evidence.map(String).join('、')}；它们只说明去哪里找证据，不构成结论。`).join('\n');
+    const scale = counts
+      ? `当前标签图：relationshipVersion = ${version || '（第 1 步返回的那个值）'}；标签 ${counts.tags} 个、记忆组件 ${counts.components} 个；本次审查共报告 ${counts.total} 项待判定（${Object.entries(counts.byKind || {})
+          .filter(([, n]) => Number(n) > 0)
+          .map(([kind, n]) => `${kind} ${n}`)
+          .join('、') || '无'}）。`
+      : `当前标签图：relationshipVersion = ${version || '（第 1 步返回的那个值）'}；标签 ${graph.tags ?? '?'} 个、记忆组件 ${graph.components ?? '?'} 个。`;
+
+    const text = [
+      '请你对 Memory Lab 的标签图做一次索引判定，并把判定结果应用回索引。',
+      '',
+      '你要判定的是下面三类问题：',
+      '',
+      body,
+      '',
+      scale,
+      '',
+      '请按这个顺序做，不要跳步：',
+      '',
+      '1. 先调用 memory_lab_tag_review（只读）取证据与请求：它返回每一条发现的证据（evidence）、可选的决定（options）和当前的关系版本（relationshipVersion）。它不改写任何东西。',
+      '2. 然后你自己逐条判定。可用的决定有四种：merge（把若干同义近义的 tag 合并到一个规范拼写，existingInto 的意思就是 canonical）、reparent（把一个根 tag 接到某个父 tag 之下）、split（把被误读成单个 tag 的名字还原成一条链）、join（把一条链收成一个 tag）。每一条决定，只使用审查里真实出现过的 tag 名，并使用审查给出的 options 里的形状。',
+      `3. 最后调用 memory_lab_tag_apply 应用你接受的决定，并带上 expectedRelationshipVersion = ${version || '（第 1 步返回的那个值）'}。`,
+      '',
+      '约束：',
+      '- 不要发明任何新的 tag 名，也不要发明审查里没有出现过的拼写。',
+      '- 不要改写任何组件的正文、简介或 slug：判定只动标签图，正文是记忆本身。',
+      '- 同义近义 tag 合并：只有当证据（stableInto 或共享词干与成员重合）真的指向同一个概念时才合并；只是拼写相近、证据没有点名的，不要合并。',
+      '- 假根父节点接续：只有候选父节点在 tagPaths 里真的有层级依据时才 reparent；否则把这一个发现留给下一次审查，不要修。',
+      '- 未被正确解析的 tag 误读为单 tag：只有证据明确说明候选链时才 split 或 join。',
+      '- 不要直接改索引文件，也不要用别的工具改标签结构：标签图只经 memory_lab_tag_apply 改动。',
+      "- 每次 apply 都会先把改动前的索引归档到 archive/，并在 policy.jsonl 里记录每个受影响组件的旧标签和一条 undo；要撤销一个已经记录的决定，就用它给的 undo 或 set-tags/unfold，不要去反推。",
+      '- 信息性的发现（options 只有 { kind: "none" }）不需要处理，它没有任何可应用的决定。',
+      '- 一次只应用你真正接受的决定：审查里没提到的部分保持不动。',
+      '',
+      `关系版本：apply 会核对 expectedRelationshipVersion = ${version || '（第 1 步返回的那个值）'}；如果读和写之间标签图变了，写入会被拒绝，请重新审查一次再决定。`,
+      '',
+      '如果你判断某一类问题当前没有可接受的修复，就什么都不应用，并在回答里说明理由；不要为了完成任务而做没有证据的合并或接续。',
+      /* The workspace is NOT printed here.
+       *
+       * It is in the request, and the tool result carries it, so a run has it either way — and
+       * the one thing this text must never do is put a local store path on a page a person is
+       * looking at, or hand it to whatever a copied prompt is pasted into. The path the run
+       * works in is a fact about the HOST, and the host is where it is read. */
+    ]
+      .filter((line, index, all) => !(line === '' && all[index - 1] === ''))
+      .join('\n')
+      .trim();
+
+    return {
+      status: 'ready',
+      text,
+      notice: '',
+      interface: AGENT_API_INTERFACE,
+      relationshipVersion: version,
+      questions: asked.length,
+      kinds,
+    };
+  }
+
+  /* ONE review per graph, memoized. `tagReview` walks every tag pair, so the snapshot this feeds
+   * — built on every page load and after every rebuild — must not recompute it while nothing has
+   * changed. The key is the index file's modification time AND the relationship version of the
+   * graph inside it: either one moving means the graph was written, which is the only thing that
+   * can change a finding, and requiring both to be unchanged is what makes a stale prompt
+   * impossible rather than unlikely. Whether a run is reachable is in the key too, because the
+   * prompt becomes unusable (and usable again) with that switch alone. */
+  let promptCache = { key: '', value: null };
+
+  /**
+   * The prompt the panel offers and a run is given, taken from ONE review of the graph.
+   *
+   * The same call the tool makes, so the text a person copies and the text a tool hands a run
+   * cannot drift apart — there is one prompt and this is where it is built.
+   *
+   * `status` is the prompt's own status unless no run is reachable, in which case it is
+   * `unavailable` and the text is withheld: a prompt nobody can use is not offered beside a
+   * notice, and "there is nobody to ask" must not be readable as "there was nothing to ask".
+   */
+  function promptForReview() {
+    const judge = judgeState();
+    let value;
+    try {
+      const review = store.tagReview({ limit: 25 });
+      const prompt = judgementPrompt(judgementRequest(review));
+      value = {
+        ...prompt,
+        counts: review.counts,
+        window: review.window,
+        // Whether a run can be asked for AT ALL is the same question the tool envelope
+        // answers, and it is answered here from the same one place. The text is withheld
+        // rather than shown next to a notice: a prompt a reader cannot use is not offered.
+        status: judge.status === 'available' ? prompt.status : 'unavailable',
+        notice: judge.status === 'available' ? prompt.notice : PROMPT_NOTICES.unavailable,
+        text: judge.status === 'available' ? prompt.text : '',
+      };
+    } catch (error) {
+      value = {
+        status: 'unknown',
+        text: '',
+        notice: `${REVIEW_UNAVAILABLE_NOTICE}${error instanceof Error ? error.message : String(error)}`,
+        interface: AGENT_API_INTERFACE,
+        workspace: path.join(root, 'Work'),
+        relationshipVersion: '',
+      };
+    }
+    return value;
+  }
+
+  /**
+   * `promptForReview()`, recomputed only when the thing it describes has moved.
+   *
+   * `tagReview` walks every tag pair, and the snapshot this feeds is built on every page load
+   * and after every rebuild, so an unmemoized review would be paid for on a page that only
+   * ever displays it. The key is the index file's identity: its modification time AND the
+   * relationship version of the graph inside it. Either one moving means the graph was
+   * written, which is the only thing that can change a finding — and requiring both to be
+   * unchanged is what makes a stale prompt impossible rather than unlikely.
+   */
+  function promptForGraph() {
+    const judge = judgeState();
+    let stamp = 'no-index';
+    try {
+      stamp = String(fs.statSync(store.indexPath).mtimeMs);
+    } catch {
+      /* An absent index is the empty store: a state with a review, not a failure. */
+    }
+    const key = `${stamp}|${judge.status}`;
+    if (promptCache.key === key && promptCache.value) return promptCache.value;
+    const value = promptForReview();
+    /* The version goes into the key, so the next call re-derives only after the graph's
+     * version has actually moved. The file's mtime is checked first because it is one stat
+     * call against a hash over every tag and every component membership. */
+    promptCache = { key: `${key}|${value.relationshipVersion}`, value };
+    return value;
   }
 
   /** Read a component back off disk; an empty slug only asserts the index reads. */
@@ -362,6 +572,20 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         // Every snapshot carries whether the judgement half of a rebuild exists, so
         // the panel and the config page can never look the same with it switched off.
         judge: judgeState(),
+        /* And every snapshot carries the PROMPT that asks for a judgement, as text.
+         *
+         * This is the one thing the panel may offer and still not do: it can be copied and
+         * pasted by a person, and it can never be run from here — there is no model call on any
+         * path out of this component, and there is no route that produces one. Rendering it
+         * here rather than in the panel is not a shortcut: the panel has no tool context by
+         * construction, so the copy a reader takes from it is the only way the judgement half
+         * reaches the place that can actually run it.
+         *
+         * `status` is one of `ready` (a prompt to send), `none` (nothing to judge — a notice,
+         * and deliberately no task), `unavailable` (agent-api is off) and `unknown` (the review
+         * could not be read). Nothing here is ever model output; the text is composed from the
+         * request and the review's own counts. */
+        prompt: promptForGraph(),
       };
     },
 
@@ -518,8 +742,8 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
           name: 'memory_lab_tag_review',
           description:
             'Report the tag-graph repairs that need judgement rather than a rule: a root tag whose memories are already filed under another tag, near-synonym tags, a name that may be a collapsed path, a chain that may be one tag, and stored values a rebuild does not reproduce. Read-only — it rewrites nothing. Every finding carries the facts to decide it and the decision shape to pass to memory_lab_tag_apply. ' +
-              'This result also carries the judgement envelope: whether a run can be asked for right now, and the request that says what is being judged, where it runs and what shape the answer takes. ' +
-              'THE SEQUENCE IS AGENT-DRIVEN AND IT IS TWO CALLS: this tool gives you the evidence and the request; YOU decide; memory_lab_tag_apply applies and records your decisions. Nothing here judges, and the config panel cannot judge either — a judgement is a model run, agent-api is invoked only by tools, and a panel button has no tool context. When you want a run to make the decision for you, obtain one from agent-api through its agent_api_send tool.',
+              'This result also carries the judgement envelope: whether a run can be asked for right now, the request that says what is being judged, where it runs and what shape the answer takes, and `prompt` — the same ask as the prose you would send a model, ready to hand to a run as it stands. ' +
+              'THE SEQUENCE IS AGENT-DRIVEN AND IT IS TWO CALLS: this tool gives you the evidence and the request; YOU decide; memory_lab_tag_apply applies and records your decisions. Nothing here judges, and the config panel cannot judge either — a judgement is a model run, agent-api is invoked only by tools, and a panel button has no tool context. The panel shows this same prompt for a person to copy, and that copy is the whole of its part in the judgement. When you want a run to make the decision for you, obtain one from agent-api through its agent_api_send tool.',
           parameters: {
             type: 'object',
             properties: {
@@ -542,7 +766,18 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
             // the request sit beside each other, so a judge reading this result now and
             // a judge handed the request later both get everything they need, and the
             // `status` field says which of them can happen.
-            return { ...review, judge, request: judge.status === 'available' ? judgementRequest(review) : null };
+            //
+            // `prompt` is the same request as the prose a model is sent, so a caller that
+            // wants to hand the judgement to a run does not have to compose the ask itself —
+            // and a caller reading this result by eye can see exactly what the judgement is.
+            // It is null when the request is null: with no run reachable there is no prompt
+            // to offer, and an empty string there would read as "asked and answered nothing".
+            return {
+              ...review,
+              judge,
+              request: judge.status === 'available' ? judgementRequest(review) : null,
+              prompt: judge.status === 'available' ? judgementPrompt(judgementRequest(review)) : null,
+            };
           },
         },
         {
