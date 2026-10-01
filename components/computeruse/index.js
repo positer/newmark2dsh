@@ -17,6 +17,7 @@
 import { createComputerUse } from './component.js';
 import { schema } from './lib/schema.js';
 import { embedJson } from './lib/embed.js';
+import { resolveRoot } from './lib/root.js';
 
 /** The page global this row publishes. */
 export const SNAPSHOT_GLOBAL = '__NEWMARK_COMPUTERUSE__';
@@ -27,6 +28,14 @@ export const inject = ['tools', 'webServer'];
 
 export const Config = schema
   ? schema.object({
+      root: schema
+        .string()
+        .description(
+          "The shared Newmark user root. Empty means Newmark's own path, ~/.Newmark. This component " +
+            'owns no store of its own: the root is what places its failure log beside the one the ' +
+            'MemoryLab store lives in.',
+        )
+        .default(''),
       leaseTtlMs: schema
         .natural()
         .description('How long a ComputerUse takeover lease stays valid, in milliseconds.')
@@ -35,9 +44,15 @@ export const Config = schema
   : undefined;
 
 export function apply(ctx, config) {
+  /* The same rule every other row resolves its root with (`lib/root.js`), read here for ONE
+   * reason: a backend failure is written to `<root>/errors.jsonl`. It is deliberately not a
+   * second path computation — a component that worked out its own root would be able to log a
+   * failure somewhere other than where the store is, which is the thing the shared rule exists
+   * to prevent. */
+  const root = resolveRoot(config);
   const leaseTtlMs = Number.isFinite(config?.leaseTtlMs) && config.leaseTtlMs > 0 ? Math.floor(config.leaseTtlMs) : 120000;
 
-  const computeruse = createComputerUse({ logger: ctx.logger, leaseTtlMs });
+  const computeruse = createComputerUse({ root, logger: ctx.logger, leaseTtlMs });
 
   const definitions = computeruse.tools();
   for (const definition of definitions) {

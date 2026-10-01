@@ -17,6 +17,8 @@
  * mechanically instead of being promised in prose.
  */
 
+import { causeChain, createErrorLog, describeError } from '../../lib/errors.js';
+
 /** Newmark's action surface, exactly. */
 export const COMPUTER_USE_ACTIONS = [
   'observe', 'app_list', 'app_observe', 'wait_for', 'sequence',
@@ -124,7 +126,17 @@ function backendOptions(args) {
   return translated;
 }
 
-export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
+export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {}) {
+  /**
+   * The bundle's failure log, from the shared root rule.
+   *
+   * A backend that will not load, a lane that will not start, a tool that answers an error:
+   * each is a failure behaviour and each is written to `<root>/errors.jsonl` AND printed.
+   * `root` is the one the core row resolves (`lib/root.js`), so a redirected
+   * `NEWMARK_USER_ROOT` moves this log with the store rather than leaving it behind.
+   */
+  const failures = createErrorLog({ root, logger });
+
   /**
    * The frozen Loader row (`index.js`) still declares a `leaseTtlMs` setting and passes it
    * here. There is no TTL any more, so it is deliberately inert - but it is reported as
@@ -182,6 +194,12 @@ export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
           code: 'unsupported_platform',
           error: `Computer Use has no backend for ${process.platform}. Windows and Linux are supported.`,
         };
+        failures.record({
+          where: 'computeruse/backend',
+          code: backendFailure.code,
+          message: backendFailure.error,
+          fields: { platform: process.platform },
+        });
         return null;
       }
       try {
@@ -193,10 +211,71 @@ export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
           error: `Computer Use could not load its ${process.platform} backend (${wanted}): ${detail}`,
         };
         logger?.warn?.(`newmark-core/computeruse: ${backendFailure.error}`);
+        /* THE CAUSE, RECORDED ONCE. Every tool call after this answers the cached
+         * `UNAVAILABLE(action)`, and that per-call answer is deliberately NOT recorded again:
+         * one backend that will not load is one failure, and a line per call would turn a
+         * broken install into a file nobody can read to the end of. The `detail` is what makes
+         * this line worth having — the module path and the loader's own message. */
+        failures.record({
+          where: 'computeruse/backend',
+          code: backendFailure.code,
+          message: backendFailure.error,
+          detail: causeChain(error),
+          fields: { platform: process.platform, module: wanted },
+        });
         return null;
       }
     })();
     return backendPromise;
+  }
+
+  /**
+   * A result the backend answered with, recorded when it is a failure.
+   *
+   * The spec names three ComputerUse failures — the lane failing to start, a backend error, and
+   * the tool returning an error — and this is the third. `ok:false` is the whole test: the
+   * backend's own code is recorded verbatim (`error_code` in the shipped backends, `code` in the
+   * tool layer's own `backend_no_result`), and so is its own sentence. A refusal the backend
+   * chose to phrase as a failure is still an action that did not happen, and recording it with
+   * the code that names it is the opposite of disguising it.
+   *
+   * `detail` is deliberately empty here: there is no cause chain, and inventing one would be
+   * this module summarising a failure the backend already names.
+   */
+  function reportOutcome(action, value) {
+    if (!value || typeof value !== 'object' || value.ok !== false) return;
+    failures.record({
+      where: 'computeruse/backend',
+      code: String(value.code || value.error_code || 'backend_error'),
+      message: String(value.error || value.output || `the ${action} action reported a failure`),
+      fields: { action: String(action) },
+    });
+  }
+
+  /**
+   * Run one backend call: record what it threw, and record what it answered.
+   *
+   * The shipped backends catch their own failures and answer a structured result, so the throw
+   * path is for a backend that misbehaves — which is exactly when a silent failure would be
+   * hardest to find. The error is re-thrown so the registry's `isError` result is unchanged.
+   */
+  async function runBackend(backend, options) {
+    let raw;
+    try {
+      raw = await backend.runComputerUse(options);
+    } catch (error) {
+      failures.record({
+        where: 'computeruse/backend',
+        code: 'backend_threw',
+        message: `the Computer Use backend threw on ${String(options?.action || 'observe')}: ${describeError(error)}`,
+        detail: causeChain(error),
+        fields: { action: String(options?.action || 'observe'), platform: process.platform },
+      });
+      throw error;
+    }
+    const value = asToolResult(raw);
+    reportOutcome(String(options?.action || 'observe'), value);
+    return value;
   }
 
   /** Keep the lease mirror in step with what the backend actually did. */
@@ -281,14 +360,14 @@ export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
              * snake_case, and the backend keeps reading camelCase.
              */
             const translated = backendOptions(args);
-            const result = await backend.runComputerUse({
+            const result = await runBackend(backend, {
               ...translated,
               imageDir: captionDir,
               ownerId: String(translated.ownerId || 'dsh'),
               mouseMode: translated.mouseMode,
             });
             observeLeaseArgs(translated, result);
-            return asToolResult(result);
+            return result;
           },
         },
         {
@@ -311,7 +390,7 @@ export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
             const backend = await loadBackend();
             if (!backend) return UNAVAILABLE('observe');
             const application = String(args?.target || 'desktop') === 'application';
-            return asToolResult(await backend.runComputerUse({
+            return runBackend(backend, {
               action: application ? 'app_observe' : 'observe',
               appTarget: args?.app_target,
               windowHandle: args?.window_handle,
@@ -321,7 +400,7 @@ export function createComputerUse({ captionDir, logger, leaseTtlMs } = {}) {
               // `screen_capture` deliberately never touches the lease.
               ownerId: 'screen-capture',
               skipLease: true,
-            }));
+            });
           },
         },
       ];

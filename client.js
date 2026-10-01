@@ -239,18 +239,10 @@ function readPageGlobals() {
 .ml-ovnode.dim { opacity: .18; }
 .ml-toolbar { position: absolute; top: 12px; right: 14px; display: flex; gap: 6px; align-items: center; padding: 5px 8px; border-radius: 9px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-overlay); }
 .ml-zoom { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary); min-width: 38px; text-align: center; }
-.ml-status { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-top: 1px solid var(--dsw-alias-border-l1); font-size: 11px; color: var(--dsw-alias-label-secondary); flex-shrink: 0; }
-/* The judgement prompt, offered beside the deterministic rebuild and not instead of it. The
-   text is the HOST half's — no tool context exists here, so this half cannot compose the ask and
-   does not try: it shows what it was served, and copies it. */
-.ml-prompt { border-bottom: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); flex-shrink: 0; }
-.ml-prompt-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px; }
-.ml-prompt-title { font-size: 11px; font-weight: 600; letter-spacing: .06em; color: var(--dsw-alias-label-primary); }
-.ml-prompt-note { font-size: 11px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
-.ml-prompt-spacer { flex: 1; }
-.ml-prompt-copy { height: 24px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--dsw-alias-border-l2); background: transparent; color: var(--dsw-alias-label-primary); font: inherit; font-size: 11px; cursor: pointer; flex-shrink: 0; }
-.ml-prompt-copy:hover { background: var(--dsw-alias-bg-layer-2); }
-.ml-prompt-body { max-height: 168px; overflow: auto; margin: 0; padding: 0 14px 10px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
+/* flex-wrap and overflow-wrap are here because this line now carries the outcome of a
+ * judgement as well as the store's own numbers: a failure clause is a sentence, and a sentence
+ * that cannot wrap in an 11 px status bar is a sentence nobody can read. */
+.ml-status { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-top: 1px solid var(--dsw-alias-border-l1); font-size: 11px; color: var(--dsw-alias-label-secondary); flex-shrink: 0; flex-wrap: wrap; overflow-wrap: anywhere; }
 .ml-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); }
 .ml-status[data-state="ready"] .ml-dot { background: var(--dsw-alias-state-success-primary); }
 .ml-status[data-state="error"] .ml-dot { background: var(--dsw-alias-state-error-primary); }
@@ -339,17 +331,23 @@ function readPageGlobals() {
         payload,
         reindexError: String(payload.reindexError || ''),
         refreshError: '',
-        /** Whether the Host half has a judge for the tag graph; absence is a state. */
-        judge: payload.judge && typeof payload.judge === 'object' ? payload.judge : null,
         /**
-         * The judgement PROMPT, as the Host half rendered it.
+         * What the judgement half of the last rebuild DID — read from the Host half, never
+         * composed here.
          *
-         * Read from the snapshot and never composed here. The ask names the tools a run must
-         * call, and this half has no tool context by construction — so a prompt it built itself
-         * would be a promise this page cannot keep. What it can do is show the text that came
-         * with the snapshot and copy it, and that is the whole of its part in a judgement run.
+         * It is present only on the answer to a rebuild request, because it is a fact about that
+         * action and not about the store: the Host runs the deterministic rebuild and then submits
+         * the ask to the agent core, and reports the two halves separately. `status` says which of
+         * them happened, `label` is the one clause this panel prints, and `attempted` says whether
+         * a run was even asked for. A plain read carries `null`, so 重置 cannot leave a stale
+         * judgement clause standing next to a store that was never re-judged.
+         *
+         * `payload.judge` — whether a judge is REACHABLE — is deliberately not mirrored into this
+         * state. It used to be, and nothing read it once the strip that warned about it was
+         * removed: a switch mirror beside an outcome that already names the switch is dead state,
+         * and dead state is what a later reader wires something to by mistake.
          */
-        judgePrompt: payload.prompt && typeof payload.prompt === 'object' ? payload.prompt : null,
+        judgement: payload.judgement && typeof payload.judgement === 'object' ? payload.judgement : null,
         root: String(payload.root || ''),
         generatedAt: String(payload.generatedAt || ''),
       };
@@ -473,8 +471,7 @@ function readPageGlobals() {
         payload: null,
         reindexError: '',
         refreshError: '',
-        judge: null,
-        judgePrompt: null,
+        judgement: null,
         servedBy: 'page-global',
         rebuildResult: null,
         root: '',
@@ -545,8 +542,9 @@ function readPageGlobals() {
               root: String(fresh.root || ''),
               generatedAt: String(fresh.generatedAt || ''),
               reindexError: String(fresh.reindexError || ''),
-              judge: fresh.judge && typeof fresh.judge === 'object' ? fresh.judge : null,
-              judgePrompt: fresh.prompt && typeof fresh.prompt === 'object' ? fresh.prompt : null,
+              // The judgement half of the action this read asked for, as the Host half reported
+              // it. Absent on a plain read — see `readInjected()`.
+              judgement: fresh.judgement && typeof fresh.judgement === 'object' ? fresh.judgement : null,
               // The store fields are the fresh ones; the switch states and the lease
               // mirror still come from the page globals this page was served with.
               payload: { ...(readPageGlobals() || {}), ...fresh },
@@ -589,8 +587,11 @@ function readPageGlobals() {
           root: String(payload.root || ''),
           generatedAt: String(payload.generatedAt || ''),
           reindexError: String(payload.reindexError || ''),
-          judge: payload.judge && typeof payload.judge === 'object' ? payload.judge : null,
-          judgePrompt: payload.prompt && typeof payload.prompt === 'object' ? payload.prompt : null,
+          /* The page-index fallback carries no judgement, because it did not ask for one: the
+           * path it took renders the shell's index, and the Host's rendering rebuild performs
+           * no run. Leaving the previous clause standing would report a judgement this read
+           * never made. */
+          judgement: null,
           payload,
           reason,
         });
@@ -607,17 +608,21 @@ function readPageGlobals() {
     }
 
     /**
-     * Rebuild the index, then re-render from the store as it is afterwards.
+     * 重建索引 — one action in two halves, asked for in one request.
      *
-     * The deterministic rebuild belongs to the Host half and is asked for through
-     * that half's own snapshot route, so what happens is the thing the button says:
-     * the index is rebuilt, and this panel re-reads the store and re-renders. The
-     * shell is not reloaded — nothing outside this panel is touched. Nothing is
-     * faked either: a rebuild that fails comes back as `reindexError` and the panel
-     * reports it, and a read that fails leaves the panel saying so.
+     * The Host half runs the deterministic rebuild FIRST and then submits the judgement to the
+     * agent core, and reports the two separately. This half's whole part is to ask for that
+     * action, show that it is running, and render what came back: it composes no prompt, runs
+     * nothing, and has no tool context by construction — which is why the run happens on the
+     * other side of this route.
+     *
+     * Neither half is faked. A rebuild that failed comes back as `reindexError`, a judgement that
+     * did not happen comes back as `judgement.status` with its own `label`, and a read that failed
+     * leaves the panel saying so. The stale clause from the previous action is cleared on the way
+     * in, so a running judgement is never shown beside an old result.
      */
     async function reindex() {
-      emit({ reindexing: true, error: '' });
+      emit({ reindexing: true, error: '', judgement: null });
       try {
         await loadVisualization({ reason: 'reindex', source: 'host', rebuild: true });
       } finally {
@@ -1656,86 +1661,29 @@ function readPageGlobals() {
       );
     }
 
-    /* ------------------------------------------------------- the offered prompt */
+    /* ------------------------------------------------- the panel, and the two halves */
 
     /**
-     * The prompt this half offers, built by the Host half, shown where the rebuild is.
+     * The MemoryLab window: the graph, the two actions, and one status line.
      *
-     * The user's report was exact: 重建索引 finished before a single Agent response could have
-     * begun, because it is the deterministic rebuild and the Agent was never in it. The fix is
-     * not to put a model behind the button — the constraint that governs this bundle is that the
-     * agent core is TOOL-INVOKED only, a button on this page has no tool context, and the gate
-     * that asserts no HTTP method produces a run must keep passing. So this half offers the
-     * judgement as what it actually is: a prompt, ready to hand to the Agent, under the button's
-     * own statement that the rebuild it performs is deterministic and nothing more.
+     * 重建索引 is ONE action in two halves and the panel says which of them happened. The Host
+     * half runs the deterministic rebuild first and then submits the judgement to the agent core;
+     * this half asks for that action over the component's own snapshot route, shows that it is
+     * running, and renders what came back — the two halves from the two fields the answer carries
+     * (`result` for the rebuild, `judgement` for the run), never blurred into one sentence.
      *
-     * The text is the HOST half's, taken from the snapshot. Nothing here could compose the ask:
-     * the tool context that would make it real does not exist on this side. A snapshot from a
-     * Host half older than this bundle carries no prompt, and then there is no strip at all
-     * rather than an invented one.
-     */
-    function JudgementPrompt({ state }) {
-      const [copied, setCopied] = React.useState('');
-      const prompt = state.judgePrompt;
-      if (!prompt || typeof prompt !== 'object') return null;
-      const text = typeof prompt.text === 'string' ? prompt.text : '';
-      const status = String(prompt.status || '');
-      const found = prompt.counts && Number.isFinite(Number(prompt.counts.findings)) ? Number(prompt.counts.findings) : null;
-      const ready = status === 'ready' && text.length > 0;
-      const title = ready
-        ? `索引判定提示词${found === null ? '' : ` · ${found} 项待判定`}`
-        : '索引判定提示词';
-      const note = ready
-        ? '把这段提示词交给 Agent（例如粘贴到对话里）；它不在这里运行。重建索引是确定性重建，只有 Agent 能判定。'
-        : String(prompt.notice || '当前没有可用的索引判定提示词。');
-      const copy = (event) => {
-        const say = (label) => {
-          setCopied(label);
-          setTimeout(() => setCopied(''), 1600);
-        };
-        const fallback = () => {
-          try {
-            const field = event.currentTarget.closest('.ml-prompt')?.querySelector('.ml-prompt-body');
-            const range = document.createRange();
-            range.selectNodeContents(field);
-            const selection = window.getSelection();
-            selection.removeAllRanges();
-            selection.addRange(range);
-            say(document.execCommand('copy') ? '已复制' : '请手动复制');
-          } catch {
-            say('请手动复制');
-          }
-        };
-        // `navigator.clipboard` is absent outside a secure context, and a copy button that
-        // silently does nothing is worse than one that says it could not: the panel selects
-        // the text instead, so the keystroke still finishes the job.
-        try {
-          const written = navigator.clipboard?.writeText?.(text);
-          if (written && typeof written.then === 'function') written.then(() => say('已复制'), fallback);
-          else fallback();
-        } catch {
-          fallback();
-        }
-      };
-      return h(
-        'div',
-        {
-          className: 'ml-prompt',
-          'data-ml-prompt': status,
-          'data-ml-prompt-version': String(prompt.relationshipVersion || ''),
-        },
-        h(
-          'div',
-          { className: 'ml-prompt-head' },
-          h('span', { className: 'ml-prompt-title' }, title),
-          h('span', { className: 'ml-prompt-note' }, `${note}${copied ? ` · ${copied}` : ''}`),
-          h('div', { className: 'ml-prompt-spacer' }),
-          ready ? h('button', { type: 'button', className: 'ml-prompt-copy', onClick: copy }, '复制提示词') : null,
-        ),
-        ready ? h('pre', { className: 'ml-prompt-body' }, text) : null,
-      );
-    }
-
+     * That is the whole of this page's part in a judgement, and it is deliberate: the ask, the run
+     * and the timeout all belong to the Host half, which has the tool context this page does not.
+     * An earlier revision offered the prompt here for a person to copy. It was removed because it
+     * was never asked for and because it is false the moment the button runs the Agent — pressing
+     * the button runs the judgement, so there is nothing left to copy.
+     *
+     * The footer is DATA: how much is in the index, which graph version, when the snapshot was
+     * taken, the outcome of each half that was asked for, and any error that actually happened. It
+     * used to end with an explanation of what the rebuild does and who does the judging —
+     * "重建索引只做确定性重建；三类判定由 Agent 经工具完成：先读证据，再决定，再应用". That is
+     * narration, not status: nobody asked for it, and it is false now that the button drives the
+     * run. A status bar reports; it does not explain itself. */
     function MemoryLabPanel() {
       const state = useMemoryLab();
       const [view, setView] = React.useState('overview');
@@ -1748,12 +1696,24 @@ function readPageGlobals() {
 
       const tagCount = tagNames(state.tags).length;
       const componentCount = state.components.length;
-      const status =
+      /* The judgement clause, taken from the Host half's own `label` — the page renders the
+       * outcome and never words it. While the request is in flight there is no outcome yet, so the
+       * clause says that instead of showing the previous one. It is appended to whatever the rest
+       * of the line says, because a rebuild puts the panel in its loading phase for as long as the
+       * run takes: a clause that only existed on the ready branch would be invisible for exactly
+       * the minutes it exists for. */
+      const judgementClause = state.reindexing
+        ? '· 正在重建并运行判定…'
+        : state.judgement && typeof state.judgement.label === 'string' && state.judgement.label
+          ? `· 判定${state.judgement.label}`
+          : '';
+      const storeLine =
         state.phase === 'ready'
-          ? `${tagCount} 标签 · ${componentCount} 组件 · ${state.relationshipVersion.slice(0, 12)} · 快照生成于 ${formatTime(Date.parse(state.generatedAt) || state.loadedAt)}${state.reindexError ? ` · 重建告警：${state.reindexError}` : ''}${state.refreshError ? ` · 重新读取失败：${state.refreshError}` : ''} · 重建索引只做确定性重建${state.judge && state.judge.status === 'unavailable' ? '（判定不可用：agent-api 已停用）' : ''}；三类判定由 Agent 经工具完成：先读证据，再决定，再应用`
+          ? `${tagCount} 标签 · ${componentCount} 组件 · ${state.relationshipVersion.slice(0, 12)} · 快照生成于 ${formatTime(Date.parse(state.generatedAt) || state.loadedAt)}${state.reindexError ? ` · 重建告警：${state.reindexError}` : ''}${state.refreshError ? ` · 重新读取失败：${state.refreshError}` : ''}`
           : state.phase === 'loading'
             ? '正在载入 Memory Lab…'
             : `Host 半侧未提供快照：${state.error}`;
+      const status = `${storeLine}${judgementClause ? ` ${judgementClause}` : ''}`;
 
       return h(
         'div',
@@ -1803,19 +1763,15 @@ function readPageGlobals() {
               disabled: !!state.reindexing,
               onClick: reindex,
               title:
-                '确定性重建：让 Host 半侧重渲染索引（索引过期时在那里重建），再从存储重新读取快照；不重载外壳。' +
-                '这个按钮只做确定性重建，不做判定——三类判定（假根父节点接续、同义近义 tag 合并、tag 误读）需要一次模型运行，' +
-                '而 agent-api 只能由工具调用，页面没有工具上下文，所以判定是 Agent 经工具完成的：先读证据，再决定，再应用。' +
-                '下面给出的是这次判定要用的提示词，可以直接复制交给 Agent；复制本身不运行任何东西。',
+                '重建索引：一次动作，两半，按这个顺序。' +
+                '（1）确定性重建——Host 半侧重写并核对索引与标签图，毫秒级；' +
+                '（2）判定——把这次重建后的标签图交给 agent-api 运行一次 agent 判定（假根父节点接续、同义近义 tag 合并、未被正确解析的 tag 误读为单 tag），' +
+                '运行在 Host 半侧通过工具发起，用你授权的模型，可能需要一两分钟。' +
+                '两半的结果分别报告：重建失败会说明，判定没运行、超时或失败也会说明，不会互相冒充。不重载外壳。',
             },
-            state.reindexing ? '重建中…' : '重建索引',
+            state.reindexing ? '重建并判定中…' : '重建索引',
           ),
         ),
-        // The prompt sits directly under the rebuild action, because they are the two halves of
-        // one job and the panel must never blur which half it did: the button rebuilt the index
-        // deterministically, and the strip below it is the judgement, offered as text for an
-        // Agent to pick up. Rendered only when the Host half carried one.
-        state.phase === 'ready' ? h(JudgementPrompt, { state }) : null,
         state.phase === 'ready' && componentCount === 0 && tagCount === 0
           ? h(
               'div',
@@ -1854,7 +1810,13 @@ function readPageGlobals() {
             ),
         h(
           'div',
-          { className: 'ml-status', 'data-state': state.phase },
+          {
+            className: 'ml-status',
+            'data-state': state.phase,
+            // Which half of the last rebuild this line is reporting, as a value rather than a
+            // sentence: `''` when no judgement was asked for, else the Host half's own status.
+            'data-ml-judgement': state.reindexing ? 'running' : state.judgement ? String(state.judgement.status || '') : '',
+          },
           h('span', { className: 'ml-dot' }),
           status,
         ),

@@ -46,6 +46,7 @@
 import { schema } from './lib/schema.js';
 import { defaultRoot, resolveRoot } from './lib/root.js';
 import { embedJson } from './lib/embed.js';
+import { causeChain, createErrorLog, describeError } from './lib/errors.js';
 import {
   MODEL_ID_FIELD,
   enumerateModelCatalog,
@@ -182,11 +183,19 @@ export const inject = ['webServer', 'profileContext'];
 const COMPONENTS = {
   memoryLab: {
     load: () => import('./components/memorylab/index.js'),
-    config: (root) => ({ root, language: 'auto', reindexOnRender: true }),
+    // `judgementTimeoutMs` is the bound on the judgement half of 重建索引 — the run of the agent
+    // core the button now drives — and it is stated here for the same reason agent-api's
+    // `timeoutMs` is: the app's real numbers belong where the component is composed. The
+    // deterministic half beside it takes milliseconds; this is the part that takes turns.
+    config: (root) => ({ root, language: 'auto', reindexOnRender: true, judgementTimeoutMs: 300000 }),
   },
   computerUse: {
     load: () => import('./components/computeruse/index.js'),
-    config: () => ({ leaseTtlMs: 120000 }),
+    // `root` reaches this component for ONE reason: its failures are written to the same
+    // `<root>/errors.jsonl` the store sits beside. It owns no store, so before this it had no
+    // root at all — and a backend failure would have gone wherever the convention pointed
+    // rather than wherever the user pointed the bundle.
+    config: (root) => ({ root, leaseTtlMs: 120000 }),
   },
   agentApi: {
     load: () => import('./components/agent-api/index.js'),
@@ -212,6 +221,18 @@ const COMPONENT_GLOBALS = {
 
 export function apply(ctx, config) {
   const root = resolveRoot(config);
+
+  /**
+   * The bundle's failure log, from the SAME resolved root as the store.
+   *
+   * The user's instruction is 所有失败行为都要在.Newmark保存报错打印 — every failure saved into
+   * `.Newmark` AND printed — and the core row owns two of the failures that must reach it: the
+   * model write and the preset switch. Both are failures of THIS row, in a file this row owns,
+   * so neither is MemoryLab's to record. `lib/errors.js` says how the line is shaped and why the
+   * path is derived rather than written down; what matters here is that `record()` never throws,
+   * so no branch below has to guard its call.
+   */
+  const failures = createErrorLog({ root, logger: ctx.logger });
 
   /**
    * The effective config, read at the moment of the read.
@@ -284,6 +305,15 @@ export function apply(ctx, config) {
       ctx.logger?.warn?.(
         'newmark-core: ' + name + ' did not unmount cleanly: ' + (error?.message ?? error),
       );
+      // A component that will not unmount is a failure of this row's composition, not a
+      // refusal by a caller: its tools may still be registered while the panel says it is off.
+      failures.record({
+        where: 'core/compose',
+        code: 'unmount_failed',
+        message: `the ${name} component did not unmount cleanly: ${describeError(error)}`,
+        detail: causeChain(error),
+        fields: { component: name },
+      });
     }
     return fiber !== undefined;
   };
@@ -302,6 +332,16 @@ export function apply(ctx, config) {
         ctx.logger?.error?.(
           'newmark-core: ' + name + ' failed to compose: ' + (error?.message ?? error),
         );
+        // The component named in the panel never loads, so every tool it owns is missing. The
+        // row says so in the log as well as in the host log: a switch that silently did nothing
+        // is the failure this record exists for.
+        failures.record({
+          where: 'core/compose',
+          code: 'compose_failed',
+          message: `the ${name} component failed to compose: ${describeError(error)}`,
+          detail: causeChain(error),
+          fields: { component: name },
+        });
       });
     return true;
   };
@@ -555,7 +595,43 @@ export function apply(ctx, config) {
               // already correctly written. That is exactly the confusing half-state this whole
               // route exists to avoid, and it is what a one-word omission bought.
               const result = await safe(() => setPresetSelected(profile, wanted));
-              if (result === undefined) return;
+              if (result === undefined) {
+                // `safe` answers `undefined` only when its body threw, and it has already sent
+                // the 500. This is the record of what caused it: without it a switch that ended
+                // in the route's last-resort handler would leave nothing behind to look at.
+                failures.record({
+                  where: 'core/preset-switch',
+                  code: 'handler_failed',
+                  message: `switching the ${PRESET_COMPONENT_KEY} selection threw before it could answer`,
+                  fields: { component: PRESET_COMPONENT_KEY, wanted },
+                });
+                return;
+              }
+              if (result.ok !== true) {
+                /**
+                 * THE WRITE WAS REFUSED OR FAILED, and the code recorded is the module's OWN.
+                 *
+                 * `setPresetSelected` answers with a discriminated result whose `error` is the
+                 * refusal's own name — `unparseable_source`, `unparseable_result`,
+                 * `collateral_change`, `selector_entry_absent`, `patch_unreadable`,
+                 * `write_failed` — and those names are the interesting half of this failure
+                 * surface. Recording them under one summary like `preset_write_refused` would
+                 * be exactly the disguise rule 2 forbids, so `error` is carried verbatim and the
+                 * sentence it came with goes in `detail`.
+                 */
+                failures.record({
+                  where: 'core/preset-switch',
+                  code: String(result.error || 'write_refused'),
+                  message: String(result.detail || result.reason || 'the preset selection was not written'),
+                  detail: String(result.reason ?? ''),
+                  fields: {
+                    component: PRESET_COMPONENT_KEY,
+                    wanted,
+                    ...(result.line === undefined || result.line === null ? {} : { line: result.line }),
+                    ...(result.patchPath === undefined ? {} : { patchPath: String(result.patchPath) }),
+                  },
+                });
+              }
               ctx.logger?.info?.(
                 `newmark-core: ${PRESET_COMPONENT_KEY} ${result.ok === true ? 'set to ' + String(result.selected) : 'FAILED ' + String(result.error)}` +
                   (result.patchPath ? ` (${result.patchPath})` : ''),
@@ -658,11 +734,32 @@ export function apply(ctx, config) {
                 // That is the same class of defect as the `memory_lab_reindex` output-boundary
                 // bug fixed in 0.2.2: an operation that SUCCEEDED, reported to the caller as a
                 // failure. A caller's natural response to a failed write is to write again.
-                await configEditor.edit(entry, (current) => ({
-                  ...current,
-                  model,
-                  modelProvider: provider,
-                }));
+                //
+                // The two ways this write can genuinely fail are recorded as they happen, and
+                // neither is inferred from the receipt afterwards: an edit that THREW is a
+                // `write_failed`, and an edit that returned but did not take is a
+                // `write_not_verified`. The refusal that comes before either — a model DSH does
+                // not list, no editor, no row entry — is a NO, reported to the panel, and
+                // deliberately not a failure of the write, because nothing was written and
+                // nothing was attempted.
+                try {
+                  await configEditor.edit(entry, (current) => ({
+                    ...current,
+                    model,
+                    modelProvider: provider,
+                  }));
+                } catch (error) {
+                  failures.record({
+                    where: 'core/model-write',
+                    code: 'write_failed',
+                    message: `configEditor.edit threw while writing ${provider}/${model}: ${describeError(error)}`,
+                    detail: causeChain(error),
+                    fields: { component: MODEL_COMPONENT_KEY, provider, model },
+                  });
+                  // Re-thrown so the route's own guard still answers the 500 it always did: the
+                  // record is an addition to the report, never a replacement for it.
+                  throw error;
+                }
                 const live = entry.options.config ?? {};
                 const persisted = normaliseSelection({
                   provider: live.modelProvider,
@@ -680,6 +777,23 @@ export function apply(ctx, config) {
                     : `the write did not take: the row's config still holds ` +
                       `${String(live.modelProvider ?? '')}/${String(live.model ?? '')}`,
                 };
+                if (!ok) {
+                  // The write returned without complaint and the file does not agree. This is
+                  // the failure path 0.2.4's stale read made it impossible to reach honestly, so
+                  // it is recorded from the read-back rather than from the intent.
+                  failures.record({
+                    where: 'core/model-write',
+                    code: 'write_not_verified',
+                    message: `the model write did not take: the row's config reads ${String(live.modelProvider ?? '')}/${String(live.model ?? '')}`,
+                    detail: result.detail,
+                    fields: {
+                      component: MODEL_COMPONENT_KEY,
+                      provider,
+                      model,
+                      readBack: `${String(live.modelProvider ?? '')}/${String(live.model ?? '')}`,
+                    },
+                  });
+                }
                 return { status: ok ? 200 : 400, body: result };
               });
               if (outcome === undefined) return;
@@ -734,6 +848,16 @@ export function apply(ctx, config) {
               ctx.logger?.error?.(
                 'newmark-core: ' + name + ' failed to compose: ' + (error?.message ?? error),
               );
+              // The same failure `mount()` records, reached by the other path: the row's
+              // opening composition rather than a switch. One `where`, one `code`, because it
+              // is one thing that went wrong.
+              failures.record({
+                where: 'core/compose',
+                code: 'compose_failed',
+                message: `the ${name} component failed to compose: ${describeError(error)}`,
+                detail: causeChain(error),
+                fields: { component: name },
+              });
             });
           return () => {
             cancelled = true;

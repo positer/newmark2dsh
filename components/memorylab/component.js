@@ -12,14 +12,22 @@
  * one memory.
  */
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import { MemoryLabStore, MemoryLabStoreError, TAG_DECISION_KINDS } from './lib/memory-store.js';
 // The presence probe belongs to the component that owns the tool being probed, and it works
 // whether or not that component is mounted — which is the whole reason it can answer "is a judge
 // reachable" for a component that is switched off. Reading it here rather than re-implementing it
 // is what keeps one answer to one question.
-import { agentApiPresence } from '../agent-api/lib/presence.js';
+//
+// `AGENT_API_PRESENCE_TOOL` is the same identity read twice: it is the tool whose registration IS
+// the presence signal, and it is the tool this component dispatches to obtain a judgement. One
+// constant, so "a judge is reachable" and "the judge was asked" cannot come to mean two different
+// tools.
+import { agentApiPresence, AGENT_API_PRESENCE_TOOL } from '../agent-api/lib/presence.js';
+// The bundle's failure log — one implementation, in the core's `lib/`, the way the root rule is.
+// This component owns two of the failures the user asked to have persisted: the deterministic
+// rebuild, and every judgement that is not a verdict.
+import { causeChain, createErrorLog, describeError } from '../../lib/errors.js';
 
 /**
  * The decisions that ARE a judgement, as opposed to a reversal of one.
@@ -44,20 +52,30 @@ export const JUDGEMENT_DECISION_KINDS = Object.freeze(['merge', 'reparent', 'spl
  *   2. `memory_lab_tag_apply` applies the decisions and records them — archived, and
  *      reversible through the `undo` the receipt carries.
  *
- * ## The judgement is TOOL-INVOKED, and the two-step shape is deliberate
+ * ## The judgement is TOOL-INVOKED — by this component, through the registry
  *
- * **This component never runs a judgement itself, and neither does the panel.** The sequence is
- * agent-driven end to end: the agent calls `memory_lab_tag_review`, reads the evidence and the
- * request it carries, decides, and applies the decisions through `memory_lab_tag_apply` —
- * obtaining a run from `agent-api` through a TOOL call when a run is wanted. `agent-api` is
- * invoked only by tools, so there is no path from a route, a page global or this component
- * straight into a run, and the panel's 重建索引 performs the deterministic rebuild only.
+ * The rule that governs this bundle has not changed: **the run half of `agent-api` is reachable
+ * from its own tool definitions and from nothing else.** What the user changed is WHO CALLS THE
+ * TOOL. Pressing 重建索引 is one action in two halves, in this order:
  *
- * An earlier revision of this file said "There is ONE path, not two" and claimed the run was
- * callable from the panel's own snapshot route. That was true of a design the user has since
- * replaced, and it is the wrong story to leave in the tree: a reader who believed it would build
- * the route-triggered judgement that the constraint forbids. What replaced it is not a fallback
- * and not a queue — it is the two calls above, in that order.
+ *   1. the DETERMINISTIC rebuild — `store.reindex()`, the normalizer, milliseconds (先硬流程重建);
+ *   2. the JUDGEMENT — this component builds the ask with `judgementPrompt()` and dispatches
+ *      `agent_api_send` through the tools registry (`judge()` below), so a run of this bundle's
+ *      own agent core actually happens, driven by that prompt.
+ *
+ * An earlier revision of this file said "This component never runs a judgement itself, and
+ * neither does the panel", and the revision before that said "There is ONE path, not two" and
+ * claimed the run was callable from the panel's own snapshot route. Both are now history: the
+ * first is false (the panel's button does cause a run, through this component), and the second
+ * described a design the user replaced with the tool-invoked sequence. Neither story may be left
+ * standing in the tree, because the next reader implements the story they were told.
+ *
+ * What has NOT changed, and what the gate still asserts: the RUN itself is invoked only through
+ * the tool. The route reaches it by dispatching `agent_api_send` — the same call a model makes —
+ * so the run goes through the registry's pre-policy, guards and post-policy exactly as any other
+ * tool call does, and there is no second entry point into `runSend`. A caller-supplied prompt
+ * cannot reach it either: the ask is built here, from a fresh review of the graph, and the route
+ * passes this component nothing but its own two locals.
  *
  * ## How "is a judge reachable" is answered, now
  *
@@ -66,8 +84,9 @@ export const JUDGEMENT_DECISION_KINDS = Object.freeze(['merge', 'reparent', 'spl
  * that can see `ctx.tools`, and it is exactly the fact that matters — if the tool is not there,
  * no tool-invoked run can happen. That probe lives in `agent-api`'s own `lib/presence.js`, which
  * is importable whether or not that component is mounted, and `readAgentApi` below is the only
- * place in MemoryLab that reads it. `AGENT_API_SERVICE` is kept below only to name the concept in
- * prose; nothing looks it up.
+ * place in MemoryLab that reads it — the same registry, and the same `get`, that `judge()`
+ * dispatches through. `AGENT_API_SERVICE` is kept below only to name the concept in prose;
+ * nothing looks it up.
  */
 export const AGENT_API_INTERFACE = 'agent-api';
 
@@ -100,6 +119,62 @@ export function readAgentApi(tools) {
     reason: presence.active === true ? '' : `the ${AGENT_API_INTERFACE} component is switched off, so no run can be asked for: ${presence.reason}`,
     active: Array.isArray(presence.registered) ? presence.registered.map(String) : [],
   };
+}
+
+/**
+ * The tool a rebuild's judgement half is dispatched through.
+ *
+ * Not a second constant and not a second lookup: this is `agent-api`'s own declared identity read
+ * from its presence module, so the tool whose registration makes a judge reachable is the tool
+ * that gets called, and neither fact can drift from the other.
+ */
+export const JUDGEMENT_TOOL = AGENT_API_PRESENCE_TOOL;
+
+/**
+ * How long a rebuild's judgement half may take, by default.
+ *
+ * A run is a model loop — several turns, tool calls, round trips — and the deterministic rebuild
+ * beside it is milliseconds. The bound exists for one reason: the button must always come back
+ * with an answer. A run that cannot finish inside this window is aborted and reported as a
+ * TIMEOUT, which is a state of its own; it must never be reported as a judgement, as a skip, or
+ * as a silent no-op, and the request must never be left open on it.
+ */
+export const DEFAULT_JUDGEMENT_TIMEOUT_MS = 300000;
+
+/**
+ * Why a run could not even be attempted, in the words a person reads.
+ *
+ * `agent_api_send` answers exit 3 with a machine code when NOTHING WAS ATTEMPTED — no model is
+ * authorised, the model is gone, the llm or the registry is unreachable. Those codes are the
+ * interesting half of the failure surface (by far the likeliest one in the app is
+ * `model_not_selected`, on a profile where nobody has chosen a model yet), and this is where each
+ * becomes a sentence in the user's language instead of an identifier. A code this table does not
+ * name falls back to the component's own message, so an unfamiliar failure is reported rather
+ * than swallowed.
+ */
+const UNAVAILABLE_GLOSS = Object.freeze({
+  agent_api_disabled: 'agent-api 已停用',
+  model_not_selected: '还没有选定模型，agent-api 不会替你默认一个',
+  model_unavailable: '已选定的模型在提供方那里已经不可用',
+  core_service_absent: '核心行没有把共享根与授权模型交给它',
+  core_model_accessor_absent: '核心行没有提供读取授权模型的方法',
+  llm_unavailable: '模型服务不可达，无法发起这次运行',
+  tools_unavailable: '工具注册表不可达，无法驱动这次运行',
+  workspace_unavailable: '运行的工作目录不可用',
+});
+
+/**
+ * The envelope a dispatched tool answered with, when it answered with one.
+ *
+ * A `ToolExecutionResult` is `{ content, isError, value }` on success and
+ * `{ content, isError, error }` on failure; `agent_api_send` answers with the envelope as its
+ * VALUE on every path, including its refusals. So the envelope is read from `value`, and its
+ * absence is a real difference — it means the dispatch never reached the tool — rather than
+ * something to be smoothed over.
+ */
+function readEnvelope(outcome) {
+  const value = outcome && typeof outcome === 'object' ? outcome.value : undefined;
+  return value && typeof value === 'object' && typeof value.exit === 'number' ? value : null;
 }
 
 /** The signature the store records for one component body. */
@@ -181,13 +256,16 @@ function toolText(value) {
  * @param root - the shared Newmark user root.
  * @param language - `'auto' | 'en' | 'zh'`, selecting the canonical bilingual tag.
  * @param logger - optional logger for activation lines.
- * @param tools - the `tools` service (`ctx.tools`), read for ONE thing: whether
- *        `agent_api_send` is currently registered, which is what "a judge is reachable" means.
- *        `agent-api` is invoked only by tools, so the registry is both the presence signal and
- *        the only route to a run — there is no second thing to look up. Its absence is a state
- *        the app reaches (the user switches `agent-api` off and its tools are retired), so it is
- *        not an error here: it is what makes the Agent half of a rebuild unavailable, and every
- *        envelope this component produces says which of the two it is.
+ * @param tools - the `tools` service (`ctx.tools`), read for TWO things that are one fact: whether
+ *        `agent_api_send` is currently registered, which is what "a judge is reachable" means, and
+ *        the `execute` that dispatches it, which is what a judgement IS. Both are read from this
+ *        one object at the moment they are used, so a caller cannot hand in a dispatcher for a
+ *        registry that was never probed. `agent-api` is invoked only by tools, so the registry is
+ *        both the presence signal and the only route to a run — there is no second thing to look
+ *        up. Its absence is a state the app reaches (the user switches `agent-api` off and its
+ *        tools are retired), so it is not an error here: it is what makes the Agent half of a
+ *        rebuild unavailable, and every envelope this component produces says which of the two
+ *        it is.
  */
 export function createMemoryLab({ root, language = 'auto', reindexOnRender = true, logger, tools } = {}) {
   const labDir = memoryLabDir(root);
@@ -196,11 +274,47 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
   logger?.info?.(`newmark-core/memorylab: store ready at ${labDir}`);
 
   /**
+   * The bundle's failure log, from the SAME resolved root the store is placed under.
+   *
+   * `where: 'memorylab/rebuild'` and `where: 'memorylab/judgement'` are this component's two
+   * halves, and `lib/errors.js` says how a line is shaped, why the path is derived rather than
+   * written down, and why zero findings never reaches it. What matters at THIS call site is
+   * rule 1: `record()` never throws, so a rebuild that failed does not fail a second time while
+   * being reported.
+   */
+  const failures = createErrorLog({ root, logger });
+
+  /**
+   * The deterministic rebuild — the ONE wrapper every rebuild in this component goes through.
+   *
+   * `store.reindex()` is called from four places (a verified write, the snapshot's stale check,
+   * the rebuild method, and the `memory_lab_reindex` tool) and a throw from any of them is the
+   * same failure: `<root>/Memory Lab` could not be normalised. Recording it here rather than at
+   * four call sites is what makes "the rebuild failed" one record instead of four chances to
+   * forget — and the error is re-thrown, so every caller keeps the behaviour it had.
+   */
+  function reindexOnce() {
+    try {
+      return store.reindex();
+    } catch (error) {
+      failures.record({
+        where: 'memorylab/rebuild',
+        code: 'rebuild_failed',
+        message: `the deterministic rebuild threw: ${describeError(error)}`,
+        detail: causeChain(error),
+        fields: { index: path.join(labDir, 'index.json') },
+      });
+      throw error;
+    }
+  }
+
+  /**
    * What the judgement half of a rebuild looks like right now.
    *
    * Read afresh on every call that needs it. `judged` is the one field that must
-   * never be guessed: MemoryLab does not judge, so it is `false` unless a caller
-   * has just handed over decisions this call applied.
+   * never be guessed: MemoryLab judges nothing by READING, so it is `false` unless a caller
+   * has just handed over decisions this call applied — a run this component dispatched is
+   * reported by `judge()` below, in its own result, and never leaks into this one.
    */
   function judgeState({ judged = false, applied = 0 } = {}) {
     const judge = readAgentApi(tools);
@@ -215,17 +329,17 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
       judged,
       applied,
       applyWith: 'memory_lab_tag_apply',
-      // The sequence, stated where a caller reads it. It is two calls and a decision by the agent
-      // in between; nothing here runs a judgement, and nothing here can.
+      // The sequence, stated where a caller reads it — and it is the sequence the panel's own
+      // button now runs, in this order. This component dispatches the run; it does not decide.
       sequence: [
-        'memory_lab_tag_review reads the evidence and carries the request',
-        'the agent decides, obtaining a run from agent-api through a tool call when one is wanted',
-        'memory_lab_tag_apply applies the decisions and records them, reversibly',
+        '确定性重建：store.reindex() 先跑完，索引与标签图是这次判定的输入',
+        `判定：MemoryLab 把 judgementPrompt 交给 agent-api 的 ${JUDGEMENT_TOOL} 工具运行一次（页面上的重建索引按钮就是这条路）`,
+        'memory_lab_tag_apply 应用并记录决定，可撤销',
       ],
       note: judged
         ? 'these decisions were applied and recorded; the receipt carries the undo that reverses them'
         : judge.available
-          ? 'nothing was judged by this call: a judgement is an agent-driven sequence — this tool reads the evidence, the agent decides, and memory_lab_tag_apply applies the result. This component never runs a judgement itself, and the panel never runs one either'
+          ? 'nothing was judged by THIS call: a reading tool never judges. The judgement runs when the panel asks for a rebuild (确定性重建之后，提交 agent-api 运行一次), or when an agent decides from memory_lab_tag_review and applies through memory_lab_tag_apply'
           : `the ${AGENT_API_INTERFACE} component is off, so the three judgement classes (假根父节点接续, 同义近义 tag 合并, 未被正确解析的 tag 误读为单 tag) are unavailable here — not skipped and not pending; the deterministic rebuild is unaffected`,
     };
   }
@@ -289,11 +403,11 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
    * judgement was asked for and came back empty.
    */
   const PROMPT_NOTICES = Object.freeze({
-    none: '索引里没有需要判定的事项：确定性重建已经做完，标签图没有留下同义近义、假根父节点或误解析的候选。这不是跳过，也不是失败，是重建后的稳定状态。',
-    unavailable: `判定不可用：${AGENT_API_INTERFACE} 已停用，标签判定的三个问题都没有可用的运行来源。这不是跳过，也不是待办——确定性重建不受影响。`,
+    none: '索引里没有需要判定的事项——确定性重建已经做完，标签图没有留下同义近义、假根父节点或误解析的候选。这不是跳过，也不是失败，是重建后的稳定状态。',
+    unavailable: `agent-api 已停用，标签判定的三个问题都没有可用的运行来源；确定性重建不受影响。这不是跳过，也不是待办。`,
   });
   const NO_EVIDENCE_NOTICE = '（这一次的审查结果没有返回任何发现，因此没有证据可以呈现。）';
-  const REVIEW_UNAVAILABLE_NOTICE = '审查暂时读不出来，所以现在没有可复制的提示词：';
+  const REVIEW_UNAVAILABLE_NOTICE = '审查暂时读不出来，因此这次判定没有可提交的内容：';
 
   /**
    * The judgement request as the PROMPT a model is actually sent.
@@ -314,9 +428,9 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
    *  - and it says what NOT to do, because this store holds real memory: no inventing tags, no
    *    rewriting component bodies, no merging a near-synonym the evidence does not name.
    *
-   * It takes the REQUEST, which is the one object both callers already have: `judgementRequest`
-   * builds it for a review, and the prompt points a run back at the review for the findings
-   * themselves. The one thing it reads about the findings is their count — the request carries
+   * It takes the REQUEST, which is the one object there is: `judgementRequest` builds it from a
+   * review, and the prompt points a run back at `memory_lab_tag_review` for the findings
+   * themselves — the same tool a model caller uses, and the same text this component dispatches. The one thing it reads about the findings is their count — the request carries
    * them under `findings`, and OF ZERO it produces a notice and no task, because a prompt that
    * asked a model to decide over an empty review would be asking it to invent the repairs. A
    * review passed straight in from the store carries the same numbers as `counts`, so both
@@ -407,44 +521,31 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
     };
   }
 
-  /* ONE review per graph, memoized. `tagReview` walks every tag pair, so the snapshot this feeds
-   * — built on every page load and after every rebuild — must not recompute it while nothing has
-   * changed. The key is the index file's modification time AND the relationship version of the
-   * graph inside it: either one moving means the graph was written, which is the only thing that
-   * can change a finding, and requiring both to be unchanged is what makes a stale prompt
-   * impossible rather than unlikely. Whether a run is reachable is in the key too, because the
-   * prompt becomes unusable (and usable again) with that switch alone. */
-  let promptCache = { key: '', value: null };
-
   /**
-   * The prompt the panel offers and a run is given, taken from ONE review of the graph.
+   * The ask a run is given, taken from ONE fresh review of the graph.
    *
-   * The same call the tool makes, so the text a person copies and the text a tool hands a run
-   * cannot drift apart — there is one prompt and this is where it is built.
+   * This is where the judgement's text is built, and it is called once per rebuild — never per
+   * page load. It used to be memoized because the SNAPSHOT carried it and a snapshot is built on
+   * every render; the snapshot no longer carries it (the run consumes it, the page has no use for
+   * it), and a rebuild is exactly the moment the evidence must be read again, so the cache and its
+   * key are gone with the reason for them.
    *
-   * `status` is the prompt's own status unless no run is reachable, in which case it is
-   * `unavailable` and the text is withheld: a prompt nobody can use is not offered beside a
-   * notice, and "there is nobody to ask" must not be readable as "there was nothing to ask".
+   * The same call the `memory_lab_tag_review` tool makes, so the ask a run is handed and the ask a
+   * model reads from that tool cannot drift apart — there is one prompt and this is where it is
+   * built.
+   *
+   * `status` is `ready` (a prompt to send), `none` (nothing to judge — a notice, and deliberately
+   * no body, so a run is never asked to invent repairs in a store holding real memory) or
+   * `unknown` (the review could not be read). Whether a run is REACHABLE is a separate question
+   * and is answered by `judge()` below from the registry, because "there is nobody to ask" and
+   * "there is nothing to ask" must never collapse into one answer.
    */
-  function promptForReview() {
-    const judge = judgeState();
-    let value;
+  function judgementAsk() {
     try {
       const review = store.tagReview({ limit: 25 });
-      const prompt = judgementPrompt(judgementRequest(review));
-      value = {
-        ...prompt,
-        counts: review.counts,
-        window: review.window,
-        // Whether a run can be asked for AT ALL is the same question the tool envelope
-        // answers, and it is answered here from the same one place. The text is withheld
-        // rather than shown next to a notice: a prompt a reader cannot use is not offered.
-        status: judge.status === 'available' ? prompt.status : 'unavailable',
-        notice: judge.status === 'available' ? prompt.notice : PROMPT_NOTICES.unavailable,
-        text: judge.status === 'available' ? prompt.text : '',
-      };
+      return { ...judgementPrompt(judgementRequest(review)), counts: review.counts, window: review.window };
     } catch (error) {
-      value = {
+      return {
         status: 'unknown',
         text: '',
         notice: `${REVIEW_UNAVAILABLE_NOTICE}${error instanceof Error ? error.message : String(error)}`,
@@ -453,35 +554,332 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         relationshipVersion: '',
       };
     }
-    return value;
+  }
+
+  /* How many judgement asks THIS instance has dispatched. A dispatched call is identified by its
+   * `callId`, so two asks must never share one — a counter is the smallest thing that guarantees
+   * it, and it is also what makes "exactly one dispatch per rebuild" countable from outside. */
+  let judgementAsks = 0;
+
+  /**
+   * The stable log codes for the statuses that carry no run code of their own.
+   *
+   * Every other status is recorded with `envelope.code` VERBATIM — `max_steps`, `run_failed`,
+   * `schema_violation`, `model_not_selected`, `agent_api_disabled`, `dispatch_threw`,
+   * `no_envelope`, and whatever the next one is called — because a code that summarises is a
+   * code that hides which failure happened, and this bundle has lost two releases to exactly
+   * that. These four are the cases where there is no run to have a code: no run was attempted
+   * (`agent_api_off`), the bound ended the call before any answer came back (`run_timeout`), the
+   * deterministic half failed first (`judgement_blocked`), or the ask could not even be built
+   * (`judgement_unknown`).
+   */
+  const JUDGEMENT_LOG_CODE = Object.freeze({
+    timeout: 'run_timeout',
+    unavailable: 'agent_api_off',
+    blocked: 'judgement_blocked',
+    unknown: 'judgement_unknown',
+    aborted: 'run_aborted',
+  });
+
+  /**
+   * Persist one judgement that is not a verdict — into `<root>/errors.jsonl`, and to the log.
+   *
+   * ## What is recorded, and what is deliberately not
+   *
+   * `agent-api` switched off is its own code (`agent_api_off`) and never "nothing to do"; a
+   * timeout is `run_timeout` and never a judgement, a skip or a silent no-op. Both, because the
+   * alternative is the disguise rule 2 forbids.
+   *
+   * **`judged` and `none` are NOT failures and never reach this function.** `judged` is a run
+   * that answered — the one status that is a verdict. `none` means the deterministic rebuild
+   * left nothing to judge: a review found no findings, so no run was asked for. That is the
+   * STEADY STATE of a clean store, and it is what a person sees every time they press 重建索引
+   * twice in a row. Recording it would fill this file with noise on a healthy store and teach
+   * whoever reads it that the file can be ignored — which would cost the failures that matter
+   * their only reader. **If a later reader is tempted to "fix" this by recording every status:
+   * that is the change this paragraph exists to stop.**
+   *
+   * A run that answered with an exit code carries that code here; a status whose cause was
+   * already recorded elsewhere (`blocked`, whose cause is the `memorylab/rebuild` line) is
+   * still recorded, because "the judgement did not happen" is its own fact and the panel's
+   * 重建索引 receipt is the only other place it appears.
+   */
+  function recordJudgement(envelope) {
+    if (envelope.status === 'judged' || envelope.status === 'none') return;
+    const own = String(envelope.code || '').trim();
+    /* An envelope whose `code` is literally its own status carries this component's PLACEHOLDER,
+     * not a run's code: the timeout branch sets `code: 'timeout'` because there is no run to have
+     * answered, and `aborted` is the same shape. Those take the log's name for the event; every
+     * other code is a run's own and is recorded exactly as it came back. */
+    const placeholder = own === '' || own === envelope.status;
+    const code = placeholder ? JUDGEMENT_LOG_CODE[envelope.status] || `judgement_${envelope.status}` : own;
+    const message =
+      String(envelope.reason || '').trim() !== ''
+        ? String(envelope.reason)
+        : String(envelope.label || '').trim() !== ''
+          ? String(envelope.label)
+          : `the judgement ended as ${envelope.status}`;
+    failures.record({
+      where: 'memorylab/judgement',
+      code,
+      message,
+      detail: String(envelope.label || ''),
+      fields: {
+        status: String(envelope.status),
+        label: String(envelope.label || ''),
+        attempted: envelope.attempted === true,
+        exit: envelope.exit === undefined ? null : envelope.exit,
+        runCode: own,
+        turns: Number(envelope.turns) || 0,
+        toolCalls: Number(envelope.toolCalls) || 0,
+        boundMs: Number(envelope.boundMs) || 0,
+        elapsedMs: Number(envelope.elapsedMs) || 0,
+      },
+    });
   }
 
   /**
-   * `promptForReview()`, recomputed only when the thing it describes has moved.
+   * The judgement half of a rebuild: ask the agent core for one run, and report what came back.
    *
-   * `tagReview` walks every tag pair, and the snapshot this feeds is built on every page load
-   * and after every rebuild, so an unmemoized review would be paid for on a page that only
-   * ever displays it. The key is the index file's identity: its modification time AND the
-   * relationship version of the graph inside it. Either one moving means the graph was
-   * written, which is the only thing that can change a finding — and requiring both to be
-   * unchanged is what makes a stale prompt impossible rather than unlikely.
+   * THE ONE WAY THIS COMPONENT REACHES A RUN: it dispatches `agent_api_send` — `agent-api`'s own
+   * run tool — through the tools registry it was constructed with, via `tools.execute`. Not a
+   * service, not a private import, not a copy of the loop. That choice is deliberate and it is the
+   * whole reason the bundle's "invoked only by tools" rule survives this feature:
+   *
+   *   - the run is produced by a TOOL EXECUTION, so it goes through the registry's pre-policy,
+   *     its guards and its post-policy exactly as a model's own tool call does;
+   *   - there is no second entry point into `runSend` — the route cannot reach the loop, only
+   *     this one tool;
+   *   - the presence answer and the dispatch read the SAME registry object at the same moment, so
+   *     a caller cannot hand in a dispatcher for a registry that was never probed. That is why
+   *     `judge()` takes no dispatcher argument: taking one would be a way to run something else.
+   *
+   * The ask is built HERE, from a fresh review of the graph the deterministic rebuild just wrote.
+   * Nothing a request carries reaches the prompt: the arguments are this method's own three
+   * values, and the tool set is left at `agent_api_send`'s own default (the `memory_lab_*` tools
+   * and nothing else), because a judgement reads a memory graph and needs no filesystem — so the
+   * one thing this call must never do is WIDEN a run.
+   *
+   * ONE BOUND, AND IT DOES TWO THINGS. `timeoutMs` is a timer this call owns:
+   *
+   *   - it aborts the signal the dispatch was handed, so a run that honours `exec.signal` stops
+   *     where it is — `agent-api` does, and it releases its temporary conversation on the way out;
+   *   - it settles this call whatever the tool does, so a dispatch that ignored the signal cannot
+   *     hold the request open. A run that would not stop is reported as a TIMEOUT, which is what
+   *     it is, and never as a judgement, a skip, or a silent no-op.
+   *
+   * Every failure is partial and named. `status` is one of:
+   *
+   *   `judged`      a run was asked for and answered (exit 0) — the only status that is a verdict;
+   *   `failed`      a run was asked for and did not deliver (exit 4, exit 2, or a dispatch that
+   *                 never reached the tool). No judgement was produced;
+   *   `timeout`     a run was asked for and did not finish inside the bound; it was aborted;
+   *   `aborted`     the run was cancelled for some other reason (exit 130 without our timer);
+   *   `unavailable` the run could not be attempted at all — agent-api is off (no dispatch), or its
+   *                 exit-3 answer says nothing was attempted (no model, no llm, no registry);
+   *   `none`        nothing to judge: the review found no findings, so no run was asked for;
+   *   `unknown`     the ask could not be built (the review could not be read) or sent (no registry
+   *                 dispatch). Distinct from `unavailable`, which names a switch or a code;
+   *   `blocked`     the deterministic half failed, so the judgement was not asked for at all.
+   *
+   * The deterministic rebuild stands in every one of them, and `label` is the one clause the panel
+   * prints, so what happened is said in one place rather than reconstructed by the page.
    */
-  function promptForGraph() {
-    const judge = judgeState();
-    let stamp = 'no-index';
-    try {
-      stamp = String(fs.statSync(store.indexPath).mtimeMs);
-    } catch {
-      /* An absent index is the empty store: a state with a review, not a failure. */
+  async function judge({ timeoutMs = DEFAULT_JUDGEMENT_TIMEOUT_MS, rebuildError = '' } = {}) {
+    const bound = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : DEFAULT_JUDGEMENT_TIMEOUT_MS;
+    const workspace = path.join(root, 'Work');
+    const startedAt = Date.now();
+    const base = {
+      interface: AGENT_API_INTERFACE,
+      tool: JUDGEMENT_TOOL,
+      workspace,
+      boundMs: bound,
+      attempted: false,
+      status: 'unknown',
+      label: '',
+      reason: '',
+      exit: null,
+      code: '',
+      error: '',
+      turns: 0,
+      toolCalls: 0,
+      stopReason: '',
+      relationshipVersion: '',
+      elapsedMs: 0,
+    };
+    /* ONE EXIT, AND THE RECORD IS ON IT. Every branch above returns through `done`, so putting
+     * the record here is what makes "every failure in this taxonomy is persisted" a property of
+     * the shape rather than a promise about eleven call sites — a branch added later is covered
+     * without being edited. `recordJudgement` is a no-op for the two statuses that are not
+     * failures, and `record()` cannot throw, so nothing about the envelope it returns changes. */
+    const done = (fields) => {
+      const envelope = { ...base, elapsedMs: Date.now() - startedAt, ...fields };
+      recordJudgement(envelope);
+      return envelope;
+    };
+
+    /* HALF ONE FAILED, SO HALF TWO IS NOT ASKED FOR. A judgement is a decision about the graph,
+     * and the graph is what the deterministic rebuild produces. Asking for one on a rebuild that
+     * threw would be judging a store this component could not write — and reporting it as a
+     * judgement that came back empty is exactly the collapse this whole envelope exists to
+     * prevent. It is REPORTED. */
+    if (rebuildError) {
+      return done({
+        status: 'blocked',
+        reason: `确定性重建失败：${rebuildError}`,
+        label: `未发起：确定性重建失败——${rebuildError}`,
+      });
     }
-    const key = `${stamp}|${judge.status}`;
-    if (promptCache.key === key && promptCache.value) return promptCache.value;
-    const value = promptForReview();
-    /* The version goes into the key, so the next call re-derives only after the graph's
-     * version has actually moved. The file's mtime is checked first because it is one stat
-     * call against a hash over every tag and every component membership. */
-    promptCache = { key: `${key}|${value.relationshipVersion}`, value };
-    return value;
+
+    const judge = readAgentApi(tools);
+    if (!judge.available) {
+      return done({
+        status: 'unavailable',
+        reason: judge.reason,
+        label: `未运行：${PROMPT_NOTICES.unavailable}`,
+      });
+    }
+
+    const ask = judgementAsk();
+    if (ask.status === 'none') {
+      return done({ status: 'none', reason: ask.notice, label: `未发起：${ask.notice}` });
+    }
+    const askText = typeof ask.text === 'string' ? ask.text : '';
+    if (ask.status !== 'ready' || !askText.trim()) {
+      return done({ status: 'unknown', reason: ask.notice, label: `未发起：${ask.notice}` });
+    }
+    if (typeof tools?.execute !== 'function') {
+      return done({
+        status: 'unknown',
+        reason: 'the tools registry has no execute(), so the ask cannot be dispatched',
+        label: '未发起：工具注册表不可达，判定无法提交',
+      });
+    }
+
+    judgementAsks += 1;
+    const controller = new AbortController();
+    let timer;
+    let timedOut = false;
+    const expiry = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        resolve(null);
+      }, bound);
+    });
+    let outcome = null;
+    try {
+      const dispatched = tools.execute({
+        callId: `newmark-memorylab:judge:${judgementAsks}:${Date.now().toString(36)}`,
+        name: JUDGEMENT_TOOL,
+        // The ask, the directory the run works in, and the bound. No `tools`, no `max_steps`, no
+        // `output_schema`: the run gets `agent_api_send`'s own narrow defaults, and a judgement
+        // must never widen what a run may reach.
+        arguments: { prompt: askText, workspace, timeout_ms: bound },
+        signal: controller.signal,
+      });
+      /* Settling the race is this call's business; the dispatched promise's own rejection is not
+       * — if it loses the race, nobody is left to read it, and an unhandled rejection would end
+       * the Host process rather than the request. */
+      if (dispatched && typeof dispatched.catch === 'function') dispatched.catch(() => {});
+      const raced = await Promise.race([dispatched, expiry]);
+      /* THE ONE TIMEOUT ANSWER, reached in one place. `expiry` settles with `null` and a dispatch
+       * that returns an envelope never does, so a null here means the bound is what ended this
+       * call. Once `raced` is anything else, the classification below runs synchronously after this
+       * await — the timer cannot fire in between — so the branches after this one carry no
+       * `timedOut` test: a second timeout answer would be a branch nothing can reach, and a reader
+       * would trust it. */
+      if (raced === null && timedOut) {
+        return done({
+          status: 'timeout',
+          attempted: true,
+          code: 'timeout',
+          reason: `运行在 ${bound} ms 内没有结束，已被中止`,
+          relationshipVersion: ask.relationshipVersion,
+          label: `超时未完成：${bound} ms 内没有返回，运行已中止，判定没有产生`,
+        });
+      }
+      outcome = raced;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return done({
+        status: 'failed',
+        attempted: true,
+        code: 'dispatch_threw',
+        error: message,
+        reason: message,
+        relationshipVersion: ask.relationshipVersion,
+        label: `未完成：dispatch_threw——${message}`,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const envelope = readEnvelope(outcome);
+    if (!envelope) {
+      /* No envelope means the dispatch never reached the tool: an unknown name, a guard's denial,
+       * a registry failure. `agent_api_send` answers with an envelope on EVERY path, including its
+       * refusals, so this is a different thing from any answer it could have given. */
+      const message = String(outcome?.error?.message || 'the dispatch returned no envelope');
+      const code = String(outcome?.error?.info?.code || 'no_envelope');
+      return done({
+        status: 'failed',
+        attempted: true,
+        code,
+        error: message,
+        reason: message,
+        relationshipVersion: ask.relationshipVersion,
+        label: `未完成：${code}——${message}`,
+      });
+    }
+
+    const result = envelope.result && typeof envelope.result === 'object' ? envelope.result : {};
+    const answered = {
+      attempted: true,
+      exit: envelope.exit,
+      code: String(envelope.code || ''),
+      error: String(envelope.error || ''),
+      turns: Number(result.turns) || 0,
+      toolCalls: Number(result.tool_calls) || 0,
+      stopReason: String(result.stop_reason || ''),
+      relationshipVersion: ask.relationshipVersion,
+    };
+
+    if (envelope.exit === 0) {
+      /* The ONLY status that is a verdict. What the run applied is in the store and in
+       * policy.jsonl — the panel's clause is a fact about the run, not a second copy of it. */
+      return done({
+        ...answered,
+        status: 'judged',
+        reason: '',
+        label: `已运行：${answered.turns} 轮模型、${answered.toolCalls} 次工具调用，用时 ${Date.now() - startedAt} ms`,
+      });
+    }
+    if (envelope.exit === 3) {
+      const gloss = UNAVAILABLE_GLOSS[answered.code] || '';
+      return done({
+        ...answered,
+        status: 'unavailable',
+        reason: answered.error,
+        label: `未运行：${gloss || answered.error || answered.code || '运行来源不可用'}`,
+      });
+    }
+    if (envelope.exit === 130) {
+      return done({
+        ...answered,
+        status: 'aborted',
+        reason: answered.error,
+        label: `已中止：${answered.error || '运行被取消，判定没有产生'}`,
+      });
+    }
+    /* Everything else — exit 2 (the ask was refused as invalid) and exit 4 (a run happened and did
+     * not deliver) — is a judgement that did NOT arrive, and it says which. */
+    return done({
+      ...answered,
+      status: 'failed',
+      reason: answered.error,
+      label: `未完成：${answered.code || 'failed'}——${answered.error}`,
+    });
   }
 
   /** Read a component back off disk; an empty slug only asserts the index reads. */
@@ -507,9 +905,22 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
    * read-back agree. Failure is a structured error, never a silent success.
    */
   function verifiedReceipt(written, operation) {
-    const rebuilt = store.reindex();
+    const rebuilt = reindexOnce();
     const verified = readBack(written?.slug || '', operation === 'delete' ? 'absent' : 'present');
     if (!verified.ok) {
+      /* A WRITE THAT DID NOT VERIFY. The component was written and the index does not agree —
+       * missing after an update, still present after a delete — so this is an operation that was
+       * ATTEMPTED and did not achieve its effect: a failure by the line this bundle draws, and
+       * the 0.2.2 defect class in its worst form. It is reported to the caller in the receipt
+       * below AND persisted here, because the caller is usually a model that may say nothing
+       * about it, and a store that quietly lost a memory is what this envelope exists to make
+       * visible. */
+      failures.record({
+        where: 'memorylab/write',
+        code: 'write_not_verified',
+        message: `Memory Lab ${operation} did not verify after rebuild: ${verified.error}`,
+        fields: { action: String(operation).toUpperCase(), slug: String(written?.slug ?? '') },
+      });
       return {
         ok: false,
         action: String(operation).toUpperCase(),
@@ -538,14 +949,28 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
     rootDir: root,
 
     /**
+     * The failure log, for the halves that live in `index.js`.
+     *
+     * The route and the page injection can both fail on their own — a snapshot that cannot be
+     * read, a route that throws — and those failures belong in the same file as the rebuild's
+     * and the judgement's. Handing out this one object rather than letting `index.js` build a
+     * second one is what keeps it one log with one path.
+     */
+    failures,
+
+    /**
      * The ONE snapshot the renderer and the injected page global are built from.
      *
      * `snapshot()` — what the page index injection calls — rebuilds the index when
-     * it is stale, which is what makes the panel's 重建索引 action honest: the
-     * action asks this half for a rebuild, the deterministic rebuild runs, and the
-     * panel re-renders from the answer. `snapshot({ rebuild: false })` is the pure
-     * read the panel's 重置 action asks for: it never writes, so re-reading the
+     * it is stale, which is what makes a page render honest about the store it draws.
+     * `snapshot({ rebuild: false })` is the pure read: it never writes, so re-reading the
      * store can never rewrite it. A rebuild failure is reported, never swallowed.
+     *
+     * It carries NO prompt. The judgement's ask is built and consumed inside `judge()`, in the
+     * same call that dispatches it; a page has no use for the text (it cannot run one, and it
+     * no longer offers one to copy), and leaving it here would be the "提示词放那" the user
+     * removed. What the snapshot carries about the judgement half is its REACHABILITY (`judge`),
+     * which is a fact about the store's surroundings rather than a task.
      */
     snapshot(options = {}) {
       const mayRebuild = options.rebuild !== false;
@@ -553,10 +978,12 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
       let visual = store.visualizationSnapshot();
       if (mayRebuild && reindexOnRender && needsRebuild(visual)) {
         try {
-          store.reindex();
+          reindexOnce();
           // Re-read so the snapshot the panel receives is the rebuilt one.
           visual = store.visualizationSnapshot();
         } catch (error) {
+          // Already recorded by `reindexOnce`; carried out as `reindexError` too, because the
+          // snapshot's own reader has to be told as well as the log.
           reindexError = error instanceof Error ? error.message : String(error);
         }
       }
@@ -572,28 +999,27 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         // Every snapshot carries whether the judgement half of a rebuild exists, so
         // the panel and the config page can never look the same with it switched off.
         judge: judgeState(),
-        /* And every snapshot carries the PROMPT that asks for a judgement, as text.
-         *
-         * This is the one thing the panel may offer and still not do: it can be copied and
-         * pasted by a person, and it can never be run from here — there is no model call on any
-         * path out of this component, and there is no route that produces one. Rendering it
-         * here rather than in the panel is not a shortcut: the panel has no tool context by
-         * construction, so the copy a reader takes from it is the only way the judgement half
-         * reaches the place that can actually run it.
-         *
-         * `status` is one of `ready` (a prompt to send), `none` (nothing to judge — a notice,
-         * and deliberately no task), `unavailable` (agent-api is off) and `unknown` (the review
-         * could not be read). Nothing here is ever model output; the text is composed from the
-         * request and the review's own counts. */
-        prompt: promptForGraph(),
       };
     },
 
     /** The deterministic rebuild on its own, with the store's own result. */
     rebuild() {
-      const result = store.reindex();
+      const result = reindexOnce();
       return { relationshipVersion: result.relationshipVersion, components: result.components, tags: result.tags, warnings: result.warnings };
     },
+
+    /**
+     * The judgement half of a rebuild, on its own.
+     *
+     * The route runs this immediately after `rebuild()`, on the SAME store, so the ask is built
+     * from the graph the deterministic half just wrote. Exposed as a method rather than hidden in
+     * the route because the sequence is the feature: 先硬流程重建，再提交 agent-api 运行一次, and a
+     * caller (or a check) has to be able to drive each half and see which one answered.
+     */
+    judge,
+
+    /** The ask the next judgement would dispatch, without dispatching it. */
+    judgementAsk,
 
     /** The seven model-facing tools, bundled with this component. */
     tools() {
@@ -703,7 +1129,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
           parameters: { type: 'object', properties: {}, required: [] },
           output: { schema: { type: 'object' }, render: (args, value) => toolText(store.formatWrite(value)) },
           async execute() {
-            const result = store.reindex();
+            const result = reindexOnce();
             const verified = readBack('');
             return {
               ok: verified.ok,
@@ -742,8 +1168,8 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
           name: 'memory_lab_tag_review',
           description:
             'Report the tag-graph repairs that need judgement rather than a rule: a root tag whose memories are already filed under another tag, near-synonym tags, a name that may be a collapsed path, a chain that may be one tag, and stored values a rebuild does not reproduce. Read-only — it rewrites nothing. Every finding carries the facts to decide it and the decision shape to pass to memory_lab_tag_apply. ' +
-              'This result also carries the judgement envelope: whether a run can be asked for right now, the request that says what is being judged, where it runs and what shape the answer takes, and `prompt` — the same ask as the prose you would send a model, ready to hand to a run as it stands. ' +
-              'THE SEQUENCE IS AGENT-DRIVEN AND IT IS TWO CALLS: this tool gives you the evidence and the request; YOU decide; memory_lab_tag_apply applies and records your decisions. Nothing here judges, and the config panel cannot judge either — a judgement is a model run, agent-api is invoked only by tools, and a panel button has no tool context. The panel shows this same prompt for a person to copy, and that copy is the whole of its part in the judgement. When you want a run to make the decision for you, obtain one from agent-api through its agent_api_send tool.',
+              'This result also carries the judgement envelope: whether a run can be asked for right now, the request that says what is being judged, where it runs and what shape the answer takes, and `prompt` — the same ask as the prose you would send a model, ready to hand to a run as it stands. It is the SAME text the panel\'s 重建索引 dispatches when it runs the judgement itself, so a run you start by hand and a run started from the panel are asked the same thing. ' +
+              'THE SEQUENCE IS AGENT-DRIVEN AND IT IS TWO CALLS: this tool gives you the evidence and the request; YOU decide; memory_lab_tag_apply applies and records your decisions. Nothing here judges. When you want a run to make the decision for you, obtain one from agent-api through its agent_api_send tool — that is also what the panel does, through this component.',
           parameters: {
             type: 'object',
             properties: {
