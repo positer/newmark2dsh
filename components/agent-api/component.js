@@ -747,7 +747,22 @@ export function createAgentApi({
           emit: async (event) => {
             // Bounded: an event log is diagnostics, and an unbounded one on a retrying run is a
             // memory leak with a friendly name.
-            if (events.length < 64) events.push({ type: String(event?.type ?? ''), turn: event?.turn });
+            // `turn` is `null` and never `undefined`, and that is not tidiness.
+    //
+    // DSH validates a tool's return value as LOSSLESS JSON before handing it back — the walker
+    // accepts null, booleans, strings, finite numbers, plain arrays and plain objects, and
+    // rejects `undefined` at `if (typeof current !== "object") return void 0`
+    // (`dsh-util-values/lib/index.js`). `{ turn: undefined }` made the WHOLE envelope invalid, so
+    // a judgement that had run to completion came back to its caller as
+    // `INVALID_TOOL_OUTPUT — tool "agent_api_send" returned invalid output: value is not lossless
+    // JSON` — an operation that succeeded, reported as a failure. Third time this bundle has met
+    // that boundary; `memory_lab_reindex` and the ComputerUse backends were the other two.
+    //
+    // It survived the acceptance gate because that gate calls the component's `execute` DIRECTLY,
+    // so the registry's output boundary was never applied. A run dispatched through `tools.execute`
+    // — which is how the judgement reaches this component, and how a model would — meets it every
+    // time. The gate's rounds are being routed through the registry for that reason.
+    if (events.length < 64) events.push({ type: String(event?.type ?? ''), turn: event?.turn ?? null });
           },
         },
         controller.signal,
