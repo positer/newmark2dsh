@@ -1764,11 +1764,13 @@ function readPageGlobals() {
               onClick: reindex,
               /* The tooltip names the ACTION and stops there.
                *
-               * It used to spell out what the judgement asks — the three classes, in the
+               * It used to spell out what the judgement asks — the judgement classes, in the
                * prompt's own words — and that is the built-in prompt leaking into a hover
                * tooltip. A user hovering a button wants to know what the button does; the ask
                * itself belongs to whoever receives it, and paraphrasing it here also meant the
-               * tooltip could drift from the prompt it was paraphrasing. */
+               * tooltip could drift from the prompt it was paraphrasing. The count is not named
+               * either, for the same reason: it is a fact about the prompt, not about the
+               * button. */
               title: '重建索引：先做确定性重建，再由 Agent 判定一次。不重载外壳。',
             },
             state.reindexing ? '重建并判定中…' : '重建索引',

@@ -390,8 +390,17 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
             const backend = await loadBackend();
             if (!backend) return UNAVAILABLE('observe');
             const application = String(args?.target || 'desktop') === 'application';
+            /**
+             * `target: "desktop"` means the screen, and it now reaches the screen.
+             *
+             * It used to be dispatched as `observe`, which resolves a window - so a request
+             * for the desktop silently answered with the foreground window: the payload
+             * carried a window handle as `target_scope` and a `PrintWindow` capture, and a
+             * caller could not tell it had not been given the screen. The action below
+             * resolves no window at all and answers with the virtual screen's own bounds.
+             */
             return runBackend(backend, {
-              action: application ? 'app_observe' : 'observe',
+              action: application ? 'app_observe' : 'capture_screen',
               appTarget: args?.app_target,
               windowHandle: args?.window_handle,
               captureMaxWidth: args?.capture_max_width,

@@ -108,12 +108,27 @@ export const ALL_ACTIONS = Object.freeze([
 ]);
 
 /**
+ * Actions that are **not** on the model-facing `computer_use` surface.
+ *
+ * `capture_screen` is the whole-desktop capture behind the read-only `screen_capture` tool.
+ * It is not an action a model can name through `computer_use`, deliberately: it returns no
+ * controls and exists only to answer "what is on the screen". It still routes through the
+ * same dispatch, the same lane table and the same failure log as every other action, so it
+ * is an action in every sense except its advertisement.
+ */
+export const INTERNAL_ACTIONS = Object.freeze(['capture_screen']);
+
+/** Every action `dispatchComputerUse` accepts, advertised or not. */
+const DISPATCHABLE_ACTIONS = Object.freeze([...ALL_ACTIONS, ...INTERNAL_ACTIONS]);
+
+/**
  * Lane routing: which persistent worker carries the PowerShell work of an action.
  * Empty array means the action is pure Node state and touches no lane.
  */
 export const ACTION_LANES = Object.freeze({
   observe: Object.freeze(['window_capture', 'uia']),
   app_observe: Object.freeze(['window_capture', 'uia']),
+  capture_screen: Object.freeze(['window_capture']),
   move: Object.freeze(['action']),
   click: Object.freeze(['action']),
   drag: Object.freeze(['action']),
@@ -149,6 +164,22 @@ const DEFAULT_INIT_TIMEOUT_MS = 25000;
 const SEQUENCE_MAX_STEPS = 8;
 const MAX_UIA_ELEMENTS = 160;
 const MAX_APPLICATIONS = 200;
+
+/**
+ * The key pressed inside a Windows key's hold, and why that is what makes a lone Windows
+ * key work.
+ *
+ * VK 0xFF is not a key: the system reports no virtual key for it, so it produces no
+ * character, no menu and no shortcut. What it does produce is a key event, and a Windows
+ * keydown followed by a key event is a chord as far as the shell is concerned - so the shell
+ * acts on the Windows key itself and the Start menu opens. An unaccompanied Windows
+ * keydown/keyup pair is instead discarded, which is why `key: "win"` used to answer
+ * `ok: true` and do nothing at all.
+ */
+const VK_DUMMY = 0xff;
+
+/** How long a key delivery is given to settle before the foreground is read again. */
+const FOCUS_SETTLE_MS = 250;
 
 /* ------------------------------------------------------------------ *
  * 2. small pure helpers
@@ -275,8 +306,23 @@ const SEND_KEYS_ALIASES = {
 };
 
 /**
+ * The virtual-key codes of the named keys, for the `key:` argument and the virtual delivery
+ * path. One table, so `enter` cannot mean one thing to a validator and another to the desktop.
+ */
+const VIRTUAL_KEY_ALIASES = Object.freeze({
+  enter: 0x0d, return: 0x0d, tab: 0x09, esc: 0x1b, escape: 0x1b, backspace: 0x08, bksp: 0x08,
+  delete: 0x2e, del: 0x2e, insert: 0x2d, ins: 0x2d, space: 0x20, up: 0x26, arrowup: 0x26,
+  down: 0x28, arrowdown: 0x28, left: 0x25, arrowleft: 0x25, right: 0x27, arrowright: 0x27,
+  home: 0x24, end: 0x23, pageup: 0x21, pgup: 0x21, pagedown: 0x22, pgdn: 0x22,
+});
+
+/**
  * Normalise a human key spelling into .NET SendKeys notation.
  * ctrl+l -> ^l, ctrl+shift+l -> ^+l, alt+f4 -> %{F4}, enter -> {ENTER}, ^s passes through.
+ *
+ * The chord is resolved first, so a chord SendKeys cannot express - anything naming a
+ * Windows key - is refused here rather than handed to SendKeys, which would silently type
+ * the letters `win` instead of pressing the key.
  */
 export function normalizeSendKeysKey(value) {
   const key = String(value === null || value === undefined ? '' : value).trim();
@@ -286,30 +332,23 @@ export function normalizeSendKeysKey(value) {
   if (singleAlias) return `{${singleAlias}}`;
   if (/^f(?:[1-9]|1[0-6])$/i.test(key)) return `{${key.toUpperCase()}}`;
 
-  const parts = key.split('+').map(part => part.trim());
-  if (parts.length > 1) {
-    const modifiers = new Set();
-    let validChord = true;
-    for (const part of parts.slice(0, -1)) {
-      const modifier = part.toLowerCase();
-      if (modifier === 'ctrl' || modifier === 'control') modifiers.add('ctrl');
-      else if (modifier === 'shift') modifiers.add('shift');
-      else if (modifier === 'alt' || modifier === 'option') modifiers.add('alt');
-      else { validChord = false; break; }
-    }
-    const baseKey = parts[parts.length - 1];
-    if (validChord && modifiers.size > 0 && baseKey) {
-      let base = baseKey;
-      let shift = modifiers.has('shift');
-      if (/^[A-Z]$/.test(base) && !shift) shift = true;
-      if (/^[A-Za-z]$/.test(base)) base = base.toLowerCase();
-      const alias = SEND_KEYS_ALIASES[base.toLowerCase()];
-      if (alias) base = `{${alias}}`;
-      else if (/^f(?:[1-9]|1[0-6])$/i.test(base)) base = `{${base.toUpperCase()}}`;
-      else if (base.length !== 1) return undefined;
-      const prefix = `${modifiers.has('ctrl') ? '^' : ''}${shift ? '+' : ''}${modifiers.has('alt') ? '%' : ''}`;
-      return `${prefix}${base}`;
-    }
+  const chord = resolveKeyChord(key);
+  if (chord.error) return undefined;
+  if (chord.notation) return chord.notation;
+  if (chord.windowsKey) return undefined;
+  if (chord.names.length > 1) {
+    const modifiers = new Set(chord.names.slice(0, -1));
+    const baseKey = chord.names[chord.names.length - 1];
+    let base = baseKey;
+    let shift = modifiers.has('shift');
+    if (/^[A-Z]$/.test(base) && !shift) shift = true;
+    if (/^[A-Za-z]$/.test(base)) base = base.toLowerCase();
+    const alias = SEND_KEYS_ALIASES[base.toLowerCase()];
+    if (alias) base = `{${alias}}`;
+    else if (/^f(?:[1-9]|1[0-6])$/i.test(base)) base = `{${base.toUpperCase()}}`;
+    else if (base.length !== 1) return undefined;
+    const prefix = `${modifiers.has('ctrl') ? '^' : ''}${shift ? '+' : ''}${modifiers.has('alt') ? '%' : ''}`;
+    return `${prefix}${base}`;
   }
 
   // Preserve existing .NET SendKeys notation such as ^s or {ENTER}.
@@ -330,6 +369,133 @@ export function encodeSendKeysText(value) {
     .replace(/[+^%~(){}]/g, character => `{${character}}`)
     .replace(/\r\n|\r|\n/g, '{ENTER}')
     .replace(/\t/g, '{TAB}');
+}
+
+/* ------------------------------------------------------------------ *
+ * 2b. key chords, including the Windows keys
+ * ------------------------------------------------------------------ */
+
+/** The virtual-key codes of the two Windows keys. */
+const VK_LEFT_WINDOWS = 0x5b;
+const VK_RIGHT_WINDOWS = 0x5c;
+
+/**
+ * Every spelling of a Windows key, mapped to the virtual key it means.
+ *
+ * `meta` and `super` are aliases rather than separate keys: they are the same key under the
+ * names other desktops and other tool surfaces give it, and a caller writing `super+r`
+ * means the same chord as `win+r`.
+ */
+const WINDOWS_KEYS = Object.freeze({
+  win: VK_LEFT_WINDOWS,
+  windows: VK_LEFT_WINDOWS,
+  lwin: VK_LEFT_WINDOWS,
+  leftwin: VK_LEFT_WINDOWS,
+  meta: VK_LEFT_WINDOWS,
+  super: VK_LEFT_WINDOWS,
+  rwin: VK_RIGHT_WINDOWS,
+  rightwin: VK_RIGHT_WINDOWS,
+});
+
+/** The spellings that require the virtual-key path, for advertisement and for callers. */
+const WINDOWS_KEY_NAMES = Object.freeze(['win', 'lwin', 'rwin', 'meta', 'super']);
+
+/** The modifier virtual keys .NET SendKeys can express, by its own notation. */
+const SEND_KEYS_MODIFIERS = Object.freeze({ ctrl: 0x11, control: 0x11, shift: 0x10, alt: 0x12, option: 0x12 });
+
+/**
+ * The virtual-key code of one key name, or 0.
+ *
+ * This is the single place a key name becomes a key code: the real delivery path, the
+ * virtual (posted-message) path and the `key:` argument's own validation all read it, so a
+ * key cannot be one thing to a validator and another to the desktop.
+ */
+export function keyNameToVirtualCode(name) {
+  const key = String(name === null || name === undefined ? '' : name).trim().toLowerCase();
+  if (!key) return 0;
+  const windowsKey = WINDOWS_KEYS[key];
+  if (windowsKey) return windowsKey;
+  const modifier = SEND_KEYS_MODIFIERS[key];
+  if (modifier) return modifier;
+  const alias = VIRTUAL_KEY_ALIASES[key];
+  if (alias) return alias;
+  if (/^f(?:[1-9]|1[0-6])$/.test(key)) return 0x70 + Number(key.slice(1)) - 1;
+  if (/^[a-z0-9]$/.test(key)) return key.toUpperCase().charCodeAt(0);
+  return 0;
+}
+
+/**
+ * Resolve a key argument into the chord it names, or a refusal.
+ *
+ * Returns the resolved virtual-key codes in press order, the names of those keys, which
+ * keys are the right-hand Windows key, and - when the caller wrote .NET SendKeys notation
+ * such as `^s` - the notation as given so the unchanged SendKeys path can still carry it.
+ *
+ * A chord that names only modifiers is refused: `ctrl` on its own is not a keystroke, and
+ * delivering a bare keydown would leave the modifier stuck down with nothing to release it.
+ * The Windows keys are the one exception, because a Windows key alone IS a keystroke: it
+ * opens the Start menu.
+ */
+export function resolveKeyChord(value) {
+  const raw = String(value === null || value === undefined ? '' : value).trim();
+  if (!raw) return { error: 'A key or key chord is required.' };
+  let notation;
+  let parts = raw.split('+').map(part => part.trim()).filter(Boolean);
+  if (parts.length === 1) {
+    const shorthand = /^([+^%]*)(?:\{([^{}]+)\}|(.))$/.exec(parts[0]);
+    if (shorthand && (shorthand[1] || shorthand[2])) {
+      const modifiers = shorthand[1].split('').map(marker => (marker === '^' ? 'ctrl' : marker === '%' ? 'alt' : 'shift'));
+      const base = shorthand[2] || shorthand[3];
+      parts = [...modifiers, base];
+      if (shorthand[2]) notation = raw;
+    }
+  }
+  if (!parts.length) return { error: `Unsupported key or key chord: ${raw}` };
+
+  const virtualKeys = [];
+  const names = [];
+  const windowsKeys = [];
+  const push = (name, code) => {
+    if (!code) return false;
+    if (!virtualKeys.includes(code)) {
+      virtualKeys.push(code);
+      names.push(name);
+    }
+    if (WINDOWS_KEYS[name]) windowsKeys.push(code);
+    return true;
+  };
+
+  const final = parts[parts.length - 1];
+  for (const part of parts.slice(0, -1)) {
+    const name = part.toLowerCase();
+    if (!push(name, keyNameToVirtualCode(name))) {
+      return { error: `Unsupported key or key chord: ${raw} (${part} is not a modifier this backend knows)` };
+    }
+  }
+  const finalName = final.toLowerCase();
+  const finalCode = keyNameToVirtualCode(final);
+  if (!finalCode) return { error: `Unsupported key or key chord: ${raw}` };
+  push(finalName, finalCode);
+
+  const shiftCase = /^[A-Z]$/.test(final) && !virtualKeys.includes(SEND_KEYS_MODIFIERS.shift);
+  if (shiftCase) push('shift', SEND_KEYS_MODIFIERS.shift);
+
+  const windowsKey = windowsKeys.length > 0;
+  if (!windowsKey && parts.length === 1 && SEND_KEYS_MODIFIERS[finalName] !== undefined) {
+    return { error: `Unsupported key or key chord: ${raw} (${final} is a modifier with no key to modify; name the key as well, for example ${parts[0]}+l)` };
+  }
+  return {
+    raw,
+    notation,
+    virtualKeys,
+    names,
+    windowsKey,
+    windowsKeys,
+    /* A lone Windows key is the one chord Windows swallows unless something is pressed
+     * inside the hold, so it is marked here and the script acts on it. */
+    lonelyWindowsKey: windowsKey && virtualKeys.length === 1 && WINDOWS_KEYS[finalName] !== undefined && virtualKeys[0] === WINDOWS_KEYS[finalName],
+    shiftCase,
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -403,6 +569,88 @@ public static class NewmarkCuNative
     int size = Marshal.SizeOf(typeof(CuEvent));
     return (int)SendKeyEvents((uint)batch.Length, batch, size);
   }
+
+  static CuEvent VirtualKeyEvent(ushort virtualKey, bool keyUp)
+  {
+    CuEvent record = new CuEvent();
+    record.type = EVENT_TYPE_KEYBOARD;
+    record.U.ki.wVk = virtualKey;
+    /* The scan code is derived from the virtual key rather than left at zero, so the event
+       carries the same scan a real keyboard reports for that key. */
+    record.U.ki.wScan = (ushort)(MapVirtualKeyW(virtualKey, 0) & 0xffu);
+    record.U.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : (uint)0;
+    record.U.ki.time = 0;
+    record.U.ki.dwExtraInfo = IntPtr.Zero;
+    return record;
+  }
+
+  /**
+   * One press-and-release of each key in the array, in the order given and released in
+   * reverse. Returns the number of records the system accepted, so a short count is a
+   * refusal the caller reports instead of a silent success.
+   *
+   * This path exists because SendKeys cannot express the Windows key at all: it knows ^, +
+   * and % and nothing else, so a Windows chord never reached the desktop through it.
+   */
+  public static int SendVirtualKeys(ushort[] keys)
+  {
+    if (keys == null || keys.Length == 0) return 0;
+    List<CuEvent> records = new List<CuEvent>();
+    for (int i = 0; i < keys.Length; i++) records.Add(VirtualKeyEvent(keys[i], false));
+    for (int i = keys.Length - 1; i >= 0; i--) records.Add(VirtualKeyEvent(keys[i], true));
+    return SendRecords(records);
+  }
+
+  /**
+   * Press the held keys and keep them down while the stroke keys are pressed and released
+   * inside the hold, then release the held keys. Returns the number of records accepted.
+   *
+   * This is the delivery a LONE Windows key needs: Windows waits after a Windows keydown to
+   * see whether a chord follows, so a down/up pair with nothing in between opens nothing
+   * while still looking like a delivered keystroke. Pressing a key inside the hold is what
+   * makes the shell act on the Windows key itself.
+   */
+  public static int SendVirtualKeysHeld(ushort[] held, ushort[] stroke)
+  {
+    if (held == null || held.Length == 0 || stroke == null || stroke.Length == 0) return 0;
+    List<CuEvent> records = new List<CuEvent>();
+    for (int i = 0; i < held.Length; i++) records.Add(VirtualKeyEvent(held[i], false));
+    for (int i = 0; i < stroke.Length; i++) records.Add(VirtualKeyEvent(stroke[i], false));
+    for (int i = stroke.Length - 1; i >= 0; i--) records.Add(VirtualKeyEvent(stroke[i], true));
+    for (int i = held.Length - 1; i >= 0; i--) records.Add(VirtualKeyEvent(held[i], true));
+    return SendRecords(records);
+  }
+
+  static int SendRecords(List<CuEvent> records)
+  {
+    CuEvent[] batch = records.ToArray();
+    int size = Marshal.SizeOf(typeof(CuEvent));
+    return (int)SendKeyEvents((uint)batch.Length, batch, size);
+  }
+
+  /**
+   * ONE transition of one key: down, or up. Returns 1 when the system accepted it, 0 when it
+   * did not.
+   *
+   * The batch entry point sends a whole press-and-release in one call. That is the wrong shape
+   * for the lone Windows key, where the key has to stay DOWN in the keyboard's own state while
+   * something else is pressed - so the caller needs the two transitions separately, with real
+   * time between them.
+   */
+  public static int SendVirtualKeyStroke(ushort virtualKey, bool keyUp)
+  {
+    List<CuEvent> records = new List<CuEvent>();
+    records.Add(VirtualKeyEvent(virtualKey, keyUp));
+    return SendRecords(records);
+  }
+
+  /** Whether the system currently considers this key held down. A measurement, not a claim. */
+  public static bool IsVirtualKeyDown(int virtualKey)
+  {
+    return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+  }
+
+  [DllImport("user32.dll")] static extern uint MapVirtualKeyW(uint code, uint mapType);
 
   public sealed class CuWindowInfo
   {
@@ -490,6 +738,10 @@ public static class NewmarkCuNative
   const int SM_YVIRTUALSCREEN = 77;
   const int SM_CXVIRTUALSCREEN = 78;
   const int SM_CYVIRTUALSCREEN = 79;
+  const int DESKTOPHORZRES = 118;
+  const int DESKTOPVERTRES = 117;
+  /* The BitBlt raster operation that copies the source pixels unchanged. */
+  const uint SRCCOPY = 0x00CC0020;
   const uint CHILD_SKIP = 0x0007;
 
   [DllImport("user32.dll", SetLastError=true)] public static extern bool SetCursorPos(int x, int y);
@@ -517,8 +769,20 @@ public static class NewmarkCuNative
   [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
   [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int virtualKey);
   [DllImport("user32.dll", EntryPoint="PostMessageW", SetLastError=true)] public static extern bool PostMessage(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
+  [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr GetDC(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
+  [DllImport("gdi32.dll", SetLastError=true)] public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+  [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr hdc);
+  [DllImport("gdi32.dll", SetLastError=true)] public static extern IntPtr CreateCompatibleBitmap(IntPtr hdc, int width, int height);
+  [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr hdc, IntPtr hObject);
+  [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr hObject);
+  [DllImport("gdi32.dll", SetLastError=true)] public static extern bool BitBlt(IntPtr dest, int x, int y, int width, int height, IntPtr source, int sourceX, int sourceY, uint rop);
+  [DllImport("gdi32.dll")] public static extern int GetDeviceCaps(IntPtr hdc, int index);
+  [DllImport("gdi32.dll")] public static extern IntPtr CreateSolidBrush(uint color);
+  [DllImport("user32.dll")] public static extern int FillRect(IntPtr hdc, ref RECT rect, IntPtr brush);
   [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
   [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="GetClassNameW")] public static extern int GetClassNameW(IntPtr hWnd, StringBuilder className, int maxCount);
@@ -704,6 +968,64 @@ public static class NewmarkCuNative
     }
     finally { LeavePhysicalDpiContext(previous); }
   }
+
+  /**
+   * Copy the whole desktop out of a SCREEN device context with BitBlt, and answer the HBITMAP.
+   *
+   * The screen DC from GetDC(IntPtr.Zero) is the entire VIRTUAL screen - every monitor, in
+   * physical pixels - and its (0, 0) IS the virtual screen's top-left corner, which is why
+   * the source rectangle is (0, 0) even when VirtualScreenValues() reports a negative
+   * left/top. Subtracting or adding that origin here would shift the copy off the desktop.
+   *
+   * This deliberately does not use PrintWindow on the desktop window: measured on many
+   * configurations that returns a black or empty bitmap, which would look like a successful
+   * capture to anything that only checked the file exists. A screen-DC BitBlt copies what is
+   * really on the display.
+   *
+   * The answer is an HBITMAP as an integer, not a System.Drawing.Bitmap: this type definition
+   * is compiled by Add-Type, which does not hand the compiler a reference to
+   * System.Drawing.Common, so naming that type here fails to compile with CS1069. The HBITMAP
+   * is the same object either way - the caller wraps it with Bitmap.FromHbitmap - and the
+   * caller is also the side that must delete it.
+   *
+   * Answers an empty array when any step fails, so a refused copy is reported rather than
+   * returned as a partial or black screen.
+   */
+  public static long[] ScreenCaptureValues()
+  {
+    int[] screen = VirtualScreenValues();
+    int width = screen[2];
+    int height = screen[3];
+    if (width <= 0 || height <= 0) return new long[0];
+    IntPtr screenDc = IntPtr.Zero;
+    IntPtr memoryDc = IntPtr.Zero;
+    IntPtr bitmap = IntPtr.Zero;
+    IntPtr previous = IntPtr.Zero;
+    bool copied = false;
+    try
+    {
+      screenDc = GetDC(IntPtr.Zero);
+      if (screenDc != IntPtr.Zero) memoryDc = CreateCompatibleDC(screenDc);
+      if (memoryDc != IntPtr.Zero) bitmap = CreateCompatibleBitmap(screenDc, width, height);
+      if (bitmap != IntPtr.Zero) previous = SelectObject(memoryDc, bitmap);
+      if (previous != IntPtr.Zero) copied = BitBlt(memoryDc, 0, 0, width, height, screenDc, 0, 0, SRCCOPY);
+      if (!copied) return new long[0];
+      return new long[] { bitmap.ToInt64(), width, height };
+    }
+    finally
+    {
+      if (previous != IntPtr.Zero && memoryDc != IntPtr.Zero) SelectObject(memoryDc, previous);
+      /* The HBITMAP survives a successful call and belongs to the caller from here on; on
+         every other path it is deleted here rather than leaked. */
+      if (!copied && bitmap != IntPtr.Zero) DeleteObject(bitmap);
+      if (memoryDc != IntPtr.Zero) DeleteDC(memoryDc);
+      if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc);
+    }
+  }
+
+  /** The virtual-key codes of the two Windows keys. */
+  public static uint LeftWindowsKey() { return 0x5B; }
+  public static uint RightWindowsKey() { return 0x5C; }
 
   public static int[] CursorPosition()
   {
@@ -1006,8 +1328,6 @@ public static class NewmarkCuNative
     if (keyUp) value |= (uint)(1u << 30) | (uint)(1u << 31);
     return unchecked((int)value);
   }
-
-  [DllImport("user32.dll")] static extern uint MapVirtualKeyW(uint code, uint mapType);
 
   public static bool PostWindowMessage(IntPtr hWnd, uint msg, uint wParam, int lParam)
   {
@@ -1668,6 +1988,18 @@ export function laneDiagnostics() {
 
 const CAPTURE_DIRECTORY_NAME = 'newmark2dsh-computer-use';
 
+/**
+ * The two capture primitives, named in every capture answer.
+ *
+ * They are constants rather than literals because they are what tells a reader which
+ * rectangle a picture covers: `PrintWindow(hwnd,hdc,2)` is one window, and
+ * `BitBlt(screen-dc,virtual-screen)` is the whole desktop. A capture that named the wrong
+ * one - or named nothing at all - is how a screen capture came back looking like a window
+ * capture with no way to tell.
+ */
+const WINDOW_CAPTURE_METHOD = 'PrintWindow(hwnd,hdc,2)';
+const SCREEN_CAPTURE_METHOD = 'BitBlt(screen-dc,virtual-screen)';
+
 function captureDirectory() {
   const directory = path.join(os.tmpdir(), CAPTURE_DIRECTORY_NAME);
   fs.mkdirSync(directory, { recursive: true });
@@ -1723,8 +2055,37 @@ function digestSampleLines(bitmapExpression) {
   ];
 }
 
+/**
+ * Present one captured bitmap as the answer: scale it down, write the PNG, and report what
+ * was written. Shared by the window capture and the screen capture, so both lanes write the
+ * same artifact with the same fields and only the source of `$source` differs.
+ */
+function captureSaveLines(outPath, maxWidth, maxHeight) {
+  return [
+    `$maxWidth = ${maxWidth}; $maxHeight = ${maxHeight}`,
+    '$scale = [Math]::Min(1.0, [Math]::Min(($maxWidth / [double]$sourceWidth), ($maxHeight / [double]$sourceHeight)))',
+    '$imageWidth = [Math]::Max(1, [int][Math]::Round($sourceWidth * $scale))',
+    '$imageHeight = [Math]::Max(1, [int][Math]::Round($sourceHeight * $scale))',
+    '$target = New-Object System.Drawing.Bitmap $imageWidth, $imageHeight',
+    '$targetGraphics = [System.Drawing.Graphics]::FromImage($target)',
+    '$targetGraphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear',
+    '$targetGraphics.DrawImage($source, 0, 0, $imageWidth, $imageHeight)',
+    '$targetGraphics.Dispose()',
+    `${psQuote(outPath)} | ForEach-Object { if ([System.IO.File]::Exists($_)) { [System.IO.File]::Delete($_) } }`,
+    `$target.Save(${psQuote(outPath)}, [System.Drawing.Imaging.ImageFormat]::Png)`,
+    '$target.Dispose()',
+    `$imageBytes = (Get-Item -LiteralPath ${psQuote(outPath)}).Length`,
+    `$lumaValues = @($lumaText -split "," | ForEach-Object { [int]$_ })`,
+  ];
+}
+
+/** The three facts every capture answer carries, as JSON fields: what, how, how big. */
+function captureReportFields(outPath, method, csv) {
+  return `ok=$true; image_path=${psQuote(outPath)}; width=$sourceWidth; height=$sourceHeight; image_width=$imageWidth; image_height=$imageHeight; image_bytes=$imageBytes; image_mime="image/png"; capture_method=${psQuote(method)}; digest_width=${SPARSE_DIGEST_WIDTH}; digest_height=${SPARSE_DIGEST_HEIGHT}; distinct_luma=$distinct; luma_min=($lumaValues | Measure-Object -Minimum).Minimum; luma_max=($lumaValues | Measure-Object -Maximum).Maximum;${csv ? ` ${csv}` : ''} luma=$lumaText`;
+}
+
 /** Full capture of one window: PrintWindow(hwnd, hdc, 2) in the window_capture lane only. */
-function fullCaptureScript(handle, processId, outPath, maxWidth, maxHeight) {
+function fullCaptureScript(handle, processId, outPath, bounds) {
   return [
     '$ErrorActionPreference = "Stop"',
     ...windowBitmapLines(handle, processId),
@@ -1737,21 +2098,40 @@ function fullCaptureScript(handle, processId, outPath, maxWidth, maxHeight) {
     '} finally { [NewmarkCuNative]::LeavePhysicalDpiContext($previousDpi) }',
     `if (-not $captured) { ${psError('capture_failed', 'PrintWindow could not render this application window.')} }`,
     ...digestSampleLines('$source'),
-    `$maxWidth = ${maxWidth}; $maxHeight = ${maxHeight}`,
-    '$scale = [Math]::Min(1.0, [Math]::Min(($maxWidth / [double]$sourceWidth), ($maxHeight / [double]$sourceHeight)))',
-    '$imageWidth = [Math]::Max(1, [int][Math]::Round($sourceWidth * $scale))',
-    '$imageHeight = [Math]::Max(1, [int][Math]::Round($sourceHeight * $scale))',
-    '$target = New-Object System.Drawing.Bitmap $imageWidth, $imageHeight',
-    '$targetGraphics = [System.Drawing.Graphics]::FromImage($target)',
-    '$targetGraphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear',
-    '$targetGraphics.DrawImage($source, 0, 0, $imageWidth, $imageHeight)',
-    '$targetGraphics.Dispose()',
-    `${psQuote(outPath)} | ForEach-Object { if ([System.IO.File]::Exists($_)) { [System.IO.File]::Delete($_) } }`,
-    `$target.Save(${psQuote(outPath)}, [System.Drawing.Imaging.ImageFormat]::Png)`,
-    '$target.Dispose(); $sourceGraphics.Dispose(); $source.Dispose()',
-    `$imageBytes = (Get-Item -LiteralPath ${psQuote(outPath)}).Length`,
-    `$lumaValues = @($lumaText -split "," | ForEach-Object { [int]$_ })`,
-    `Write-Output (@{ ok=$true; image_path=${psQuote(outPath)}; width=$sourceWidth; height=$sourceHeight; image_width=$imageWidth; image_height=$imageHeight; image_bytes=$imageBytes; image_mime="image/png"; capture_method="PrintWindow(hwnd,hdc,2)"; digest_width=${SPARSE_DIGEST_WIDTH}; digest_height=${SPARSE_DIGEST_HEIGHT}; distinct_luma=$distinct; luma_min=($lumaValues | Measure-Object -Minimum).Minimum; luma_max=($lumaValues | Measure-Object -Maximum).Maximum; luma=$lumaText } | ConvertTo-Json -Compress)`,
+    ...captureSaveLines(outPath, bounds.maxWidth, bounds.maxHeight),
+    '$sourceGraphics.Dispose(); $source.Dispose()',
+    `Write-Output (@{ ${captureReportFields(outPath, WINDOW_CAPTURE_METHOD, '')} } | ConvertTo-Json -Compress)`,
+  ].join('\r\n');
+}
+
+/**
+ * Full capture of the whole desktop: one screen-DC copy of the entire virtual screen.
+ *
+ * The copy is made by the native helper, which is also where the reason it is BitBlt and not
+ * PrintWindow on the desktop window is written down. What this script owns is the geometry:
+ * the rectangle copied is the virtual screen's, and the virtual screen's own bounds travel
+ * back in the answer so a reader can check the picture against the screen it claims to show.
+ */
+function screenCaptureScript(outPath, bounds) {
+  return [
+    '$ErrorActionPreference = "Stop"',
+    '$virtual = [NewmarkCuNative]::VirtualScreenValues()',
+    '$screenLeft = $virtual[0]; $screenTop = $virtual[1]; $screenWidth = $virtual[2]; $screenHeight = $virtual[3]',
+    `if ($screenWidth -le 0 -or $screenHeight -le 0) { ${psError('screen_rect_unavailable', 'The desktop did not report a virtual screen rectangle.')} }`,
+    '$previousDpi = [NewmarkCuNative]::EnterPhysicalDpiContext()',
+    'try { $capture = [NewmarkCuNative]::ScreenCaptureValues() } finally { [NewmarkCuNative]::LeavePhysicalDpiContext($previousDpi) }',
+    `if ($capture.Count -lt 3) { ${psError('capture_failed', 'The screen device context could not be copied into a bitmap.')} }`,
+    '$source = [System.Drawing.Bitmap]::FromHbitmap([IntPtr]::new([int64]$capture[0]))',
+    '$sourceWidth = $source.Width; $sourceHeight = $source.Height',
+    `if ($sourceWidth -ne $screenWidth -or $sourceHeight -ne $screenHeight) { ${psError('capture_scope_mismatch', 'The copied bitmap is not the size of the virtual screen, so it is not a whole-desktop capture.')} }`,
+    ...digestSampleLines('$source'),
+    'try {',
+    ...captureSaveLines(outPath, bounds.maxWidth, bounds.maxHeight).map(line => `  ${line}`),
+    '} finally {',
+    '  $source.Dispose()',
+    '  [void][NewmarkCuNative]::DeleteObject([IntPtr]::new([int64]$capture[0]))',
+    '}',
+    `Write-Output (@{ ${captureReportFields(outPath, SCREEN_CAPTURE_METHOD, 'target_scope="screen"; screen_left=$screenLeft; screen_top=$screenTop; screen_width=$screenWidth; screen_height=$screenHeight;')} } | ConvertTo-Json -Compress)`,
   ].join('\r\n');
 }
 
@@ -1801,50 +2181,133 @@ function digestOf(luma) {
 export async function captureWindow(options = {}) {
   const handle = handleHex(options.handle || options.windowHandle);
   const processId = Number(options.processId || options.process_id || 0);
-  if (!handle) return failure('observe', 'window_handle_required', 'A non-zero native window handle is required for capture.');
-  if (!IS_WINDOWS) return failure('observe', 'unsupported_platform', 'Computer Use Win32 capture is Windows-only.');
-  const maxWidth = clampNumber(options.maxWidth ?? options.captureMaxWidth, 320, 2048, 1280);
-  const maxHeight = clampNumber(options.maxHeight ?? options.captureMaxHeight, 240, 2048, 960);
+  if (!handle) return failure('observe', 'window_handle_required', 'A non-zero native window handle is required for capture.', { action: 'observe' });
+  if (!IS_WINDOWS) return failure('observe', 'unsupported_platform', 'Computer Use Win32 capture is Windows-only.', { action: 'observe' });
   const ownerId = String(options.ownerId || 'direct');
   const lane = 'window_capture';
   const outPath = options.imagePath || capturePath(ownerId, 'observe');
   const prepared = await prepareLane(lane, clampNumber(options.initTimeoutMs, 1000, 120000, DEFAULT_INIT_TIMEOUT_MS));
   if (!prepared.ready) {
     const worker = laneWorkerOrNull(lane);
-    return failure('observe', 'lane_unavailable', `The window_capture lane did not become ready.${worker && worker.initError ? ` ${worker.initError}` : ''}`, { lane });
+    return failure('observe', 'lane_unavailable', `The window_capture lane did not become ready.${worker && worker.initError ? ` ${worker.initError}` : ''}`, { lane, action: 'observe' });
   }
   const startedAt = Date.now();
-  const result = await runInLane(lane, fullCaptureScript(handle, processId, outPath, maxWidth, maxHeight), clampNumber(options.timeoutMs, 1000, 300000, 30000));
+  const result = await runInLane(lane, fullCaptureScript(handle, processId, outPath, captureBounds(options)), clampNumber(options.timeoutMs, 1000, 300000, 30000));
   if (!result.ok) {
     const parsed = parsePsError(result.output);
     try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch { /* ignore */ }
-    return failure('observe', parsed.code, parsed.message, { lane, window_handle: unwrapHandle(handle), telemetry: { capture_ms: Date.now() - startedAt, lane } });
+    return failure('observe', parsed.code, parsed.message, { lane, action: 'observe', window_handle: unwrapHandle(handle), telemetry: { capture_ms: Date.now() - startedAt, lane } });
   }
+  return captureResultFrom(result, {
+    lane,
+    action: 'observe',
+    fallbackPath: outPath,
+    fallbackMethod: 'PrintWindow(hwnd,hdc,2)',
+    targetScope: unwrapHandle(handle),
+    expectedWidth: 0,
+    expectedHeight: 0,
+    startedAt,
+  });
+}
+
+/**
+ * observation of the whole desktop: one BitBlt of the virtual screen in the **same**
+ * window_capture lane the window capture uses. There is no second lane and no second
+ * persistent child: what differs from `captureWindow` is the script, exactly as the sparse
+ * digest differs from the full capture.
+ *
+ * The reported `width`/`height` are the virtual screen's - the union of every monitor -
+ * and never the foreground window's and never the primary monitor's, which is what makes
+ * the answer readable as a screen capture rather than a window capture.
+ */
+export async function captureScreen(options = {}) {
+  if (!IS_WINDOWS) return failure('capture_screen', 'unsupported_platform', 'Computer Use Win32 capture is Windows-only.', { action: 'capture_screen' });
+  const ownerId = String(options.ownerId || 'direct');
+  const lane = 'window_capture';
+  const outPath = options.imagePath || capturePath(ownerId, 'screen');
+  const prepared = await prepareLane(lane, clampNumber(options.initTimeoutMs, 1000, 120000, DEFAULT_INIT_TIMEOUT_MS));
+  if (!prepared.ready) {
+    const worker = laneWorkerOrNull(lane);
+    return failure('capture_screen', 'lane_unavailable', `The window_capture lane did not become ready.${worker && worker.initError ? ` ${worker.initError}` : ''}`, { lane, action: 'capture_screen' });
+  }
+  const startedAt = Date.now();
+  const result = await runInLane(lane, screenCaptureScript(outPath, captureBounds(options)), clampNumber(options.timeoutMs, 1000, 300000, 30000));
+  if (!result.ok) {
+    const parsed = parsePsError(result.output);
+    try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch { /* ignore */ }
+    return failure('capture_screen', parsed.code, parsed.message, { lane, action: 'capture_screen', telemetry: { capture_ms: Date.now() - startedAt, lane } });
+  }
+  return captureResultFrom(result, {
+    lane,
+    action: 'capture_screen',
+    fallbackPath: outPath,
+    fallbackMethod: 'BitBlt(screen-dc,virtual-screen)',
+    targetScope: 'screen',
+    /* The lane reports the virtual screen it really copied; these are only what the answer
+     * is checked against when it does not. */
+    expectedWidth: Number(options.virtualScreenWidth) || 0,
+    expectedHeight: Number(options.virtualScreenHeight) || 0,
+    startedAt,
+  });
+}
+
+/** The capture size bounds every full capture shares, in physical pixels. */
+function captureBounds(options) {
+  return {
+    maxWidth: clampNumber(options.maxWidth ?? options.captureMaxWidth, 320, 2048, 1280),
+    maxHeight: clampNumber(options.maxHeight ?? options.captureMaxHeight, 240, 2048, 960),
+  };
+}
+
+/**
+ * The one path from a lane's capture JSON to the capture answer, shared by the window
+ * capture and the screen capture.
+ *
+ * Every field a reader needs to tell the two apart is composed here: `target_scope` is
+ * `screen` for the whole desktop and the window handle for one window, `capture_method`
+ * names the primitive that really ran, and a screen capture additionally carries the
+ * virtual screen bounds it covered. A monochrome or zero-size capture is a hard error on
+ * this path too, so a black frame can never be returned as a picture.
+ */
+function captureResultFrom(result, { lane, action, fallbackPath, fallbackMethod, targetScope, expectedWidth, expectedHeight, startedAt }) {
   const parsed = parseJsonObject(result.output);
   if (!parsed || parsed.ok !== true) {
-    return failure('observe', 'capture_result_invalid', 'The window_capture lane returned an unreadable capture result.', { lane });
+    return failure(action, 'capture_result_invalid', 'The window_capture lane returned an unreadable capture result.', { lane, action });
   }
   const width = Number(parsed.width) || 0;
   const height = Number(parsed.height) || 0;
   const distinct = Number(parsed.distinct_luma) || 0;
   if (width <= 0 || height <= 0) {
-    return failure('observe', 'capture_zero_size', 'The capture reported a zero-size presentation, so it is not a usable observation.', { lane });
+    return failure(action, 'capture_zero_size', 'The capture reported a zero-size presentation, so it is not a usable observation.', { lane, action });
+  }
+  if (expectedWidth > 0 && expectedHeight > 0 && (width !== expectedWidth || height !== expectedHeight)) {
+    return failure(action, 'capture_scope_mismatch', `The capture reported ${width}x${height}, but the ${String(targetScope)} scope is ${expectedWidth}x${expectedHeight}, so the picture does not cover what its scope claims.`, {
+      lane,
+      action,
+      target_scope: targetScope,
+      captured_width: width,
+      captured_height: height,
+      expected_width: expectedWidth,
+      expected_height: expectedHeight,
+    });
   }
   if (distinct <= 1) {
-    return failure('observe', 'capture_monochrome', 'The capture was a single flat colour, so it is not a real desktop presentation.', { lane });
+    return failure(action, 'capture_monochrome', 'The capture was a single flat colour, so it is not a real desktop presentation.', { lane, action, target_scope: targetScope });
   }
-  return {
+  const method = String(parsed.capture_method || fallbackMethod);
+  const answer = {
     ok: true,
-    action: 'observe',
+    action,
     lane,
-    image_path: String(parsed.image_path || outPath),
+    target_scope: targetScope,
+    capture_method: method,
+    image_path: String(parsed.image_path || fallbackPath),
     width,
     height,
     image_width: Number(parsed.image_width) || width,
     image_height: Number(parsed.image_height) || height,
     image_bytes: Number(parsed.image_bytes) || 0,
     image_mime: 'image/png',
-    capture_method: String(parsed.capture_method || 'PrintWindow(hwnd,hdc,2)'),
     digest: {
       width: SPARSE_DIGEST_WIDTH,
       height: SPARSE_DIGEST_HEIGHT,
@@ -1855,6 +2318,22 @@ export async function captureWindow(options = {}) {
     },
     telemetry: { capture_ms: Date.now() - startedAt, lane, lane_elapsed_ms: result.elapsedMs },
   };
+  if (method === SCREEN_CAPTURE_METHOD) {
+    /* Self-describing, exactly as asked for: a reader can tell a screen capture from a
+     * window capture in the payload itself, without knowing which branch produced it. */
+    answer.capture_scope = 'virtual-screen';
+    answer.screen = {
+      left: Number(parsed.screen_left) || 0,
+      top: Number(parsed.screen_top) || 0,
+      width: Number(parsed.screen_width) || width,
+      height: Number(parsed.screen_height) || height,
+      monitors: 'every monitor, unioned: the virtual screen',
+    };
+  } else {
+    answer.capture_scope = 'window';
+    answer.window_handle = targetScope;
+  }
+  return answer;
 }
 
 /**
@@ -2523,6 +3002,9 @@ function realTypeScript(text, expect = {}) {
 }
 
 function realKeyScript(key, expect = {}) {
+  const chord = resolveKeyChord(key);
+  if (chord.error) return { error: chord.error };
+  if (chord.windowsKey) return windowsKeyScript(key, chord, expect);
   const notation = normalizeSendKeysKey(key);
   if (!notation) return { error: `Unsupported key or key chord: ${key}` };
   return {
@@ -2533,7 +3015,98 @@ function realKeyScript(key, expect = {}) {
       // to land on the window that carries it into the document, or it dies on the frame.
       ...focusEnsureLines(),
       `[System.Windows.Forms.SendKeys]::SendWait(${psQuote(notation)})`,
-      `Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; key=${psQuote(key)}; send_keys=${psQuote(notation)}; ${focusResultFields()} foreground_verified=([NewmarkCuNative]::GetForegroundWindow() -ne [IntPtr]::Zero) } | ConvertTo-Json -Compress)`,
+      `Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; key_delivery="send-keys"; key=${psQuote(key)}; send_keys=${psQuote(notation)}; ${focusResultFields()} foreground_verified=([NewmarkCuNative]::GetForegroundWindow() -ne [IntPtr]::Zero) } | ConvertTo-Json -Compress)`,
+    ].join('\r\n'),
+  };
+}
+
+/**
+ * A chord that names a Windows key, delivered as real virtual-key events.
+ *
+ * SendKeys is not used here and cannot be: it knows `^`, `+` and `%` and nothing else, so a
+ * Windows chord never reached the desktop at all - `key: "win+r"` came back `ok: true` while
+ * the Run dialog never opened. The keys are built from virtual-key codes instead, and the
+ * delivery is the same call the unicode typing path already uses.
+ *
+ * The lone Windows key needs one more thing. Windows does not act on a Windows keydown until
+ * it sees whether a chord follows: an unaccompanied down/up pair opens nothing, so the same
+ * request reports success and does nothing. The key is therefore held, a dummy key is pressed
+ * and released inside the hold, and only then is the Windows key released - which is the
+ * documented delivery for "press the Windows key". The receipt names the dummy key, so the
+ * difference between the two deliveries is visible rather than inferred.
+ */
+function windowsKeyScript(key, chord, expect = {}) {
+  const keys = chord.virtualKeys.map(code => `[uint16]${code}`).join(',');
+  const names = chord.names.join('+');
+  const windowsKeyCodes = chord.windowsKeys.length ? chord.windowsKeys.join(',') : '0';
+  const held = chord.lonelyWindowsKey;
+  const eventCount = chord.virtualKeys.length * 2 + (held ? 2 : 0);
+  const receipt = [
+    `settle_ms=${FOCUS_SETTLE_MS};`,
+    'foreground_before=("0x{0:X}" -f $before.ToInt64());',
+    'foreground_before_class=[NewmarkCuNative]::ClassName($before);',
+    'foreground_after=("0x{0:X}" -f $after.ToInt64());',
+    'foreground_after_class=[NewmarkCuNative]::ClassName($after);',
+    'foreground_changed_by_key=$changed;',
+    'background_changed_by_key=$backgroundChanged;',
+    /**
+     * WHAT THE KEY DELIVERED, and what could be measured about its effect.
+     *
+     * For a LONE Windows key the effect is measurable in the crudest possible way: if nothing
+     * took the foreground and no window appeared, then whatever the key was supposed to open
+     * did not open. That is reported as "not-observed" instead of being passed off as success.
+     *
+     * This is not a hedge. Measured on this machine, four deliveries that all provably held
+     * VK_LWIN in the keyboard's own state - a dummy stroke, a control stroke, the older
+     * keybd_event path, and the right-hand Windows key - changed nothing on screen: the
+     * foreground window stayed put, no window appeared, and about 1 pixel block in 60,000 of
+     * the region the Start menu covers differed. The keys were delivered; the shell did not act
+     * on them. A chord is a different request and its effect is not measured here, because
+     * whether the Run dialog opened is not a window this backend may open on a caller's desktop
+     * without the caller asking - "win+r" is delivered and says so.
+     */
+    `windows_key_effect=${held ? '$(if ($changed -or $backgroundChanged) { "foreground-or-window-changed" } else { "not-observed" })' : '"not-measured"'};`,
+    `key_delivery=${held ? '"virtual-keys-held-across-a-stroke"' : '"virtual-keys"'};`,
+    `key=${psQuote(key)};`,
+    `resolved_virtual_keys=@(${chord.virtualKeys.join(',')});`,
+    `resolved_key_names=${psQuote(names)};`,
+    'windows_key=$true;',
+    `windows_key_codes=@(${windowsKeyCodes});`,
+    `dummy_key=${held ? `0x${VK_DUMMY.toString(16).toUpperCase()}` : 'none'};`,
+    `stroke_events=${eventCount};`,
+  ].join(' ');
+  /**
+   * ONE delivery, never two. A lone Windows key is delivered by the held call - the Windows
+   * key down, the dummy down, the dummy up, the Windows key up - and the plain call is not
+   * made at all: doing both would press and release the Windows key twice, and the first
+   * delivery would already have opened the Start menu.
+   */
+  const deliveryLines = held
+    ? [
+      `$sent = [NewmarkCuNative]::SendVirtualKeysHeld([uint16[]]@(${windowsKeyCodes}), [uint16[]]@(${VK_DUMMY}))`,
+      `if ($sent -ne ${eventCount}) { ${psError('windows_key_delivery_failed', `The system accepted only $sent of ${eventCount} key events for the held Windows key, so it was not delivered as given.`)} }`,
+    ]
+    : [
+      `$sent = [NewmarkCuNative]::SendVirtualKeys([uint16[]]@(${keys}))`,
+      `if ($sent -ne ${eventCount}) { ${psError('virtual_key_delivery_failed', `The system accepted only $sent of ${eventCount} key events, so the chord was not delivered as given.`)} }`,
+    ];
+  return {
+    script: [
+      '$ErrorActionPreference = "Stop"',
+      ...foregroundGuardLines(expect),
+      ...focusEnsureLines(),
+      '$backgroundBefore = [NewmarkCuNative]::GetForegroundWindow()',
+      /* The focus step can change who holds the foreground, and the point of the two reads
+         below is what THIS key changed. So the baseline is taken after the focus step has
+         settled, never before it. */
+      `Start-Sleep -Milliseconds ${FOCUS_SETTLE_MS}`,
+      '$before = [NewmarkCuNative]::GetForegroundWindow()',
+      ...deliveryLines,
+      `Start-Sleep -Milliseconds ${FOCUS_SETTLE_MS}`,
+      '$after = [NewmarkCuNative]::GetForegroundWindow()',
+      '$changed = $after -ne $before',
+      '$backgroundChanged = $after -ne $backgroundBefore',
+      `Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; ${receipt} ${focusResultFields()} foreground_verified=([NewmarkCuNative]::GetForegroundWindow() -ne [IntPtr]::Zero) } | ConvertTo-Json -Compress)`,
     ].join('\r\n'),
   };
 }
@@ -2808,43 +3381,35 @@ function virtualTypeScript(application, text, targetHandle) {
   ].join('\r\n');
 }
 
-function virtualKeyCodes(key) {
-  const aliases = {
-    enter: 0x0d, return: 0x0d, tab: 0x09, esc: 0x1b, escape: 0x1b, backspace: 0x08, bksp: 0x08,
-    delete: 0x2e, del: 0x2e, insert: 0x2d, ins: 0x2d, space: 0x20, up: 0x26, arrowup: 0x26,
-    down: 0x28, arrowdown: 0x28, left: 0x25, arrowleft: 0x25, right: 0x27, arrowright: 0x27,
-    home: 0x24, end: 0x23, pageup: 0x21, pgup: 0x21, pagedown: 0x22, pgdn: 0x22,
-  };
-  let parts = String(key || '').trim().split('+').map(part => part.trim()).filter(Boolean);
-  if (parts.length === 1) {
-    const notation = /^([+^%]*)(?:\{([^{}]+)\}|(.))$/.exec(parts[0]);
-    if (notation && (notation[1] || notation[2])) {
-      const modifiers = notation[1].split('').map(modifier => (modifier === '^' ? 'ctrl' : modifier === '%' ? 'alt' : 'shift'));
-      parts = [...modifiers, notation[2] || notation[3]];
-    }
-  }
-  if (!parts.length) return undefined;
-  const modifiers = [];
-  for (const part of parts.slice(0, -1)) {
-    const modifier = part.toLowerCase();
-    const code = modifier === 'ctrl' || modifier === 'control' ? 0x11 : modifier === 'alt' ? 0x12 : modifier === 'shift' ? 0x10 : 0;
-    if (!code) return undefined;
-    if (!modifiers.includes(code)) modifiers.push(code);
-  }
-  const final = parts[parts.length - 1];
-  const lower = final.toLowerCase();
-  let keyCode = aliases[lower];
-  if (!keyCode && /^f(?:[1-9]|1[0-6])$/i.test(final)) keyCode = 0x70 + Number(final.slice(1)) - 1;
-  if (!keyCode && /^[a-z0-9]$/i.test(final)) keyCode = final.toUpperCase().charCodeAt(0);
+/**
+ * The virtual-mode key chord, in the shape `virtualKeyScript` posts.
+ *
+ * The key names come from the one resolver, so `win` is a key here exactly as it is in real
+ * mode and there is no second table to drift. A chord naming a Windows key is refused rather
+ * than posted: Windows keys are system-scoped, and a posted WM_KEYDOWN with VK_LWIN does not
+ * open the Start menu - it only tells one window that the key was pressed, which is not the
+ * same event and must not be reported as one.
+ */
+function windowsKeyChord(key) {
+  const chord = resolveKeyChord(key);
+  if (chord.error) return undefined;
+  if (chord.windowsKey) return { chord };
+  const keyCode = chord.virtualKeys[chord.virtualKeys.length - 1];
   if (!keyCode || keyCode > 0xffff) return undefined;
-  const shiftCase = /^[A-Z]$/.test(final) && !modifiers.includes(0x10);
-  if (shiftCase) modifiers.push(0x10);
-  return { modifiers, keyCode, shiftCase };
+  /* Modifier order is the order the caller wrote, and the final key is last; `shiftCase`
+   * reports the shift the resolver added for an upper-case final key. */
+  return { modifiers: chord.virtualKeys.slice(0, -1), keyCode, shiftCase: chord.shiftCase };
 }
 
 function virtualKeyScript(application, key, targetHandle) {
-  const parsed = virtualKeyCodes(key);
+  const parsed = windowsKeyChord(key);
   if (!parsed) return { error: `Virtual app_key accepts one key or a ctrl/alt/shift chord such as ctrl+l, enter, or F5: ${key}` };
+  if (parsed.chord && parsed.chord.windowsKey) {
+    return {
+      error: `Virtual app_key cannot deliver the Windows key: ${key} names ${parsed.chord.names.join('+')}, and a Windows key is system-scoped. A posted window message reaches one window and does not open the Start menu or the Run dialog, so it is refused rather than reported as delivered. Use the real mouse mode for this chord.`,
+      code: 'windows_key_requires_real_delivery',
+    };
+  }
   const keyDowns = [...parsed.modifiers, parsed.keyCode];
   const keyUps = [...keyDowns].reverse();
   const lines = [
@@ -2859,6 +3424,7 @@ function virtualKeyScript(application, key, targetHandle) {
   for (const code of keyUps) lines.push(`if (-not [NewmarkCuNative]::PostWindowMessage($target, 0x0101, ${code}, [NewmarkCuNative]::KeyMessageLParam(${code}, $true))) { ${psError('virtual_message_rejected', 'WM_KEYUP could not be queued for the target window.')} }`);
   lines.push(...virtualReceiptLines('app_key', application, {
     key: psQuote(key),
+    key_delivery: '"posted-window-messages"',
     key_code: parsed.keyCode,
     modifiers: `@(${parsed.modifiers.join(',')})`,
     target_control: '("0x{0:X}" -f $target.ToInt64())',
@@ -2958,7 +3524,9 @@ async function virtualKey(options) {
   const application = options.application;
   const key = String(options.key || '').trim();
   const built = virtualKeyScript(application, key, (virtualPointerFor(options.ownerId) || {}).targetHandle || application.handle);
-  if (built.error) return failure(options.action, 'virtual_key_unsupported', built.error, { mouse_mode: 'virtual', app: application });
+  /* The refusal carries the code its own reason names: a Windows chord in virtual mode is
+   * refused because posted messages cannot deliver it, not because the key is unknown. */
+  if (built.error) return failure(options.action, built.code || 'virtual_key_unsupported', built.error, { mouse_mode: 'virtual', app: application });
   const result = await runActionScript(built.script, { action: 'app_key', ...options });
   return { ...result, mouse_mode: 'virtual', app: application, physical_delivery_used: false };
 }
@@ -3284,7 +3852,7 @@ async function dispatchComputerUse(action, options) {
 
   if (!IS_WINDOWS) return unsupportedPlatform(action);
 
-  if (!ALL_ACTIONS.includes(action)) {
+  if (!ALL_ACTIONS.includes(action) && !INTERNAL_ACTIONS.includes(action)) {
     return failure(action, 'unknown_action', `Unknown computer_use action: ${action}.`, { supported_actions: [...ALL_ACTIONS] });
   }
 
@@ -3298,6 +3866,7 @@ async function dispatchComputerUse(action, options) {
   };
 
   if (action === 'observe') return await observeAction(action, options, mode, header);
+  if (action === 'capture_screen') return await captureScreenAction(action, options, mode, header);
   if (action === 'app_list') return await appListAction(action, options, mode, header);
   if (action === 'app_observe') return await appObserveAction(action, options, mode, header);
   if (action === 'app_activate') return await appActivateAction(action, options, mode, header);
@@ -3335,6 +3904,78 @@ async function observeAction(action, options, mode, header) {
     return failure(action, resolved.error_code || 'window_unavailable', resolved.error || 'No window is available to observe.', { ...header, applications: (resolved.applications || []).slice(0, 20) });
   }
   return await fullObservation(action, options, mode, header, resolved.application);
+}
+
+/**
+ * The whole-desktop observation, for `screen_capture` with `target: "desktop"`.
+ *
+ * It resolves no window at all. That is the whole point: the defect it replaces answered a
+ * request for the screen with the foreground window, so a caller asking "what is on the
+ * screen" got a picture of one window and no field saying so. Nothing here reads the
+ * foreground window, and nothing is captured from a window handle.
+ */
+async function captureScreenAction(action, options, mode, header) {
+  if (mode.mode === 'virtual') {
+    return virtualRefusal(action, options, 'Virtual mode refuses the whole-desktop capture: a screen capture is not a window-scoped read, so there is no target to scope it to. Use the real mouse mode, or app_observe with app_target or window_handle.');
+  }
+  return await fullScreenObservation(action, options, header);
+}
+
+/** One screen capture, reported with the virtual screen bounds it really covered. */
+async function fullScreenObservation(action, options, header) {
+  const capture = await captureScreen({
+    ownerId: options.ownerId,
+    imagePath: options.imagePath || options.image_path,
+    maxWidth: options.captureMaxWidth ?? options.max_width,
+    maxHeight: options.captureMaxHeight ?? options.max_height,
+    timeoutMs: options.captureTimeoutMs,
+    virtualScreenWidth: options.virtualScreenWidth,
+    virtualScreenHeight: options.virtualScreenHeight,
+  });
+  if (capture.ok !== true) {
+    return { ...header, ...capture, action };
+  }
+  return {
+    ...header,
+    ok: true,
+    action,
+    observation: 'full',
+    observation_scope: 'screen',
+    must_reacquire_full_observation: false,
+    target_scope: capture.target_scope,
+    capture_scope: capture.capture_scope,
+    screen: capture.screen,
+    image_path: capture.image_path,
+    image_mime: capture.image_mime,
+    width: capture.width,
+    height: capture.height,
+    image_width: capture.image_width,
+    image_height: capture.image_height,
+    image_bytes: capture.image_bytes,
+    capture: {
+      image_path: capture.image_path,
+      image_mime: capture.image_mime,
+      width: capture.width,
+      height: capture.height,
+      image_bytes: capture.image_bytes,
+      capture_method: capture.capture_method,
+      target_scope: capture.target_scope,
+      lane: capture.lane,
+      digest: capture.digest,
+    },
+    /* A screen capture has no controls and no window, and it says so instead of leaving a
+     * caller to infer it from an absent field. */
+    controls: [],
+    control_count: 0,
+    uia_visited: 0,
+    telemetry: {
+      lane: capture.lane,
+      capture_ms: capture.telemetry ? capture.telemetry.capture_ms : undefined,
+      uia_ms: 0,
+      uia_lane: null,
+      uia_error: null,
+    },
+  };
 }
 
 async function appObserveAction(action, options, mode, header) {
@@ -3387,6 +4028,7 @@ async function fullObservation(action, options, mode, header, application) {
     ok: true,
     action,
     observation: 'full',
+    observation_scope: 'window',
     must_reacquire_full_observation: false,
     app: application,
     window: application,
@@ -3404,13 +4046,17 @@ async function fullObservation(action, options, mode, header, application) {
       height: capture.height,
       image_bytes: capture.image_bytes,
       capture_method: capture.capture_method,
+      target_scope: capture.target_scope,
       lane: capture.lane,
       digest: capture.digest,
     },
     controls: bounded,
     control_count: bounded.length,
     uia_visited: controls.visited || 0,
-    target_scope: application.handle,
+    /* What the picture covers. The window capture reports the window handle; the screen
+     * capture reports `screen`. A reader never has to guess which one it is holding. */
+    target_scope: capture.target_scope,
+    capture_scope: capture.capture_scope,
     telemetry: {
       lane: capture.lane,
       capture_ms: capture.telemetry ? capture.telemetry.capture_ms : undefined,
@@ -3508,6 +4154,24 @@ async function appActivateAction(action, options, mode, header) {
   // The app record was enumerated before the activation, so its `foreground` flag is
   // stale. It is replaced by the measured value, so the payload cannot contradict itself.
   return { ...header, ...activated, app: { ...application, foreground: activated.foreground_is_target === true } };
+}
+
+/**
+ * The real-mode key delivery as a lane script, without running it.
+ *
+ * `key` and `app_key` in virtual mode compose their scripts in functions this module keeps to
+ * itself, which left the one thing a gate most needs to check - WHICH keys a chord composes,
+ * and through which mechanism they are delivered - unmeasurable without pressing them on
+ * somebody's desktop. These two exports are that measurement point and nothing else: they
+ * build the script and hand it back.
+ */
+export function previewKeyScript(key, expect = {}) {
+  return realKeyScript(key, expect);
+}
+
+/** The virtual (posted-message) key script, for the same reason. */
+export function previewVirtualKeyScript(application, key, targetHandle) {
+  return virtualKeyScript(application, key, targetHandle);
 }
 
 async function desktopPhysicalAction(action, options, mode, header) {
@@ -3775,6 +4439,35 @@ function modeReport(action, options) {
       sparse_digest: `${SPARSE_DIGEST_WIDTH}x${SPARSE_DIGEST_HEIGHT}-grayscale`,
       full_capture: 'PrintWindow(hwnd,hdc,2) in the window_capture lane',
     },
+    /* The two capture scopes, so a caller can see which one answers which request rather
+     * than discovering it from a payload after the fact. */
+    capture_scopes: {
+      window: {
+        action: 'observe',
+        tool: 'screen_capture with target "application"',
+        capture_method: WINDOW_CAPTURE_METHOD,
+        covers: 'one window, by handle',
+        target_scope: 'the window handle',
+        lane: 'window_capture',
+      },
+      screen: {
+        action: 'capture_screen',
+        tool: 'screen_capture with target "desktop"',
+        capture_method: SCREEN_CAPTURE_METHOD,
+        covers: 'the entire virtual screen: every monitor, unioned',
+        target_scope: '"screen"',
+        lane: 'window_capture',
+      },
+    },
+    /* Windows-key delivery, advertised as a fact rather than left to be discovered by a
+     * caller whose `key: "win"` silently did nothing before this. */
+    key_delivery: {
+      send_keys: 'every chord .NET SendKeys can express: ctrl, shift and alt, alone or combined',
+      virtual_keys: 'every chord, built from virtual-key codes and delivered with the same call the unicode path uses',
+      virtual_keys_required_for: WINDOWS_KEY_NAMES.join(', '),
+      windows_key_virtual_codes: { left: `0x${VK_LEFT_WINDOWS.toString(16).toUpperCase()}`, right: `0x${VK_RIGHT_WINDOWS.toString(16).toUpperCase()}` },
+      lone_windows_key: 'held down, a dummy key is pressed inside the hold, and only then is it released: Windows waits to see whether a chord follows, so an unaccompanied down/up pair is swallowed',
+    },
     constants: {
       lease_expiry: LEASE_EXPIRY,
       lease_release_action: LEASE_RELEASE_ACTION,
@@ -3816,6 +4509,7 @@ function modeReport(action, options) {
        */
       refuses: [
         'observe of the foreground desktop (virtual mode refuses the whole-desktop capture: use app_observe with app_target or window_handle)',
+        'capture_screen, the whole-desktop capture behind screen_capture with target "desktop" (virtual mode refuses it: a screen capture is not a window-scoped read, so there is no target to scope it to)',
         'app_observe without app_target or window_handle (the foreground scene check)',
         'desktop move/click/drag/scroll/type/key without app_target, window_handle or a prior app_observe target (virtual_mode_requires_app_target)',
         'sequence (virtual mode refuses a scene-checked sequence: use app_observe followed by explicit app_* actions)',

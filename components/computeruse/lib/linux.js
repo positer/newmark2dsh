@@ -127,12 +127,22 @@ export const ALL_ACTIONS = Object.freeze([
 ]);
 
 /**
+ * Actions that are **not** on the model-facing `computer_use` surface.
+ *
+ * `capture_screen` is the whole-desktop capture behind the read-only `screen_capture` tool.
+ * It is accepted by `runComputerUse` and routes through the same dispatch and the same
+ * guards as every other action; it is simply not advertised as an action a model can name.
+ */
+export const INTERNAL_ACTIONS = Object.freeze(['capture_screen']);
+
+/**
  * Lane routing: which execution slot carries the work of an action.
  * Empty array means the action is pure Node state and touches no lane.
  */
 export const ACTION_LANES = Object.freeze({
   observe: Object.freeze(['window_capture', 'uia']),
   app_observe: Object.freeze(['window_capture', 'uia']),
+  capture_screen: Object.freeze(['window_capture']),
   move: Object.freeze(['action']),
   click: Object.freeze(['action']),
   drag: Object.freeze(['action']),
@@ -484,6 +494,9 @@ const TOOL_CHAINS = Object.freeze({
   input: Object.freeze(['xdotool', 'xte', 'ydotool']),
   windows: Object.freeze(['wmctrl', 'xdotool']),
   capture: Object.freeze(['gnome-screenshot', 'scrot', 'import', 'ffmpeg']),
+  /* The whole screen, which is not the same request as one window: the entries here are the
+   * ones that can address the root window or the full display, in preference order. */
+  screen_capture: Object.freeze(['import', 'gnome-screenshot', 'scrot', 'ffmpeg']),
   digest: Object.freeze(['magick', 'convert', 'ffmpeg']),
   dimensions: Object.freeze(['identify', 'magick', 'ffprobe']),
   active_window: Object.freeze(['xdotool', 'xprop']),
@@ -2063,6 +2076,136 @@ function imageMime(format, imagePath) {
   if (extension === '.png') return 'image/png';
   if (extension === '.webp') return 'image/webp';
   return 'application/octet-stream';
+}
+
+/**
+ * Full observation of the **whole screen**, the Linux half of the same capability the
+ * Windows backend answers with a screen-DC copy.
+ *
+ * It resolves no window: the point of the request is the screen, not a window on it. Every
+ * entry in the chain addresses the root window or the full display - `import -window root`,
+ * `gnome-screenshot` without a window flag, `scrot` without `-u`, and `ffmpeg`'s x11grab
+ * over the whole display - so a screen request can never be answered with the foreground
+ * window, which is exactly the defect this replaces on the Windows sibling.
+ *
+ * The reported bounds are the captured image's own, measured from the file, so the answer
+ * says what was really copied rather than what was asked for.
+ */
+export async function captureScreen(options = {}) {
+  const action = String(options.action || 'capture_screen');
+  const blocked = displayGuard(action) || toolGuard(action, 'capture') || toolGuard(action, 'digest');
+  if (blocked) return blocked;
+  const caps = capabilities();
+  const chain = TOOL_CHAINS.screen_capture;
+  const available = chain.filter(name => caps.tools[name]);
+  if (!available.length) {
+    return failure(action, 'missing_backend_tool', `No whole-screen capture backend is available: none of ${chain.join(', ')} is installed or on PATH.`, {
+      tool_chain: [...chain],
+      missing_tools: [...chain],
+      capability: 'screen_capture',
+    });
+  }
+  const ownerId = String(options.ownerId || 'direct');
+  const outPath = options.imagePath || options.image_path || capturePath(ownerId, 'screen');
+  const timeoutMs = clampNumber(options.timeoutMs, 1000, 300000, CAPTURE_TIMEOUT_MS);
+  const base = displayBase();
+  const maxWidth = clampNumber(options.maxWidth ?? options.captureMaxWidth, 320, 2048, 1280);
+  const maxHeight = clampNumber(options.maxHeight ?? options.captureMaxHeight, 240, 2048, 960);
+  const startedAt = Date.now();
+  const attempts = [];
+  for (const tool of chain) {
+    if (!caps.tools[tool]) continue;
+    if (tool === 'import') attempts.push({ tool, args: ['-window', 'root', outPath], method: 'import -window root' });
+    else if (tool === 'gnome-screenshot') attempts.push({ tool, args: ['-f', outPath], method: 'gnome-screenshot (whole screen)' });
+    else if (tool === 'scrot') attempts.push({ tool, args: [outPath], method: 'scrot (whole screen)' });
+    else if (tool === 'ffmpeg' && base) attempts.push({
+      tool,
+      args: ['-y', '-v', 'error', '-f', 'x11grab', '-i', base, '-frames:v', '1', outPath],
+      method: `ffmpeg -f x11grab -i ${base}`,
+    });
+  }
+  const failures = [];
+  for (const attempt of attempts) {
+    try { fs.rmSync(outPath, { force: true }); } catch { /* nothing to remove */ }
+    const result = await runTool(attempt.tool, attempt.args, { timeoutMs, lane: 'window_capture' });
+    if (!result.ok) {
+      failures.push({ tool: attempt.tool, error_code: result.error_code, error: result.error, stderr: firstLine(result.stderr) });
+      continue;
+    }
+    const stat = statImage(outPath);
+    if (!stat.ok) {
+      failures.push({ tool: attempt.tool, error_code: stat.error_code, error: stat.error });
+      continue;
+    }
+    let buffer;
+    try {
+      buffer = fs.readFileSync(outPath);
+    } catch (error) {
+      failures.push({ tool: attempt.tool, error_code: 'capture_failed', error: `the capture at ${outPath} could not be read back: ${messageOf(error)}` });
+      continue;
+    }
+    const dimensions = await imageDimensions(outPath, buffer, timeoutMs);
+    if (dimensions.ok !== true) {
+      failures.push({ tool: attempt.tool, error_code: dimensions.error_code, error: dimensions.error });
+      continue;
+    }
+    const digest = await digest32x18FromImage(outPath, timeoutMs);
+    if (digest.ok !== true) {
+      failures.push({ tool: attempt.tool, error_code: digest.error_code, error: digest.error });
+      continue;
+    }
+    const width = Number(dimensions.width) || 0;
+    const height = Number(dimensions.height) || 0;
+    if (width <= 0 || height <= 0) {
+      failures.push({ tool: attempt.tool, error_code: 'capture_zero_size', error: 'the capture reported a zero-size presentation' });
+      continue;
+    }
+    if (digest.distinct_luma <= 1) {
+      failures.push({ tool: attempt.tool, error_code: 'capture_monochrome', error: 'the capture was a single flat colour' });
+      continue;
+    }
+    return {
+      ok: true,
+      action,
+      lane: 'window_capture',
+      image_path: outPath,
+      imagePath: outPath,
+      image_mime: imageMime(dimensions.format, outPath),
+      width,
+      height,
+      image_width: width,
+      image_height: height,
+      image_bytes: stat.bytes,
+      image_mime_measured: dimensions.format,
+      /* The screen, not a window and not a region of one: the reader can tell which. */
+      target_scope: 'screen',
+      capture_scope: 'whole-display',
+      capture_method: attempt.method,
+      resize_applied: false,
+      requested_max_width: maxWidth,
+      requested_max_height: maxHeight,
+      digest: {
+        width: SPARSE_DIGEST_WIDTH,
+        height: SPARSE_DIGEST_HEIGHT,
+        sha256_prefix: digest.digest,
+        luma_min: digest.luma_min,
+        luma_max: digest.luma_max,
+        distinct_luma: digest.distinct_luma,
+      },
+      digest32x18: digest.digest,
+      digest32x18_geometry: `${SPARSE_DIGEST_WIDTH}x${SPARSE_DIGEST_HEIGHT}-grayscale`,
+      digest_tool: digest.tool,
+      ...backendReport(attempt.tool),
+      telemetry: { capture_ms: Date.now() - startedAt, lane: 'window_capture', width_source: dimensions.source },
+    };
+  }
+  try { fs.rmSync(outPath, { force: true }); } catch { /* ignore */ }
+  return failure(action, 'capture_screen_failed', `Every whole-screen capture backend failed: ${failures.map(item => `${item.tool}: ${item.error}`).join(' | ')}`, {
+    lane: 'window_capture',
+    tool_chain: [...chain],
+    available_tools: available,
+    failures,
+  });
 }
 
 /**
@@ -3761,7 +3904,7 @@ async function dispatchComputerUse(action, options) {
 
   if (action === READ_ONLY_POLL_ACTION) return await waitForAction(action, options);
 
-  if (!ALL_ACTIONS.includes(action)) {
+  if (!ALL_ACTIONS.includes(action) && !INTERNAL_ACTIONS.includes(action)) {
     return failure(action, 'unknown_action', `Unknown computer_use action: ${action}.`, { supported_actions: [...ALL_ACTIONS], extensions: [READ_ONLY_POLL_ACTION] });
   }
 
@@ -3794,6 +3937,14 @@ async function dispatchComputerUse(action, options) {
   if (blocked) return { ...header, ...blocked };
 
   if (action === 'app_list') return await appListAction(action, options, mode, header);
+  if (action === 'capture_screen') {
+    /* The whole-desktop capture behind `screen_capture` with `target: "desktop"`. It is on
+     * the dispatchable surface but deliberately not on the model-facing action list, exactly
+     * as on the Windows sibling. */
+    const needed = toolGuard(action, 'capture') || toolGuard(action, 'digest');
+    if (needed) return { ...header, ...needed };
+    return { ...header, ...(await captureScreen({ ...options, action })) };
+  }
   if (action === 'observe') {
     const needed = toolGuard(action, 'capture') || toolGuard(action, 'digest');
     if (needed) return { ...header, ...needed };
