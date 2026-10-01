@@ -32,11 +32,16 @@ import { causeChain, createErrorLog, describeError } from '../../lib/errors.js';
 /**
  * The decisions that ARE a judgement, as opposed to a reversal of one.
  *
- * `merge`, `reparent`, `split` and `join` decide something about the graph, so they
+ * `merge`, `reparent`, `split`, `join` and `cut` decide something about the graph, so they
  * are the Agent half of a rebuild and need the `agent-api` interface; `set-tags` and
  * `unfold` only restore tags a recorded decision replaced, so they never do.
+ *
+ * `cut` belongs here for the same reason the other four do: it is the decision 解环判定
+ * produces — which edge of a cycle to break — and it is the only decision that can break one.
+ * A cycle has no reparent that breaks it, so gating `cut` behind a reachable judge is what
+ * keeps cycle-breaking a judgement rather than something that happens on its own.
  */
-export const JUDGEMENT_DECISION_KINDS = Object.freeze(['merge', 'reparent', 'split', 'join']);
+export const JUDGEMENT_DECISION_KINDS = Object.freeze(['merge', 'reparent', 'split', 'join', 'cut']);
 
 /**
  * The interface MemoryLab hands its judgement to, and how it is reached.
@@ -340,7 +345,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         ? 'these decisions were applied and recorded; the receipt carries the undo that reverses them'
         : judge.available
           ? 'nothing was judged by THIS call: a reading tool never judges. The judgement runs when the panel asks for a rebuild (确定性重建之后，提交 agent-api 运行一次), or when an agent decides from memory_lab_tag_review and applies through memory_lab_tag_apply'
-          : `the ${AGENT_API_INTERFACE} component is off, so the three judgement classes (假根父节点接续, 同义近义 tag 合并, 未被正确解析的 tag 误读为单 tag) are unavailable here — not skipped and not pending; the deterministic rebuild is unaffected`,
+          : `the ${AGENT_API_INTERFACE} component is off, so the four judgement classes (假根父节点接续, 同义近义 tag 合并, 未被正确解析的 tag 误读为单 tag, 解环判定) are unavailable here — not skipped and not pending; the deterministic rebuild is unaffected`,
     };
   }
 
@@ -348,11 +353,18 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
    * What the judgement is asked, where it runs, and what it must answer with.
    *
    * This is the request an in-process run through the interface consumes — the same
-   * object whether the trigger was a tool call or the panel's own route. The three
-   * questions are the user's own names for the three things a rebuild cannot decide
+   * object whether the trigger was a tool call or the panel's own route. The four
+   * questions are the user's own names for the four things a rebuild cannot decide
    * by rule; each is stated with the finding kind that carries its evidence, so a
    * run is told what it is being asked rather than handed a payload and left to
    * guess.
+   *
+   * The fourth — 解环判定, in the user's own words — covers the two shapes one finding kind
+   * carries and says so: a cycle the stored graph really holds (`stored-cycle`, read from
+   * index.json before the normalizer drops its second edge), and two roots that name each
+   * other as candidate parent (`candidate-mutual`, the shape the Agent met when it refused to
+   * reparent three false roots because 其 why 为共现且 #作者↔#研究 互为候选，属循环). They need
+   * different evidence and different decisions, which is why the finding says which it is.
    */
   function judgementRequest(review) {
     return {
@@ -366,6 +378,11 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
           id: 'misparsed-tag',
           ask: '未被正确解析的 tag 误读为单 tag：which stored name is really a chain, and which chain is really one tag?',
           evidence: ['single-tag-path', 'path-might-be-one-tag'],
+        },
+        {
+          id: 'cycle-break',
+          ask: '解环判定：which tags form a cycle — a cycle the stored graph really holds, or two roots that each name the other as candidate parent — and which edge should be broken, in which direction?',
+          evidence: ['cycle-candidate'],
         },
       ],
       graph: {
@@ -403,8 +420,8 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
    * judgement was asked for and came back empty.
    */
   const PROMPT_NOTICES = Object.freeze({
-    none: '索引里没有需要判定的事项——确定性重建已经做完，标签图没有留下同义近义、假根父节点或误解析的候选。这不是跳过，也不是失败，是重建后的稳定状态。',
-    unavailable: `agent-api 已停用，标签判定的三个问题都没有可用的运行来源；确定性重建不受影响。这不是跳过，也不是待办。`,
+    none: '索引里没有需要判定的事项——确定性重建已经做完，标签图没有留下同义近义、假根父节点、误解析或成环的候选。这不是跳过，也不是失败，是重建后的稳定状态。',
+    unavailable: `agent-api 已停用，标签判定的四个问题都没有可用的运行来源；确定性重建不受影响。这不是跳过，也不是待办。`,
   });
   const NO_EVIDENCE_NOTICE = '（这一次的审查结果没有返回任何发现，因此没有证据可以呈现。）';
   const REVIEW_UNAVAILABLE_NOTICE = '审查暂时读不出来，因此这次判定没有可提交的内容：';
@@ -415,11 +432,11 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
    * The request is the structured half — questions with ids and evidence kinds, the graph's
    * relationship version, the finding counts, an answer shape. Handing that object to a model
    * is handing it a payload. This renders the same thing as the prose a person would write, and
-   * it is the only place in this bundle where the three questions become a message:
+   * it is the only place in this bundle where the four questions become a message:
    *
-   *  - the three questions are asked in the USER'S OWN WORDS for them (同义近义 tag 合并 /
-   *    假根父节点接续 / 未被正确解析的 tag 误读为单 tag), with their finding kinds attached as
-   *    where-to-look, never as the thing being asked;
+   *  - the four questions are asked in the USER'S OWN WORDS for them (同义近义 tag 合并 /
+   *    假根父节点接续 / 未被正确解析的 tag 误读为单 tag / 解环判定), with their finding kinds
+   *    attached as where-to-look, never as the thing being asked;
    *  - the sequence is stated as a procedure: read the evidence, decide, then apply — two calls
    *    with a decision between them, which is what this component has always said it is;
    *  - the guard travels with the prompt (`expectedRelationshipVersion`, archive + undo), so a
@@ -473,7 +490,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
     const text = [
       '请你对 Memory Lab 的标签图做一次索引判定，并把判定结果应用回索引。',
       '',
-      '你要判定的是下面三类问题：',
+      '你要判定的是下面四类问题：',
       '',
       body,
       '',
@@ -482,7 +499,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
       '请按这个顺序做，不要跳步：',
       '',
       '1. 先调用 memory_lab_tag_review（只读）取证据与请求：它返回每一条发现的证据（evidence）、可选的决定（options）和当前的关系版本（relationshipVersion）。它不改写任何东西。',
-      '2. 然后你自己逐条判定。可用的决定有四种：merge（把若干同义近义的 tag 合并到一个规范拼写，existingInto 的意思就是 canonical）、reparent（把一个根 tag 接到某个父 tag 之下）、split（把被误读成单个 tag 的名字还原成一条链）、join（把一条链收成一个 tag）。每一条决定，只使用审查里真实出现过的 tag 名，并使用审查给出的 options 里的形状。',
+      '2. 然后你自己逐条判定。可用的决定有五种：merge（把若干同义近义的 tag 合并到一个规范拼写，existingInto 的意思就是 canonical）、reparent（把一个根 tag 接到某个父 tag 之下）、split（把被误读成单个 tag 的名字还原成一条链）、join（把一条链收成一个 tag）、cut（剪断一条 parent -> child 的边，形状是 { parent, child }：把 parent 从断言这条边的组件 tagPaths 里去掉，环就解开了）。每一条决定，只使用审查里真实出现过的 tag 名，并使用审查给出的 options 里的形状。',
       `3. 最后调用 memory_lab_tag_apply 应用你接受的决定，并带上 expectedRelationshipVersion = ${version || '（第 1 步返回的那个值）'}。`,
       '',
       '约束：',
@@ -491,6 +508,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
       '- 同义近义 tag 合并：只有当证据（stableInto 或共享词干与成员重合）真的指向同一个概念时才合并；只是拼写相近、证据没有点名的，不要合并。',
       '- 假根父节点接续：只有候选父节点在 tagPaths 里真的有层级依据时才 reparent；否则把这一个发现留给下一次审查，不要修。',
       '- 未被正确解析的 tag 误读为单 tag：只有证据明确说明候选链时才 split 或 join。',
+      '- 解环判定：先看 evidence.shape 是哪一种。shape = "stored-cycle" 是索引文件里真的成环，用 cut 剪断环上的一条边（reparent 也能让环消失，但那是规范化顺手丢边的副作用，回执里不会说是哪一条边没了；cut 会点名这条边，所以解环要用 cut）。cut 的证据里 edges 给出环上每一条边、assertedBy 给出哪些组件断言了它、suggestedCut 是建议剪断的那一条，剪断环上任意一条边都能解环。shape = "candidate-mutual" 是图里并没有环、只是两个根节点互为候选父节点：只有 evidence.direction 指出哪一边更一般（name-containment / synonym-group / structure）时才按那个方向 reparent；direction.directionDecided 为 false、或 why 说明这只是共现时，就什么都不要应用，并说明理由——把没有证据的方向说成结论，比不判定更糟。',
       '- 不要直接改索引文件，也不要用别的工具改标签结构：标签图只经 memory_lab_tag_apply 改动。',
       "- 每次 apply 都会先把改动前的索引归档到 archive/，并在 policy.jsonl 里记录每个受影响组件的旧标签和一条 undo；要撤销一个已经记录的决定，就用它给的 undo 或 set-tags/unfold，不要去反推。",
       '- 信息性的发现（options 只有 { kind: "none" }）不需要处理，它没有任何可应用的决定。',
@@ -498,7 +516,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
       '',
       `关系版本：apply 会核对 expectedRelationshipVersion = ${version || '（第 1 步返回的那个值）'}；如果读和写之间标签图变了，写入会被拒绝，请重新审查一次再决定。`,
       '',
-      '如果你判断某一类问题当前没有可接受的修复，就什么都不应用，并在回答里说明理由；不要为了完成任务而做没有证据的合并或接续。',
+      '如果你判断某一类问题当前没有可接受的修复，就什么都不应用，并在回答里说明理由；不要为了完成任务而做没有证据的合并、接续或剪断。',
       /* The workspace is NOT printed here.
        *
        * It is in the request, and the tool result carries it, so a run has it either way — and
@@ -1167,7 +1185,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_tag_review',
           description:
-            'Report the tag-graph repairs that need judgement rather than a rule: a root tag whose memories are already filed under another tag, near-synonym tags, a name that may be a collapsed path, a chain that may be one tag, and stored values a rebuild does not reproduce. Read-only — it rewrites nothing. Every finding carries the facts to decide it and the decision shape to pass to memory_lab_tag_apply. ' +
+            'Report the tag-graph repairs that need judgement rather than a rule: a root tag whose memories are already filed under another tag, near-synonym tags, a name that may be a collapsed path, a chain that may be one tag, stored values a rebuild does not reproduce, and the cycles — a cycle the stored graph really holds (`stored-cycle`, read from index.json before the normalizer drops its second edge) or two roots that each name the other as candidate parent (`candidate-mutual`); the finding says which shape it is and carries what makes a direction logical, or says plainly that nothing does. Read-only — it rewrites nothing. Every finding carries the facts to decide it and the decision shape to pass to memory_lab_tag_apply. ' +
               'This result also carries the judgement envelope: whether a run can be asked for right now, the request that says what is being judged, where it runs and what shape the answer takes, and `prompt` — the same ask as the prose you would send a model, ready to hand to a run as it stands. It is the SAME text the panel\'s 重建索引 dispatches when it runs the judgement itself, so a run you start by hand and a run started from the panel are asked the same thing. ' +
               'THE SEQUENCE IS AGENT-DRIVEN AND IT IS TWO CALLS: this tool gives you the evidence and the request; YOU decide; memory_lab_tag_apply applies and records your decisions. Nothing here judges. When you want a run to make the decision for you, obtain one from agent-api through its agent_api_send tool — that is also what the panel does, through this component.',
           parameters: {
@@ -1177,7 +1195,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
                 type: 'array',
                 items: { type: 'string' },
                 description:
-                  'Report only these finding kinds: false-root, synonym-candidate, single-tag-path, path-might-be-one-tag, rule-not-reproducible. Omit for all of them.',
+                  'Report only these finding kinds: false-root, synonym-candidate, single-tag-path, path-might-be-one-tag, rule-not-reproducible, cycle-candidate. Omit for all of them.',
               },
               limit: { type: 'number', description: 'Findings per page, 1-200, default 25.' },
               offset: { type: 'number', description: 'Skip this many findings. The window in the result says how many were omitted.' },
@@ -1209,7 +1227,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_tag_apply',
           description:
-            'Apply the tag-graph decisions you made from memory_lab_tag_review: merge folds tags into one canonical tag, reparent continues a root tag under a parent, split turns a collapsed name into a chain, join turns a chain into one tag, and set-tags/unfold restore previous tags exactly. Before it writes, the current index is archived under archive/ and one policy.jsonl line records the decisions, every affected component previous tags and an undo list that restores the previous graph. A judgement decision (merge, reparent, split, join) requires the agent-api component and is refused while it is switched off; a reversal still applies.',
+            'Apply the tag-graph decisions you made from memory_lab_tag_review: merge folds tags into one canonical tag, reparent continues a root tag under a parent, split turns a collapsed name into a chain, join turns a chain into one tag, cut removes one parent -> child edge from the component tagPaths that assert it (the way a cycle is broken: reparent cannot break one, because moving a node of a cycle under another node of it is refused as a cycle and moving it outside leaves the cycle intact), and set-tags/unfold restore previous tags exactly. Before it writes, the current index is archived under archive/ and one policy.jsonl line records the decisions, every affected component previous tags and an undo list that restores the previous graph. A judgement decision (merge, reparent, split, join, cut) requires the agent-api component and is refused while it is switched off; a reversal still applies.',
           parameters: {
             type: 'object',
             properties: {
@@ -1220,7 +1238,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
                   properties: {
                     kind: {
                       type: 'string',
-                      enum: ['merge', 'reparent', 'split', 'join', 'set-tags', 'unfold'],
+                      enum: ['merge', 'reparent', 'split', 'join', 'cut', 'set-tags', 'unfold'],
                       description: 'Which repair this decision is; the other fields are the ones that kind reads.',
                     },
                   },
@@ -1246,7 +1264,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
             /**
              * A judgement is not a reversal, and the two do not share a gate.
              *
-             * The four judging decisions need the Agent half of the rebuild, so with
+             * The five judging decisions need the Agent half of the rebuild, so with
              * `agent-api` switched off they are UNAVAILABLE: this refuses, names the
              * switch, and writes nothing — it never applies half a judgement. A
              * reversal is `set-tags`/`unfold` only, decides nothing, and is the way back

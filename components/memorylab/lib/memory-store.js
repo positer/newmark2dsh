@@ -140,6 +140,26 @@ export const TAG_FINDING_KINDS = Object.freeze([
   'path-might-be-one-tag',
   /** A stored value today's rule does not reproduce (grandfathering, or drift). */
   'rule-not-reproducible',
+  /**
+   * Two tags that cannot both be the other's parent — 解环判定.
+   *
+   * The finding covers TWO shapes and says which one it is, because they are not the same
+   * kind of problem and they do not have the same answer:
+   *
+   *   * `stored-cycle` — the graph AS IT IS ON DISK contains a cycle. Read from the raw
+   *     `index.json` document, before `normalizeIndex()` runs, because the normalizer
+   *     silently drops the second edge of a cycle (`cyclic-tag-edge-skipped`) and the
+   *     in-memory graph a review is handed therefore no longer shows it. This is a DEFECT:
+   *     a cycle is not a legal tag graph and the store refuses to create one.
+   *   * `candidate-mutual` — two roots are each other's candidate parent. The graph holds no
+   *     cycle at all; the cycle lives in the EVIDENCE. This is a DECISION, not a defect, and
+   *     it is the shape the Agent met when it refused to reparent three false roots and said
+   *     the relation was 循环.
+   *
+   * Either way the finding carries what makes a direction logical, and says plainly when
+   * nothing does — see `tagDirection()`.
+   */
+  'cycle-candidate',
 ]);
 
 /** How many findings one review returns unless the caller asks for another window. */
@@ -150,10 +170,20 @@ export const MAX_TAG_FINDING_LIMIT = 200;
 
 /**
  * The tag-graph decisions `applyTagDecisions()` accepts. `merge`, `reparent`,
- * `split` and `join` are the four repairs; `set-tags` and `unfold` exist so an
- * applied decision can be reversed exactly (see the `undo` in every receipt).
+ * `split`, `join` and `cut` are the five repairs; `set-tags` and `unfold` exist so
+ * an applied decision can be reversed exactly (see the `undo` in every receipt).
+ *
+ * `cut` is the one that breaks a cycle BY NAME: it removes ONE parent -> child edge from
+ * the component `tagPaths` that assert it, and the receipt says which edge and which
+ * component. `reparent` can also clear a ring, but only as a side effect — moving a node
+ * of the cycle under its own child rewrites the chains, and the rebuild that follows
+ * derives a graph in which one of the two directions must be refused, with nothing in the
+ * receipt saying which edge went. Measured in the store gate: `reparent #cycA under #cycB`
+ * on a two-node cycle clears the review's finding and records no `removedFrom`. That
+ * difference — an edge named on the record versus an edge lost in normalization — is what
+ * `cut` is for.
  */
-export const TAG_DECISION_KINDS = Object.freeze(['merge', 'reparent', 'split', 'join', 'set-tags', 'unfold']);
+export const TAG_DECISION_KINDS = Object.freeze(['merge', 'reparent', 'split', 'join', 'cut', 'set-tags', 'unfold']);
 
 /** The `action` every tag-graph decision batch records in `policy.jsonl`. */
 export const TAG_EDIT_ACTION = 'TAG-EDIT';
@@ -712,7 +742,7 @@ export class MemoryLabStore {
       'memory_lab_query is bounded task-relevant retrieval: prefer it over injecting the whole index.',
       'memory_lab_update creates or replaces a component; pass expectedUpdatedAt from the latest read so a stale write is rejected instead of overwriting newer memory.',
       'For small edits prefer contentAppend or oldText/newText over resending the whole body. memory_lab_delete forgets a component only when the user asks.',
-      'memory_lab_reindex is the deterministic rebuild; memory_lab_tag_review reports the tag-graph repairs that need your judgement (near-synonyms, a false root, a collapsed or over-split path) and memory_lab_tag_apply records the decisions you make from it, reversibly.',
+      'memory_lab_reindex is the deterministic rebuild; memory_lab_tag_review reports the tag-graph repairs that need your judgement (near-synonyms, a false root, a collapsed or over-split path, and a cycle — one the stored graph really holds, or two roots that each name the other as candidate parent) and memory_lab_tag_apply records the decisions you make from it, reversibly.',
       'Tag names carry one leading "#"; a tag that stands alone still gets its own single-node tagPath. Express hierarchy with tagPaths, for example [["#研究","#论文"]].',
       'Every revision is archived under archive/<slug>/ and every mutation appends one policy.jsonl line (action, slug, reason, source, timestamps, archive path, content hash) — never memory content.',
       'Never inject index or component content into the system prompt; retrieve it through these tools only when needed.',
@@ -2078,6 +2108,408 @@ export class MemoryLabStore {
     return referenced;
   }
 
+  /**
+   * The parent -> child edges the index.json ON DISK claims, read BEFORE normalization.
+   *
+   * Why this exists at all, because it is not the obvious source: `loadIndex()` runs
+   * `normalizeIndex()` on the way in, and the normalizer REFUSES a cyclic edge
+   * (`tagPathExists()` + `cyclic-tag-edge-skipped`), so a cycle that is really in the file is
+   * already gone from the graph a review is handed. Measured on a hand-written two-way cycle:
+   * the file holds `#A -> #B` and `#B -> #A`, `loadIndex()` returns `#A -> #B` only, with the
+   * warning `cyclic-tag-edge-skipped:#B->#A`, and `tagReview()` on that graph reports nothing.
+   * The cycle therefore has to be read from the document, not from the graph — otherwise the
+   * one shape that is a real defect is the one shape the review cannot see.
+   *
+   * Each edge carries the two node lists SEPARATELY, because their disagreement is itself the
+   * defect: a hand-edited or restored index can say `#B` is a child of `#A` while `#A` does not
+   * list `#B` as its child, and an edge said by only one side is a conflicting claim rather
+   * than a hierarchy.
+   *
+   * READ-ONLY, and silent on a missing or unparseable document: this is evidence for a review,
+   * and a review of a store that cannot be read is `loadIndex()`'s answer to give, not this
+   * one's. A legacy array-shaped node (`[name, parents, children, components]`) is read as the
+   * real store's `rawTagNodes()` reads it.
+   */
+  storedGraphRelations() {
+    const raw = readTextOrNull(this.indexPath);
+    const edges = new Map();
+    const names = [];
+    const note = (name) => {
+      if (name && !edges.has(name)) {
+        edges.set(name, { name, fromChildren: [], fromParents: [] });
+        names.push(name);
+      }
+      return name;
+    };
+    let parsed = null;
+    if (raw !== null) {
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parsed = null;
+      }
+    }
+    for (const node of parsed ? this.rawTagNodes(parsed) : []) {
+      note(node.name);
+      for (const child of node.children) {
+        const name = normalizeTagName(child);
+        if (!name || name === node.name) continue;
+        note(name);
+        const entry = edges.get(node.name);
+        if (!entry.fromChildren.includes(name)) entry.fromChildren.push(name);
+      }
+      for (const parent of node.parents) {
+        const name = normalizeTagName(parent);
+        if (!name || name === node.name) continue;
+        note(name);
+        const entry = edges.get(node.name);
+        if (!entry.fromParents.includes(name)) entry.fromParents.push(name);
+      }
+    }
+    for (const entry of edges.values()) {
+      entry.fromChildren = sortedUnique(entry.fromChildren);
+      entry.fromParents = sortedUnique(entry.fromParents);
+    }
+    /** The union relation: an edge is claimed when EITHER side says so. */
+    const childrenOf = (name) => sortedUnique([...(edges.get(name)?.fromChildren || []), ...(edges.get(name)?.fromParents || [])]);
+    const says = (parent, child, side) =>
+      side === 'children' ? (edges.get(parent)?.fromChildren || []).includes(child) : (edges.get(parent)?.fromParents || []).includes(child);
+    return { names, edges, childrenOf, says, relation: (side) => (name) => (side === 'children' ? edges.get(name)?.fromChildren || [] : edges.get(name)?.fromParents || []) };
+  }
+
+  /**
+   * Every cycle the stored relations contain, as an exact path, deterministically.
+   *
+   * A depth-first walk over the union relation above, in index order, reporting the cycles a
+   * back edge closes. The path is the cycle in order and is CLOSED — its last node is its
+   * first — so a reader sees every edge and can point at the one to cut. A self edge
+   * (`#A` -> `#A`) is reported as the one-node path `['#A', '#A']`: a tag that is its own
+   * parent is a cycle of length one and `reparent` refuses it by name.
+   *
+   * Deduplicated by canonical rotation (each cycle is reported once, from its smallest node in
+   * code-unit order) and capped, because a pathological document could otherwise make a
+   * read-only review the most expensive thing in the app. The caps are generous and the caller
+   * is told when they bite (`truncated`).
+   *
+   * Deterministic in both content and ORDER: `names` is index order, each node's children are
+   * sorted, and the paths are sorted at the end. A review that returned the same cycles in a
+   * different order on every read would make every diff of its output noise.
+   */
+  storedCycles(relations) {
+    const MAX_PATHS = 64;
+    const MAX_DEPTH = 32;
+    const source = relations || this.storedGraphRelations();
+    const found = new Map();
+    let truncated = false;
+    /**
+     * Walk the `children` projection and report the cycles it closes.
+     *
+     * ONE projection, and this is the measured reason it is one. Walking BOTH projections, or
+     * their union, reports a cycle for a graph that merely leaves an asymmetry behind: a stored
+     * `#A.children -> #B` beside a stored `#B.parents -> #A` is what a hand-edited index looks
+     * like after one side was removed, and reading the second claim as an edge turns that
+     * leftover into a ring that the rebuild will silently drop anyway. Measured on such a
+     * fixture, the union walk reported `#B -> #A -> #B` on a graph whose `children` relation was
+     * a clean two-node chain. The relation that decides a cycle is the `children` list — "this is
+     * my child" is the direction the normalizer itself walks (`tagPathExists()` follows
+     * `node.children`) — so that is what a cycle is read from here, and a one-sided claim is
+     * reported as the fact it is (`conflicting`) inside a cycle that really exists.
+     */
+    const walkProjection = (childrenOf, relationName) => {
+      const onPath = new Map();
+      const done = new Set();
+      const visit = (node, path) => {
+        if (truncated) return;
+        if (path.length >= MAX_DEPTH) {
+          truncated = true;
+          return;
+        }
+        onPath.set(node, path.length);
+        for (const rawChild of childrenOf(node)) {
+          const child = String(rawChild);
+          const at = onPath.get(child);
+          if (at !== undefined) {
+            /* `path.slice(at)` is the ring in WALK order, and the closing node repeats the head.
+             * It has to stay in walk order: the dedup key below used to be built by sorting the
+             * ring, and reading the sorted list back as the path reported `#cycB > #cycA` for a
+             * walk of `#cycA > #cycB` — the ring's direction is the fact a reader needs, so the
+             * key is sorted and the path is not. */
+            const cycle = [...path.slice(at), child];
+            /* Deduplicated by the VERTEX SET: the same ring is found once from every node of it,
+             * and for a two-node ring once in each direction — which is the same cycle. Keying on
+             * a canonical rotation instead collapsed `#A -> #B -> #A` and `#B -> #A -> #B` onto
+             * one key and then rebuilt the path from the wrong one, reporting the one-node lie
+             * `#B -> #B`. The ring kept is the first in index order, so the path stays
+             * deterministic; which of the two directions READS correctly is settled by the
+             * orientation step below, not here. */
+            const ring = cycle.slice(0, -1);
+            const key = Array.from(new Set(ring)).sort(compareStrings).join('\u0000');
+            if (!found.has(key)) found.set(key, cycle);
+            if (found.size >= MAX_PATHS) {
+              truncated = true;
+              return;
+            }
+            continue;
+          }
+          if (done.has(child)) continue;
+          visit(child, [...path, child]);
+          if (truncated) return;
+        }
+        onPath.delete(node);
+        done.add(node);
+      };
+      for (const name of source.names) {
+        if (truncated) break;
+        if (done.has(name)) continue;
+        visit(name, [name]);
+      }
+    };
+    walkProjection(source.relation('children'), 'children');
+    const paths = Array.from(found.values()).sort((a, b) => compareStrings(a.join('\u0000'), b.join('\u0000')));
+    const selfEdges = sortedUnique(
+      source.names.filter((name) => (source.edges.get(name)?.fromChildren || []).includes(name) || (source.edges.get(name)?.fromParents || []).includes(name)),
+    );
+    return { paths, selfEdges, truncated, read: source.names.length > 0 };
+  }
+
+  /**
+   * The roots that are each other's candidate parent — the cycle that lives in the EVIDENCE.
+   *
+   * This is the shape the Agent actually hit and refused: `#作者`'s false-root evidence names
+   * `#研究` as a candidate parent, `#研究`'s names `#作者`, and both are roots, so reparenting
+   * either one had no more support than the other. It was right to refuse, and the reason is
+   * that the candidate rule is SYMMETRIC here: both tags are carried by the same component, so
+   * each is a candidate parent of the other and neither relation was ever a hierarchy.
+   *
+   * The rule is the false-root rule — the same one shape 1 (`false-root`) reports — so it is
+   * applied here rather than read out of those findings: a review narrowed to `cycle-candidate`
+   * has to find these, and two implementations of "candidate parent" would be two answers to
+   * one question. What this adds is the pair test: `A` names `B` AND `B` names `A`.
+   *
+   * Read-only, deterministic, and ordered by the tag names so the review's page is stable.
+   */
+  mutualCandidatePairs(graph, members) {
+    const candidatesOf = new Map();
+    for (const root of graph.names) {
+      const node = graph.tags[root] || {};
+      if (toArray(node.parents).length) continue;
+      const own = members.get(root) || [];
+      if (!own.length) continue;
+      const descendants = new Set();
+      const walk = (name) => {
+        for (const child of toArray((graph.tags[name] || {}).children)) {
+          if (descendants.has(child)) continue;
+          descendants.add(child);
+          walk(child);
+        }
+      };
+      walk(root);
+      const support = new Map();
+      for (const name of graph.names) {
+        if (name === root) continue;
+        const other = members.get(name) || [];
+        const shared = other.filter((slug) => own.includes(slug));
+        if (!shared.length || shared.length / own.length < 0.5) continue;
+        const parents = toArray((graph.tags[name] || {}).parents);
+        for (const parent of parents.length ? parents : [name]) {
+          if (parent === root || descendants.has(parent)) continue;
+          if (!support.has(parent)) support.set(parent, new Set());
+          support.get(parent).add(name);
+        }
+      }
+      candidatesOf.set(root, support);
+    }
+    const pairs = new Map();
+    for (const root of graph.names) {
+      const support = candidatesOf.get(root);
+      if (!support) continue;
+      for (const other of support.keys()) {
+        /**
+         * The pair test: BOTH sides must name the other.
+         *
+         * It is kept even though the candidate rule makes it unreachable, and the reason is worth
+         * writing down rather than discovering again. For two ROOTS with a shared component, the
+         * relation is necessarily symmetric: `B`'s shared set contains `A`'s (both are the shared
+         * components), so `B`'s ratio is at least `A`'s, and the root branch (`parents.length ?
+         * parents : [name]`) then offers `B` to `A` exactly when it offers `A` to `B`. A root that
+         * shares nothing with `A` is never offered at all. So the only way to reach this line with
+         * `other` not naming `root` back is for the CANDIDATE RULE to change — which is the change
+         * this guard exists to catch, and a guard that is only reachable after that change is
+         * still a guard. Measured: removing it left every fixture reporting exactly the pairs the
+         * rule already implies, so no gate can distinguish it today.
+         */
+        if (!candidatesOf.get(other)?.has(root)) continue;
+        const [a, b] = [root, other].sort(compareStrings);
+        const key = `${a}\u0000${b}`;
+        if (pairs.has(key)) continue;
+        pairs.set(key, {
+          pair: [a, b],
+          viaA: sortedUnique(Array.from(candidatesOf.get(a)?.get(b) || [])),
+          viaB: sortedUnique(Array.from(candidatesOf.get(b)?.get(a) || [])),
+        });
+      }
+    }
+    return Array.from(pairs.values()).sort((x, y) => compareStrings(x.pair.join('\u0000'), y.pair.join('\u0000')));
+  }
+
+  /**
+   * What makes a direction between two tags LOGICAL — or the fact that nothing does.
+   *
+   * This is the evidence the judgement was missing. The Agent refused to reparent three false
+   * roots because all it had was co-occurrence, and it was right: `#作者`'s false-root evidence
+   * names `#研究` as a candidate parent and `#研究`'s names `#作者`, so the evidence is
+   * SYMMETRIC and either move is arbitrary. What a reader needs is not a verdict but the facts
+   * that could make one direction the general one — and, when there are none, that fact stated
+   * outright.
+   *
+   * Every signal here is read from the store, none is invented:
+   *
+   *   * **name containment / the fold table** — the store already decides whether two
+   *     spellings are one tag: `SYNONYM_GROUPS` plus `synonymKey()`, the same bilingual
+   *     normalizer `inputTagFold()` and `tagAliasGroups()` use. When one name contains the
+   *     other, or the two fold to one synonym key, that decides the direction, and this
+   *     reports the store's own key as the reason rather than a second comparison written
+   *     here. `synonymReasons()` is reused as-is for the containment question.
+   *   * **generality** — how many components carry the tag, how many children hang below it,
+   *     and whether it appears as a parent at all. In this store a root that is nobody's
+   *     parent is a leaf; a root with children is already a level of the hierarchy.
+   *   * **strict dominance** — one side reaching all of the other's components while nothing
+   *     reaches back the same way (`superset` / `subset`). Reported because it is a fact about
+   *     the data a reader can check, and it is NOT treated as a decisive signal on its own:
+   *     in a store where one memory carries both tags, one side reaching the other's component
+   *     is the ordinary shape of co-occurrence.
+   *
+   * `directionDecided` is the honest half: when NO signal decides a direction, `moreGeneral`
+   * is `null` and `directionDecided` is `false`, because "these two must be broken in this
+   * direction" is not something the evidence supports, and a finding that admits it cannot
+   * choose is worth more than one that guesses. The caller may then still choose a direction —
+   * a reader of the memories knows things the store does not — but it will do so knowing the
+   * store did not.
+   */
+  tagDirection(a, b, membersOf, tags) {
+    const nodeOf = (name) => (tags && tags[name]) || {};
+    const factOf = (name) => {
+      const children = sortedUnique(toArray(nodeOf(name).children));
+      const parents = sortedUnique(toArray(nodeOf(name).parents));
+      const bare = String(name).replace(/^#/, '');
+      return {
+        tag: name,
+        components: sortedUnique(membersOf(name)),
+        componentCount: membersOf(name).length,
+        childTags: children,
+        childCount: children.length,
+        parentTags: parents,
+        isRoot: parents.length === 0,
+        /**
+         * The store's own identity for this name, read from the fold table rather than
+         * recomputed: two names with the same key are one concept in the table's terms
+         * (`#研究` and `#research`), which is exactly what makes one of them the survivor.
+         */
+        synonymKey: synonymKey(name),
+        nameLength: bare.length,
+      };
+    };
+    const fa = factOf(a);
+    const fb = factOf(b);
+    const shared = fa.components.filter((slug) => fb.components.includes(slug));
+    const shapeA = nameShape(a);
+    const shapeB = nameShape(b);
+    const basis = [];
+    let moreGeneral = null;
+    let decisiveBy = '';
+    let sameConcept = false;
+
+    if (shapeA && shapeB && shapeA === shapeB) {
+      sameConcept = true;
+      decisiveBy = 'same-shape';
+      basis.push({ signal: 'name', decisive: true, fact: `${a} and ${b} are identical once case and separators are removed, so one of them is this one tag under two keys` });
+    } else if (fa.synonymKey === fb.synonymKey && fa.synonymKey !== comparisonKey(a)) {
+      sameConcept = true;
+      decisiveBy = 'synonym-group';
+      const group = SYNONYM_GROUPS.find((names) => synonymGroupKey(names) === fa.synonymKey) || [];
+      basis.push({
+        signal: 'synonym-group',
+        decisive: true,
+        fact: `the store's own fold table puts ${a} and ${b} in one group (${group.map(normalizeTagName).join(', ')}), so one of them is a spelling of the other and the decision here is a merge, not a hierarchy`,
+      });
+    } else if (shapeA && shapeB && (shapeA.includes(shapeB) || shapeB.includes(shapeA))) {
+      decisiveBy = 'name-containment';
+      const [longer, shorter] = shapeA.includes(shapeB) ? [a, b] : [b, a];
+      basis.push({
+        signal: 'name-containment',
+        decisive: true,
+        fact: `${shorter} is contained in ${longer}, so ${longer} reads as the narrower of the two and ${shorter} as the more general name`,
+      });
+      moreGeneral = shorter;
+    }
+    for (const reason of this.synonymReasons(a, b, fa.components, fb.components).reasons) {
+      if (basis.some((entry) => entry.fact.includes(reason))) continue;
+      basis.push({ signal: 'name-shape', decisive: false, fact: reason });
+    }
+    basis.push({
+      signal: 'generality',
+      decisive: false,
+      fact: `${a} is carried by ${fa.componentCount} component(s) and is the parent of ${fa.childCount} tag(s); ${b} is carried by ${fb.componentCount} component(s) and is the parent of ${fb.childCount} tag(s)`,
+    });
+    if (fa.isRoot !== fb.isRoot) {
+      basis.push({ signal: 'hierarchy', decisive: false, fact: `${fa.isRoot ? a : b} is a root and ${fa.isRoot ? b : a} is not, so the non-root side already has a parent` });
+    }
+    basis.push({
+      signal: 'co-occurrence',
+      decisive: false,
+      fact: shared.length
+        ? `${a} and ${b} are carried by the same ${shared.length} component(s) (${shared.join(', ')}) and by nothing else that separates them`
+        : `${a} and ${b} share no component`,
+    });
+    const subset = shared.length > 0 && shared.length === fa.componentCount && fa.componentCount < fb.componentCount;
+    const superset = shared.length > 0 && shared.length === fb.componentCount && fb.componentCount < fa.componentCount;
+    if (subset || superset) {
+      const [small, large] = subset ? [a, b] : [b, a];
+      basis.push({
+        signal: 'component-containment',
+        decisive: false,
+        fact: `every component carrying ${small} also carries ${large}, and ${large} has component(s) that do not carry ${small}`,
+      });
+    }
+    /* A childless root beside a root that already parents other tags: the hierarchy exists on
+     * one side only, and that is the fact the false-root question turns on. Kept non-decisive
+     * because a leaf root can be a legitimate top-level tag. */
+    if (!moreGeneral && fa.childCount !== fb.childCount && (fa.childCount === 0 || fb.childCount === 0) && (fa.componentCount >= 2 || fb.componentCount >= 2)) {
+      moreGeneral = fa.childCount === 0 ? b : a;
+      decisiveBy = 'structure';
+      basis.push({
+        signal: 'structure',
+        decisive: true,
+        fact: `${moreGeneral} already parents ${(moreGeneral === a ? fa : fb).childCount} tag(s) while ${moreGeneral === a ? b : a} parents none, and the two share component(s), so the level exists on one side only`,
+      });
+    }
+    const coOccurrenceOnly = !moreGeneral && !sameConcept;
+    return {
+      moreGeneral,
+      decisiveBy,
+      sameConcept,
+      basis,
+      coOccurrenceOnly,
+      directionDecided: Boolean(moreGeneral) || sameConcept,
+      sharedComponents: shared,
+      why: sameConcept
+        ? [
+            `${a} and ${b} are the same concept by the ${decisiveBy} fact above, so this pair is a merge question and not a hierarchy: continuing either one under the other would leave two spellings of one idea in the graph`,
+            'as a cycle it is broken by folding the two names into one, not by choosing which is the parent',
+          ]
+        : coOccurrenceOnly
+          ? [
+              `no fact in the store decides a direction between ${a} and ${b}: their names are unrelated, the fold table does not put them in one group, and the only relation between them is that ${shared.length ? `${shared.length} component(s) carry both` : 'no component carries both'}`,
+              'breaking such a pair in either direction would be arbitrary — this is a decision for a reader of the memories, not a repair the evidence supports',
+            ]
+          : [
+              `${moreGeneral} is the more general of the two, read from the ${decisiveBy} fact above`,
+              `${moreGeneral === a ? b : a} continues under it, which is the direction that does not invert the hierarchy already in the store`,
+            ],
+      perTag: [fa, fb],
+    };
+  }
+
   /** A finding: the facts, the question they raise, and the decisions that answer it. */
   tagFinding(id, kind, question, evidence, options) {
     return { id, kind, question, evidence, options };
@@ -2426,6 +2858,288 @@ export class MemoryLabStore {
       }
     }
 
+    /* 6. cycles — 解环判定 ------------------------------------------------ */
+
+    /* The two shapes are collected in ONE block because they answer one question and a reader
+     * must be able to tell them apart from the finding itself: `stored-cycle` is a defect in
+     * the file, `candidate-mutual` is a decision about evidence. `shape` says which. */
+    if (wants('cycle-candidate')) {
+      /* The stored half reads the DOCUMENT, not the graph: see `storedGraphRelations()` for
+       * the measurement that forced this — the normalizer drops the second edge of a cycle on
+       * the way in, so reading the graph would report nothing exactly when the file is broken. */
+      const relations = this.storedGraphRelations();
+      const cycles = this.storedCycles(relations);
+      const assertions = new Map();
+      for (const component of graph.components) {
+        const state = this.normalizeTagInput(toArray(component.tags), toArray(component.tagPaths));
+        for (const chain of state.tagPaths) {
+          for (let index = 1; index < chain.length; index += 1) {
+            const key = `${chain[index - 1]}\u0000${chain[index]}`;
+            if (!assertions.has(key)) assertions.set(key, new Set());
+            assertions.get(key).add(String(component.slug));
+          }
+        }
+      }
+      const edgeFacts = (parent, child) => {
+        const fromChildren = relations.says(parent, child, 'children');
+        const fromParents = relations.says(parent, child, 'parents');
+        const assertedBy = sortedUnique(Array.from(assertions.get(`${parent}\u0000${child}`) || []));
+        return {
+          parent,
+          child,
+          /** The `children` list of the parent names the child. */
+          saidByParent: fromChildren,
+          /** The `parents` list of the child names the parent — the cycle's other half. */
+          saidByChild: fromParents,
+          /** Both ends agree: a hierarchy edge, and the cycle it sits in is the real defect. */
+          agreed: fromChildren && fromParents,
+          /** Only one end says so: a claim nothing on the other side supports. */
+          conflicting: fromChildren !== fromParents,
+          /**
+           * The components whose tagPaths actually assert this edge. Empty means the edge lives
+           * only in the tags dictionary: no component puts it there, so a rebuild drops it and
+           * the finding says so rather than pretending a decision is needed.
+           */
+          assertedBy,
+        };
+      };
+      const pathOf = (cycle) => {
+        const edges = [];
+        for (let index = 1; index < cycle.length; index += 1) edges.push(edgeFacts(cycle[index - 1], cycle[index]));
+        return edges;
+      };
+      /**
+       * Which edges the normalizer drops, in the order it would see them.
+       *
+       * The normalizer walks the components' tagPaths in order and skips an edge whose reverse
+       * path already exists (`tagPathExists()` -> `cyclic-tag-edge-skipped`). Replaying exactly
+       * that over the RAW relation is what makes the finding name the edge the rebuild really
+       * loses, which is the same edge the review's own `warnings` names. Without it, a
+       * two-node cycle reported the direction the DFS happened to walk first, and a reader
+       * comparing the finding against the warning saw two different edges.
+       */
+      const normalizerDropped = (() => {
+        const built = new Map();
+        const note = (name) => {
+          if (!built.has(name)) built.set(name, { children: [], parents: [] });
+          return built.get(name);
+        };
+        const reaches = (from, target, seen = new Set()) => {
+          if (from === target) return true;
+          if (seen.has(from)) return false;
+          seen.add(from);
+          return (built.get(from)?.children || []).some((child) => reaches(child, target, seen));
+        };
+        const dropped = [];
+        for (const name of relations.names) {
+          const node = note(name);
+          for (const child of relations.edges.get(name)?.fromChildren || []) {
+            note(child);
+            if (reaches(child, name)) {
+              dropped.push({ parent: name, child, rule: 'the child already reaches the parent, so inserting this edge would close a cycle' });
+              continue;
+            }
+            node.children.push(child);
+            note(child).parents.push(name);
+          }
+        }
+        return dropped;
+      })();
+      const droppedEdge = (parent, child) => normalizerDropped.find((entry) => entry.parent === parent && entry.child === child) || null;
+      /**
+       * The cycle to REPORT, and the edge to suggest cutting.
+       *
+       * A two-node ring is the one case where the DFS walk can start on either edge. When one of
+       * the two edges is the one-sided claim, the ring is reported in the direction the normalizer
+       * KEEPS — parent -> child, the hierarchy — so the reader sees the hierarchy and can see the
+       * claim that contradicts it, instead of reading a cycle with no way to tell which edge is
+       * the defect. The suggested cut is then the edge the normalizer itself drops, so the
+       * finding and the review's `cyclic-tag-edge-skipped` warning name the same edge. For a ring
+       * of three or more nodes, the first edge of the walk is suggested and the evidence says the
+       * choice is free.
+       */
+      /**
+       * Which way round to READ a two-node ring, and which edge to suggest cutting.
+       *
+       * `storedCycles()` returns a ring as its NODES in walk order (`['#A','#B']`), so a
+       * two-node ring is the one case where the two readings — `#A -> #B` and `#B -> #A` — are
+       * both true descriptions of the same cycle, and they are not equivalent to a reader. The
+       * reading is chosen by the edge a COMPONENT asserts, because that is the edge a cut can
+       * actually remove: the other edge is a claim that lives only in the tags dictionary and
+       * that the next rebuild drops on its own. When neither or both are asserted, the walk's own
+       * order stands, and the suggested cut falls back to the edge the normalizer drops, so the
+       * finding and the review's `cyclic-tag-edge-skipped` warning name the same edge.
+       *
+       * A ring of three or more nodes has no such ambiguity — every edge can be cut and the
+       * evidence says the choice is free — so its walk order is the order it is reported in.
+       */
+      const orient = (cycle) => {
+        const asserted = (edge) => edge.assertedBy.length > 0;
+        /* A two-node ring is the one case the walk can start either way, and the two readings are
+         * not equivalent to a reader, so it is read from the edge a COMPONENT asserts when there is
+         * one — that is the edge a cut can really remove, and the other edge is a claim the rebuild
+         * drops on its own. A longer ring has no such ambiguity; its walk order stands. */
+        let path = cycle;
+        if (cycle.length === 2) {
+          const [a, b] = cycle;
+          const forward = edgeFacts(a, b);
+          const backward = edgeFacts(b, a);
+          path = asserted(backward) && !asserted(forward) ? [b, a] : [a, b];
+        }
+        const edges = pathOf([...path, path[0]]);
+        const cuttable = edges.filter(asserted);
+        const droppedEdgeFact = edges.map((edge) => droppedEdge(edge.parent, edge.child)).find(Boolean) || null;
+        /* `droppedEdge()` returns the NORMALIZER's record (`{ parent, child, rule }`), not an edge of
+         * this finding. The suggestion has to be the matching EDGE — publishing the record made
+         * `suggestedCut.assertedBy` undefined and threw inside `tagReview` for any ring whose
+         * suggestion came from the normalizer. */
+        const dropped = droppedEdgeFact ? edges.find((edge) => edge.parent === droppedEdgeFact.parent && edge.child === droppedEdgeFact.child) || null : null;
+        /* The suggested cut follows what a caller can actually act on: a component-asserted edge is
+         * one a cut really removes; failing that, the edge the normalizer itself would drop, which
+         * is the one the review's own `cyclic-tag-edge-skipped` warning names, so the suggestion
+         * and the warning agree; and failing that, the first edge of the ring. The rule is the same
+         * for a ring of any length — it used to apply only to two-node rings, which left a
+         * three-node ring suggesting its first edge while the evidence named a different one. */
+        return { path, suggested: cuttable[0] || dropped || edges[0], free: false };
+      };
+      /* One finding per cycle, with every edge of it on the record. A cycle is one object; a
+       * finding per edge would report the same object several times and leave the reader to
+       * rebuild the ring from the pieces. The `options` are the cuts, so the decision is still
+       * one per edge — the reader chooses which edge to cut, which is the judgement being asked
+       * for. */
+      const reported = [];
+      for (const raw of cycles.paths) {
+        const { path, suggested, free } = orient(raw);
+        const edges = pathOf([...path, path[0]]);
+        if (!edges.length) continue;
+        const componentSet = sortedUnique(edges.flatMap((edge) => edge.assertedBy));
+        reported.push({ path, edges, componentSet, suggested: suggested || edges[0], free });
+      }
+      for (const selfEdge of cycles.selfEdges) {
+        const edges = [edgeFacts(selfEdge, selfEdge)];
+        reported.push({ path: [selfEdge], edges, componentSet: sortedUnique(edges.flatMap((edge) => edge.assertedBy)), suggested: edges[0], free: false });
+      }
+      reported.sort((a, b) => compareStrings(a.path.join('\u0000'), b.path.join('\u0000')));
+      for (const entry of reported) {
+        /* The ring as a reader sees it: the path with its first node repeated, so the cycle reads
+         * as closed. `tags` stays the deduplicated list a caller iterates; keeping both means a
+         * reader is never left to infer the closure from a list of names. */
+        const ring = [...entry.path, entry.path[0]];
+        const tagNames = sortedUnique(entry.path);
+        const direction = tagNames.length === 2 ? this.tagDirection(tagNames[0], tagNames[1], (name) => members.get(name) || [], graph.tags) : null;
+        const options = entry.edges.map((edge) => ({ kind: 'cut', parent: edge.parent, child: edge.child }));
+        const conflicting = entry.edges.filter((edge) => edge.conflicting);
+        const normalizerDrop = entry.edges
+          .map((edge) => droppedEdge(edge.parent, edge.child))
+          .filter(Boolean);
+        const why = [
+          `index.json on disk holds the ring ${ring.join(' -> ')}: its last node is its first one again`,
+          conflicting.length
+            ? `one-sided claim(s): ${conflicting
+                .map((edge) => `${edge.parent} -> ${edge.child} is named by ${edge.saidByParent ? `the children list of ${edge.parent} only` : `the parents list of ${edge.child} only`}`)
+                .join('; ')}`
+            : 'every edge of this ring is claimed by both ends, so no edge here is a one-sided claim',
+          normalizerDrop.length
+            ? `the normalizer drops ${normalizerDrop
+                .map((edge) => `${edge.parent} -> ${edge.child} (${edge.rule})`)
+                .join('; ')}, which is what the review's own cyclic-tag-edge-skipped warning names`
+            : 'the normalizer drops no edge of this ring by itself',
+          entry.componentSet.length
+            ? `asserted by component tagPaths: ${entry.componentSet.join(', ')}`
+            : 'no component tagPath asserts any edge of this ring, so it lives only in the tags dictionary and a rebuild drops it',
+          entry.free
+            ? `cutting any ONE of these ${entry.edges.length} edges breaks the cycle; ${entry.suggested.parent} -> ${entry.suggested.child} is the one this review suggests, and the choice between them is free`
+            : entry.suggested.assertedBy.length
+              ? `cutting ${entry.suggested.parent} -> ${entry.suggested.child} breaks the cycle, and it is the edge component tagPaths assert (${entry.suggested.assertedBy.join(', ')}), so it is the one this review suggests`
+              : `cutting ${entry.suggested.parent} -> ${entry.suggested.child} breaks the cycle; no component asserts that edge, so the cut removes the stored claim and a rebuild would have dropped it too`,
+        ].filter(Boolean);
+        /* The free-choice sentence goes on a ring of three or more, where every edge is a real
+         * edge of the ring and removing any one of them breaks it. It is appended AFTER the
+         * suggestion rather than replacing it, so a reader always gets the suggestion too. */
+        if (entry.edges.length > 2) {
+          why.push(`this ring has ${entry.edges.length} edges and cutting any ONE of them breaks the cycle, so the choice between them is free`);
+        }
+        /* The suggested cut travels as the SAME edge object the `edges` list carries, so a caller
+         * never gets a shape that is missing the fields the other edges have. Measured: publishing
+         * the cut decision (`{ kind, parent, child }`) here instead made `suggestedCut.assertedBy`
+         * undefined, and a reader that touched it threw inside `tagReview` itself. */
+        const suggestedCut = entry.edges.find((edge) => edge.parent === entry.suggested.parent && edge.child === entry.suggested.child) || entry.edges[0];
+        findings.push(
+          this.tagFinding(
+            `cycle-candidate:stored-cycle:${ring.join('>')}`,
+            'cycle-candidate',
+            `The tag graph holds the cycle ${ring.join(' -> ')}: which edge should be cut, and why that one?`,
+            {
+              shape: 'stored-cycle',
+              cycle: ring,
+              tags: tagNames,
+              edges: entry.edges,
+              components: entry.componentSet,
+              suggestedCut,
+              normalizerDrops: normalizerDrop.map((edge) => ({ parent: edge.parent, child: edge.child, rule: edge.rule })),
+              direction,
+              why,
+            },
+            options,
+          ),
+        );
+      }
+
+      /* The candidate half: two roots that are each other's candidate parent. The graph is fine
+       * — this is about the EVIDENCE, which is symmetric, so reparenting either one is
+       * arbitrary unless a fact decides. The candidate rule is the false-root rule, so it is
+       * run here rather than reported by shape 1: a review narrowed to this kind has to still
+       * find these, and the two must agree about what a candidate parent is. */
+      for (const pair of this.mutualCandidatePairs(graph, members)) {
+        const [a, b] = pair.pair;
+        const direction = this.tagDirection(a, b, (name) => members.get(name) || [], graph.tags);
+        const options = [];
+        if (direction.sameConcept) {
+          options.push({ kind: 'merge', tags: [b], into: a }, { kind: 'merge', tags: [a], into: b });
+        } else if (direction.moreGeneral) {
+          const subject = direction.moreGeneral === a ? b : a;
+          options.push({ kind: 'reparent', tag: subject, under: direction.moreGeneral });
+          options.push({ kind: 'reparent', tag: direction.moreGeneral, under: subject });
+        }
+        options.push({
+          kind: 'none',
+          note: direction.directionDecided
+            ? 'keep both as roots: a mutual candidate is not by itself a reason to move a tag'
+            : 'report only — the store holds no fact that decides a direction, so a reparent here is not supported by this evidence',
+        });
+        findings.push(
+          this.tagFinding(
+            `cycle-candidate:candidate-mutual:${a}|${b}`,
+            'cycle-candidate',
+            `${a} and ${b} each name the other as a candidate parent: which one, if either, continues under the other?`,
+            {
+              shape: 'candidate-mutual',
+              pair: [a, b],
+              cycle: [a, b, a],
+              tags: [a, b],
+              candidates: [
+                { tag: a, namesAsParent: b, via: pair.viaA },
+                { tag: b, namesAsParent: a, via: pair.viaB },
+              ],
+              components: direction.sharedComponents,
+              direction,
+              /* The evidence a reader needs to tell a DECISION from a DEFECT: nothing is stored
+               * here, the two candidate relations mirror each other, and the direction facts say
+               * whether anything decides between them. */
+              storedEdgesBetween: [relations.says(a, b, 'children') || relations.says(a, b, 'parents'), relations.says(b, a, 'children') || relations.says(b, a, 'parents')],
+              why: [
+                `${a} has no parent in any component tagPath, and its false-root evidence names ${b} as a candidate parent (via ${pair.viaA.join(', ')})`,
+                `${b} has no parent in any component tagPath, and its false-root evidence names ${a} as a candidate parent (via ${pair.viaB.join(', ')})`,
+                'the two relations mirror each other, so this is a cycle in the candidate EVIDENCE: the stored graph holds no cycle, and no parent edge between these two is on disk',
+                ...direction.why,
+              ],
+            },
+            options,
+          ),
+        );
+      }
+    }
+
     /* the window ----------------------------------------------------------- */
 
     const limit = clampInt(options && options.limit, DEFAULT_TAG_FINDING_LIMIT, 1, MAX_TAG_FINDING_LIMIT);
@@ -2749,6 +3463,93 @@ export class MemoryLabStore {
         continue;
       }
 
+      if (kind === 'cut') {
+        /**
+         * Break a cycle by removing ONE parent -> child edge from the component tagPaths that
+         * assert it. 解环判定 — and the honest reason it is its own decision rather than a
+         * `reparent`, which is NOT that a reparent cannot clear a ring. Measured in the store
+         * gate, a reparent inside a cycle does clear it: moving `#cycA` under its own child
+         * rewrites the chains, and the rebuild derives a graph in which one of the two directions
+         * must be refused. What it cannot do is say so. The edge goes as a side effect of
+         * normalization, the receipt records that a component moved, and the judgement's question
+         * — which edge was broken, and why that one — is answered nowhere. A `cut` answers it: the
+         * edge is named, the component that asserted it is named, and the change is reversible
+         * through the same undo every decision carries.
+         *
+         * The edge is removed from the COMPONENTS, not from the tags dictionary, because the graph
+         * is rebuilt from the components on every read: a tags-only edit would be gone by the next
+         * review, and an edge no component asserts is dropped by a rebuild anyway.
+         *
+         * Fail-closed on everything: both tags must be nodes, they must differ, and the edge must
+         * be one the file on disk actually claims. A cut of an edge that does not exist would
+         * report a repair it never made — the failure mode this store's decision model exists to
+         * prevent.
+         */
+        const parent = requireTag(decision.parent, 'parent');
+        const child = requireTag(decision.child, 'child');
+        if (parent === child) throw new MemoryLabStoreError('TAG_CYCLE', `A tag cannot be its own parent: ${parent}`, { parent, child });
+        const relations = this.storedGraphRelations();
+        if (!relations.says(parent, child, 'children') && !relations.says(parent, child, 'parents')) {
+          throw new MemoryLabStoreError('NOT_FOUND', `The index does not hold the edge ${parent} -> ${child}, so there is nothing to cut.`, {
+            field: 'parent',
+            parent,
+            child,
+            action: 'cut removes an edge the stored graph claims; read the review again for the edges of the cycle',
+          });
+        }
+        const affected = [];
+        const removedFrom = [];
+        for (const component of components) {
+          const state = this.normalizeTagInput(toArray(component.tags), toArray(component.tagPaths));
+          if (!state.tags.includes(child) && !state.tagPaths.some((chain) => chain.includes(child))) continue;
+          /* Remove the edge by taking the PARENT node out of every chain in which it stands
+           * directly before the child. The chain's other edges are kept, so cutting one edge of a
+           * longer cycle does not take the rest of the hierarchy with it.
+           *
+           * WHY NO GUARD IS NEEDED FOR THE PARENT'S DECLARATION, because this was written with one
+           * and measurement disproved it. A cut cannot silently undeclare the parent tag, and the
+           * reason is structural: `normalizeTagInput()` materialises a single-node path for EVERY
+           * node of every chain, so `#parent`'s own `[#parent]` path is part of the state this loop
+           * walks — and it carries no edge, so the cut never removes it. The declaration therefore
+           * survives every cut, of every edge, in every component. A guard that re-declared the
+           * parent was built, measured (its condition was false on both fixtures that were supposed
+           * to reach it) and deleted: an assertion that cannot fail is not an assertion. */
+          const paths = [];
+          const dropped = [];
+          for (const chain of state.tagPaths) {
+            const mapped = [];
+            for (let index = 0; index < chain.length; index += 1) {
+              if (chain[index] === parent && chain[index + 1] === child) {
+                dropped.push(chain.join(' > '));
+                continue;
+              }
+              mapped.push(chain[index]);
+            }
+            if (mapped.length) paths.push(mapped);
+          }
+          if (!dropped.length) continue;
+          writeTags(component, state.tags, paths);
+          removedFrom.push({ slug: String(component.slug), chain: sortedUnique(dropped) });
+          affected.push(String(component.slug));
+        }
+        if (!affected.length) {
+          warnings.push(
+            `cut:${parent}->${child}: the stored graph claims this edge but no component tagPath does, so no component was rewritten; the edge is gone from the stored graph all the same, and a rebuild would have dropped it because the components are what the graph is built from`,
+          );
+          applied.push({ kind, parent, child, affected: [], assertedBy: [], storedOnly: true });
+          continue;
+        }
+        applied.push({
+          kind,
+          parent,
+          child,
+          removedFrom,
+          assertedBy: affected.slice(),
+          storedOnly: false,
+        });
+        continue;
+      }
+
       // unfold: take a merge's fold link back out of the fold table.
       const named = name(decision.canonical);
       const canonical = resolveNode(named);
@@ -2774,7 +3575,11 @@ export class MemoryLabStore {
       );
     }
 
-    const changed = applied.some((entry) => entry.affected.length > 0 || entry.kind === 'unfold');
+    /* `storedOnly` counts as a change even though no component was rewritten: the edge is gone
+     * from the stored graph, and the write is what persists the graph the normalization builds
+     * from the components. Reporting `changed: false` there would tell the caller the decision
+     * did nothing while the review stops reporting the cycle. */
+    const changed = applied.some((entry) => (entry.affected || []).length > 0 || entry.kind === 'unfold' || entry.storedOnly === true);
     if (!applied.length) {
       return {
         ok: true,
@@ -2798,6 +3603,25 @@ export class MemoryLabStore {
     });
     warnings.push(...normalizeWarnings);
     const affectedBefore = Array.from(before.entries()).map(([slug, state]) => ({ slug, before: state }));
+    /* `changed` says whether the INDEX really differs, and it is measured, not inferred.
+     *
+     * It used to be computed from `applied` alone: a decision that rewrote a component counted
+     * as a change even when the component's tags and tagPaths came back identical, and the write
+     * that followed was byte-identical. A caller reads `changed: true` and believes the store
+     * moved; a review then reports the same graph and the receipt looks wrong. Comparing the two
+     * documents is the fact itself, so both the field and the policy line are built from it.
+     *
+     * The comparison is over the whole persisted document, `relationshipVersion` INCLUDED, and
+     * that field is the one that makes it correct: the index this call started from is the one
+     * `openForWrite()` returned, which is the file AFTER normalization — so a graph that is
+     * cyclic on disk and acyclic once normalized are the same in-memory object. Measured: undoing
+     * a cut on a cyclic store restores the component exactly and re-derives the cycle, the version
+     * moves, and a comparison without this field reported `changed: false` for a write that really
+     * did put the cycle back. */
+    const measured = this.indexDocument(normalized);
+    const indexChanged =
+      JSON.stringify({ ...this.indexDocument(index), relationshipVersion: String(index.relationshipVersion || '') }) !==
+      JSON.stringify({ ...measured, relationshipVersion: String(normalized.relationshipVersion || '') });
 
     if (dryRun) {
       return {
@@ -2805,14 +3629,14 @@ export class MemoryLabStore {
         action: TAG_EDIT_ACTION,
         applied,
         skipped,
-        changed,
+        changed: indexChanged,
         dryRun: true,
         relationshipVersionBefore: String(index.relationshipVersion || ''),
         relationshipVersionAfter: String(normalized.relationshipVersion || ''),
         affected: affectedBefore,
         undo: this.tagUndo(before, applied),
         warnings: sortedUnique(warnings),
-        receipt: { operation: 'tag-apply', completed: true, dryRun: true, changed, decisions: applied.length, verifiedAt: isoNow() },
+        receipt: { operation: 'tag-apply', completed: true, dryRun: true, changed: indexChanged, decisions: applied.length, verifiedAt: isoNow() },
       };
     }
 
@@ -2840,7 +3664,7 @@ export class MemoryLabStore {
       action: TAG_EDIT_ACTION,
       applied,
       skipped,
-      changed,
+      changed: indexChanged,
       dryRun: false,
       relationshipVersionBefore: String(index.relationshipVersion || ''),
       relationshipVersionAfter: String(normalized.relationshipVersion || ''),
@@ -2853,7 +3677,7 @@ export class MemoryLabStore {
       receipt: {
         operation: 'tag-apply',
         completed: true,
-        changed,
+        changed: indexChanged,
         decisions: applied.length,
         indexPath: this.indexPath,
         indexUpdatedAt: normalized.updatedAt,
