@@ -596,6 +596,8 @@ public static class NmAgentJob
   public const int JobObjectBasicProcessIdList = 3;
   public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
   public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+  public const uint PROCESS_SET_QUOTA = 0x0100;
+  public const uint PROCESS_TERMINATE = 0x0001;
 
   public static IntPtr CreateKillOnClose(out int error)
   {
@@ -705,6 +707,62 @@ public static class NmAgentJob
     bool terminated = TerminateJobObject(job, 1);
     error = Marshal.GetLastWin32Error();
     return terminated;
+  }
+
+  /**
+   * Membership as a THREE-VALUED answer, because "false" alone cannot be told from a failure.
+   *
+   * The shipped read was PidInJob, which answers "false" both when the process is genuinely
+   * not a member AND when OpenProcess refused the handle - so a read that never happened was
+   * reported as the fact "this process is not in the job". Measured on this station: a launched
+   * application was reported in_job false while the agent that launched it reported
+   * job_in_job true, and nothing in the receipt said which of the two readings it was.
+   *
+   *   1 the process is a member of this job
+   *   0 the handle opened and the process is NOT a member
+   *  -1 the handle could not be opened, and the error code says why
+   */
+  public static int PidMembership(IntPtr job, int pid, out int error)
+  {
+    error = 0;
+    IntPtr handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+    if (handle == IntPtr.Zero) { error = Marshal.GetLastWin32Error(); return -1; }
+    try
+    {
+      bool result = false;
+      if (!IsProcessInJob(handle, job, out result)) { error = Marshal.GetLastWin32Error(); return -1; }
+      return result ? 1 : 0;
+    }
+    finally { CloseHandle(handle); }
+  }
+
+  /**
+   * Put a pid in this job AFTER it was created, and answer what happened.
+   *
+   * Inheritance is the mechanism that is supposed to make this unnecessary, and it is not
+   * sufficient: a launch that hands its work to a process this agent did not create - which is
+   * what happens when the target is a packaged application - arrives OUTSIDE the job, and a
+   * process outside the job is not killed by KILL_ON_JOB_CLOSE. Holding it is therefore done in
+   * two steps and the second one is measured, never assumed.
+   *
+   * AssignProcessToJobObject needs PROCESS_SET_QUOTA and PROCESS_TERMINATE, which is why this
+   * opens its own handle rather than reusing a query-only one. A refusal (typically
+   * ERROR_ACCESS_DENIED, 5, when the process already belongs to a job this one cannot nest
+   * with) is returned as a failure with its error code, and the caller reports the launch as
+   * NOT held rather than silently absent.
+   */
+  public static bool AssignPid(IntPtr job, int pid, out int error)
+  {
+    error = 0;
+    IntPtr handle = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+    if (handle == IntPtr.Zero) { error = Marshal.GetLastWin32Error(); return false; }
+    try
+    {
+      bool assigned = AssignProcessToJobObject(job, handle);
+      error = Marshal.GetLastWin32Error();
+      return assigned;
+    }
+    finally { CloseHandle(handle); }
   }
 
   public static bool Release(IntPtr job)
@@ -1252,6 +1310,41 @@ function Get-NmHostedPids {
   return $listed
 }
 
+# The processes that OWN A WINDOW ON THIS AGENT'S OWN DESKTOP and are not held by the job.
+#
+# This is the second half of the ownership question, and it exists because inheritance is not
+# the whole story. A launch whose target hands its work to a process this agent did not create
+# - a packaged application is the measured case - leaves a process ON this desktop that the
+# job does not hold, so 'hosted' (job members) misses it and the teardown would report a clean
+# end while something still occupies the desktop. A window is bound to its desktop, so every
+# pid listed here is a process that is really on this agent's desktop; the read is by pid and
+# never by name, and nothing here terminates anything.
+function Get-NmUnheldWindowPids {
+  $listed = @()
+  $seen = @{}
+  foreach ($fact in [NmAgentWindow]::TopLevelWindows()) {
+    $ownerPid = [int]$fact.ProcessId
+    if ($ownerPid -le 0 -or $ownerPid -eq $PID -or $seen.ContainsKey($ownerPid)) { continue }
+    $seen[$ownerPid] = $true
+    $membership = -1
+    if ($script:nmJob -ne [IntPtr]::Zero) {
+      $membershipError = 0
+      $membership = [NmAgentJob]::PidMembership($script:nmJob, $ownerPid, [ref]$membershipError)
+    }
+    if ($membership -eq 1) { continue }
+    $listed += @{
+      pid = $ownerPid
+      held = $false
+      membership = [int]$membership
+      title = [string]$fact.Title
+      class_name = [string]$fact.ClassName
+      start_time_utc = (Get-NmStartTimeIso -ProcessId $ownerPid)
+      start_time_ticks = [string][NmProcessFacts]::StartTimeTicks($ownerPid)
+    }
+  }
+  return $listed
+}
+
 function Invoke-NmAgentRequest {
   param([string]$Line)
   $request = $null
@@ -1278,6 +1371,11 @@ function Invoke-NmAgentRequest {
       job_kill_on_close = (($script:nmJobLimit -band 0x2000) -ne 0)
       job_handle = ('0x' + $script:nmJob.ToInt64().ToString('x'))
       hosted = @(Get-NmHostedPids)
+      # Every process on THIS desktop that owns a window and is not a job member. It is reported
+      # by the state read, which the teardown asks BEFORE the exit, so a launch that the job does
+      # not hold is inside the question the teardown asks rather than outside it.
+      unheld_window_pids = @(Get-NmUnheldWindowPids)
+      launched_this_agent = @($script:nmLaunched)
       token_match = $true
       shell = 'Windows PowerShell 5.1'
       types = @('NmAgentDesktop', 'NmAgentJob', 'NmAgentProcess', 'NmAgentWindow', 'NmProcessFacts')
@@ -1426,6 +1524,10 @@ function Invoke-NmAgentRequest {
   if ($op -eq 'launch') {
     $commandLine = [string]$request.command_line
     $errorCode = 0
+    # WHEN THIS LAUNCH BEGAN, so a pid that answered can be told from a process this launch made.
+    # The boundary below is 5 seconds in FILETIME ticks (10^7 per second), which is far longer than
+    # a create-and-answer round trip and far shorter than any plausible pre-existing process.
+    $launchMarkTicks = [long][DateTime]::UtcNow.ToFileTimeUtc()
     $started = [NmAgentProcess]::LaunchOn($DesktopName, $commandLine, [ref]$errorCode)
     if ($started -eq 0) {
       return (New-NmLine -Id $id -Ok $false -Fields @{
@@ -1435,13 +1537,74 @@ function Invoke-NmAgentRequest {
         desktop = $DesktopName
       })
     }
+    # THE MEMBERSHIP IS MEASURED AFTER THE LAUNCH, IN THREE STEPS, AND EACH ONE IS REPORTED.
+    #
+    # Inheritance is the mechanism that is supposed to make this unnecessary - a child of a job
+    # member is in the job - and it is not sufficient. Measured on this station: an agent that
+    # reported job_in_job: true launched notepad.exe and the child came back NOT a member,
+    # while the same agent launching a plain Win32 program produced a member. A process outside
+    # the job is not killed by KILL_ON_JOB_CLOSE, so the desktop it sits on outlives the agent
+    # that made it, invisibly.
+    #
+    # So: read membership as a three-valued answer (a failed OpenProcess is NOT "not a member"),
+    # cross-check it against the job's own member list, and if the child is not a member PUT IT
+    # THERE and read again. 'held' is the answer after all of that; a launch that could not be
+    # held says so, with the reason, and the caller reports it as unowned rather than absent.
     $startTicks = 0
-    $inJob = $false
     try { $startTicks = [NmProcessFacts]::StartTimeTicks([int]$started) } catch { }
+    $membership = -1
+    $membershipError = 0
+    $memberListed = $false
+    $maybe = $true
     if ($script:nmJob -ne [IntPtr]::Zero) {
-      try { $inJob = [NmAgentJob]::PidInJob([int]$started, $script:nmJob) } catch { }
+      try { $membership = [NmAgentJob]::PidMembership($script:nmJob, [int]$started, [ref]$membershipError) } catch { $membership = -1 }
+    } else {
+      $maybe = $false
     }
-    $script:nmLaunched += @{ pid = [int]$started; start_time_ticks = [string]$startTicks; command_line = $commandLine }
+    $membershipBefore = [int]$membership
+    $inherited = ($membership -eq 1)
+    # OURS, OR MERELY THE PID THAT ANSWERED.
+    #
+    # A launch that hands its work to the shell's activation host can answer with a process this
+    # launch did not create - including one that was already running. Assigning THAT to the job
+    # would claim, and later kill, something that was never this route's. So a process whose
+    # creation time predates the launch is reported as NOT ours: it is checked by the teardown and
+    # named as a survivor, but it is never adopted.
+    $ours = $true
+    if ($startTicks -gt 0) {
+      if ([long]$startTicks -lt ([long]$launchMarkTicks - 50000000)) { $ours = $false }
+    }
+    $assigned = $false
+    $assignError = 0
+    if (-not $inherited -and $maybe -and $ours) {
+      try { $assigned = [NmAgentJob]::AssignPid($script:nmJob, [int]$started, [ref]$assignError) } catch { $assigned = $false }
+      if ($assigned) {
+        $membershipError = 0
+        try { $membership = [NmAgentJob]::PidMembership($script:nmJob, [int]$started, [ref]$membershipError) } catch { $membership = -1 }
+      }
+    }
+    if ($maybe) {
+      $listError = 0
+      $assignedCount = 0
+      # @(...) on purpose: PowerShell unwraps a one-element array returned from a method into a
+      # scalar, and '-contains' against a scalar is a different question from '-contains' against
+      # the list the kernel answered with.
+      $members = @()
+      try { $members = @([NmAgentJob]::MemberPids($script:nmJob, [ref]$listError, [ref]$assignedCount)) } catch { $members = @() }
+      $memberListed = ($members -contains [int]$started)
+    }
+    $held = ($membership -eq 1)
+    # A second, independent read: a process on THIS desktop that is not held. It catches a target
+    # that handed its work to a process this agent never created, which no membership read of the
+    # created pid can see.
+    $unheld = @()
+    try { $unheld = @(Get-NmUnheldWindowPids) } catch { $unheld = @() }
+    $unheldPids = @($unheld | ForEach-Object { [int]$_.pid })
+    # No ternary: this payload runs under Windows PowerShell 5.1, which has no '? :' operator.
+    $ownership = 'unowned'
+    if ($held) {
+      if ($inherited) { $ownership = 'inherited' } else { $ownership = 'assigned' }
+    }    $script:nmLaunched += @{ pid = [int]$started; start_time_ticks = [string]$startTicks; command_line = $commandLine; held = [bool]$held; ownership = $ownership }
     Write-NmLedger -Entry @{
       kind = 'hosted'
       at = [DateTime]::UtcNow.ToString('o')
@@ -1454,7 +1617,8 @@ function Invoke-NmAgentRequest {
       # measurement came back "pid reuse" for its own processes because of exactly this, and the
       # reaper then refused to terminate anything.
       start_time_ticks = [string]$startTicks
-      in_job = $inJob
+      in_job = [bool]$held
+      ownership = $ownership
       agent_pid = $PID
       command_line = $commandLine
     }
@@ -1462,7 +1626,22 @@ function Invoke-NmAgentRequest {
       pid = [int]$started
       start_time_utc = (Get-NmStartTimeIso -ProcessId ([int]$started))
       start_time_ticks = [string]$startTicks
-      in_job = [bool]$inJob
+      in_job = [bool]$held
+      held = [bool]$held
+      ownership = $ownership
+      inherited = [bool]$inherited
+      assigned_after_launch = [bool]$assigned
+      assign_error = [int]$assignError
+      membership_before = [int]$membershipBefore
+      membership_error = [int]$membershipError
+      created_by_this_launch = [bool]$ours
+      started_before_this_launch = [bool](-not $ours)
+      launch_mark_ticks = [string]$launchMarkTicks
+      member_listed = [bool]$memberListed
+      job_present = [bool]$maybe
+      job_in_job = [bool]$script:nmJobInJob
+      unheld_window_pids = @($unheld)
+      unheld_pids = @($unheldPids)
       desktop_requested = $DesktopName
       command_line = $commandLine
     })

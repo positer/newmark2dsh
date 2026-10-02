@@ -121,31 +121,106 @@ export function toRequestMessages(messages, model) {
  * wired up and could never once have worked.
  *
  * The translation belongs here because this module is the seam: it is the only place that
- * knows DSH's wire shape and the loop's `call.arguments` contract at the same time. The loop
- * itself is transport-free by design and must not learn about JSON text.
+ * knows DSH's wire shape and the loop's `call.arguments` contract at the same time.
+ *
+ * ## WHERE IT IS APPLIED, which is the other half of the same fact
+ *
+ * It is applied **at the tool boundary** (`component.js` sets `prepareArguments` on every tool
+ * it offers a run), and deliberately NOT to the block the loop keeps in its history — because
+ * the same block is sent back to the provider on the next turn, and THERE DSH's published type
+ * is `ToolCallBlock.arguments: string`. The DeepSeek Messages adapter reads it with
+ * `JSON.parse(raw)` (`dsh-llm-deepseek/lib/index.js`, `toolInput`); given an object that parse
+ * fails and the argument set is silently replaced with `{}`, so a model would be shown its own
+ * previous call as having had no arguments at all. Normalising in place destroyed the echo;
+ * normalising at the boundary does not, and `arguments` stays the text the type declares.
  *
  * Text that is not a JSON object is reported as `{}` rather than thrown: an empty argument
  * set reaches the tool, the tool's own validation answers with its own message, and that
- * message is a better failure than a seam that dies before the tool is ever asked.
+ * message is a better failure than a seam that dies before the tool is ever asked. That is the
+ * LENIENT reading. `toolCallArgumentsChecked` below is the same parse with the failure KEPT,
+ * which is what a run needs when the provider itself emitted unusable JSON — see its own note.
  */
 export function toolCallArguments(raw) {
-  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) return raw;
-  if (typeof raw !== 'string') return {};
-  const text = raw.trim();
-  if (text === '') return {};
-  try {
-    const parsed = JSON.parse(text);
-    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
+  return toolCallArgumentsChecked(raw).value;
 }
 
-/** One `tool-call` block with its arguments normalised to the object the registry takes. */
-function normaliseToolCall(block) {
-  if (block === null || typeof block !== 'object' || block.type !== 'tool-call') return block;
-  const args = toolCallArguments(block.arguments);
-  return block.arguments === args ? block : { ...block, arguments: args };
+/**
+ * The same parse, answering with what went wrong instead of erasing it.
+ *
+ * WHY THE FAILURE HAS TO SURVIVE. The DeepSeek Messages adapter validates the tool-call
+ * arguments the provider streamed, at `message_stop`, and throws
+ * `DeepSeek Messages stream: tool input is invalid JSON (MALFORMED_RESPONSE)`
+ * (`dsh-llm-deepseek/lib/index.js:1983-1992`). That is a real, measured outcome of a run whose
+ * model degenerated after several failed tool calls. Two things follow, and both are this
+ * function's business:
+ *
+ *   1. a call whose arguments cannot be parsed must reach the model as a LEGIBLE tool result —
+ *      "your call's arguments were not valid JSON, here is an excerpt, re-issue it" — rather
+ *      than as a run that dies with a transport error;
+ *   2. `ok` distinguishes "there were no arguments" (an empty object, or valid `null`) from
+ *      "the arguments were not readable", so the component never silently calls a tool with
+ *      `{}` because the text was garbage.
+ *
+ * Valid JSON that is simply not an object (`null`, a number, an array) keeps the LENIENT
+ * reading: `{ ok: true, value: {} }`. That is deliberate — it is what this seam did before, and
+ * narrowing it to an error would turn a working no-argument call into a failure.
+ */
+export function toolCallArgumentsChecked(raw) {
+  if (raw === undefined || raw === null) return { ok: true, value: {}, reason: '' };
+  if (typeof raw === 'object') {
+    return Array.isArray(raw) ? { ok: true, value: {}, reason: '' } : { ok: true, value: raw, reason: '' };
+  }
+  if (typeof raw !== 'string') {
+    return { ok: false, value: {}, reason: `the arguments were a ${typeof raw}, not the JSON text a tool call carries` };
+  }
+  const text = raw.trim();
+  if (text === '') return { ok: true, value: {}, reason: '' };
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return {
+      ok: false,
+      value: {},
+      reason: `the tool call's arguments were not valid JSON (${error?.message ?? 'parse failed'}): ${excerpt(text)}`,
+    };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: true, value: {}, reason: '' };
+  return { ok: true, value: parsed, reason: '' };
+}
+
+/** A bounded, single-line excerpt of text a model may have to act on. */
+export function excerpt(text, limit = 200) {
+  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return flat.length > limit ? `${flat.slice(0, limit)}…(+${flat.length - limit} chars)` : flat;
+}
+
+/**
+ * A stable key for one tool call: the tool's name and its arguments, canonicalised.
+ *
+ * Canonicalisation is the point, and it is why this lives beside `toolCallArguments` rather than
+ * in the loop: the SAME call can be spelled `'{"component":"X"}'` and `'{"component": "X"}'`,
+ * and a retry bound that treated those as different calls would not bound anything. `arguments`
+ * is text on the wire and an object at the registry, so both spellings are normalised through
+ * the same parse before they are compared.
+ */
+export function toolCallKey(call) {
+  const name = String(call?.name ?? '');
+  let value;
+  try {
+    value = stableJson(toolCallArguments(call?.arguments));
+  } catch {
+    return `${name}\u0000<unreadable>`;
+  }
+  return `${name}\u0000${value}`;
+}
+
+/** JSON with object keys in a fixed order, so two equal values have one spelling. */
+export function stableJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map((entry) => stableJson(entry)).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
 }
 
 /**
@@ -156,43 +231,89 @@ function normaliseToolCall(block) {
  * from the deltas. The deltas are still accumulated, because a `tool-call` block that arrives
  * only as `tool-call-delta` chunks would otherwise be lost, and losing a tool call silently
  * turns a run that needed evidence into a run that answered without it.
+ *
+ * THE BLOCKS ARE KEPT AS THEY ARRIVED, and that is a fix rather than an omission. They used to
+ * be normalised here — the arguments turned into an object for the registry — and the same
+ * object was then pushed into the loop's history and sent back to the provider on the next
+ * turn, where DSH's `ToolCallBlock.arguments` is a STRING and the DeepSeek adapter reads it
+ * with `JSON.parse`. The model was therefore shown every one of its own earlier calls with no
+ * arguments. The registry gets its object at the tool boundary now (`prepareArguments`), and
+ * the durable block keeps the shape the published type declares.
+ *
+ * ## A stream that fails AFTER it delivered content
+ *
+ * `for await` over an adapter that throws loses every chunk already pulled — and the DeepSeek
+ * Messages adapter throws at `message_stop`, after all `block-end` chunks have been yielded, to
+ * report tool arguments the provider streamed as invalid JSON
+ * (`dsh-llm-deepseek/lib/index.js:1983-1992`). Reading that as "the turn produced nothing"
+ * turned a completed completion into `run_failed` with a transport error. So the throw is held
+ * rather than propagated, and then:
+ *
+ *   - **nothing usable arrived** (no block-end, no recovered call) — rethrow, and the run fails
+ *     honestly with the provider's own message;
+ *   - **an abort** — rethrow, so cancellation stays cancellation;
+ *   - **a tool call did arrive** — the turn continues with `stopReason: 'tool-calls'`. The
+ *     arguments are whatever text arrived, and the tool boundary's checked parse turns unusable
+ *     JSON into a legible tool result for the model. The turn's text, if any, is partial; the
+ *     answer that matters comes from a later, complete turn, which is why this is safe.
  */
-export async function collectAssistant(stream, model, onPartial) {
+export async function collectAssistant(stream, model, onPartial, options = {}) {
   const blocks = [];
   const toolCalls = new Map();
   let usage;
   let finish;
-  for await (const chunk of stream) {
-    switch (chunk?.type) {
-      case 'block-end':
-        if (Number.isInteger(chunk.index)) blocks[chunk.index] = normaliseToolCall(chunk.block);
-        break;
-      case 'tool-call-delta': {
-        const current = toolCalls.get(chunk.id) || { type: 'tool-call', id: chunk.id, name: chunk.name ?? '', arguments: '' };
-        if (chunk.name) current.name = chunk.name;
-        current.arguments += chunk.argumentsDelta ?? '';
-        toolCalls.set(chunk.id, current);
-        break;
+  let streamError = null;
+  try {
+    for await (const chunk of stream) {
+      switch (chunk?.type) {
+        case 'block-end':
+          if (Number.isInteger(chunk.index)) blocks[chunk.index] = chunk.block;
+          break;
+        case 'tool-call-delta': {
+          const current = toolCalls.get(chunk.id) || { type: 'tool-call', id: chunk.id, name: chunk.name ?? '', arguments: '' };
+          if (chunk.name) current.name = chunk.name;
+          current.arguments += chunk.argumentsDelta ?? '';
+          toolCalls.set(chunk.id, current);
+          break;
+        }
+        case 'usage':
+          usage = chunk.usage;
+          break;
+        case 'finish':
+          finish = chunk.reason;
+          break;
+        default:
+          break;
       }
-      case 'usage':
-        usage = chunk.usage;
-        break;
-      case 'finish':
-        finish = chunk.reason;
-        break;
-      default:
-        break;
+      if (typeof onPartial === 'function') onPartial(chunk);
     }
-    if (typeof onPartial === 'function') onPartial(chunk);
+  } catch (error) {
+    if (options.signal?.aborted || error?.name === 'AbortError') throw error;
+    streamError = error;
   }
 
   const content = blocks.filter(Boolean);
   if (content.length === 0 && toolCalls.size > 0) {
     // No completed blocks arrived, so the deltas are all there is. Recovered rather than
     // dropped: the alternative is a run that quietly stops calling tools. The recovered
-    // arguments are text by construction, so they cross the same normalisation the
-    // completed blocks do.
-    content.push(...[...toolCalls.values()].map(normaliseToolCall));
+    // arguments are text by construction — the shape the block keeps.
+    content.push(...toolCalls.values());
+  }
+
+  if (streamError !== null) {
+    const calls = content.filter((block) => block?.type === 'tool-call');
+    if (calls.length === 0) throw streamError;
+    return {
+      role: 'assistant',
+      content,
+      usage,
+      stopReason: 'tool-calls',
+      diagnostic: `the model stream failed after delivering ${calls.length} tool call(s); the turn was kept so the failure reaches the model as a tool result: ${failureText({ message: streamError?.message ?? String(streamError), code: streamError?.code })}`,
+      failureCode: String(streamError?.code ?? ''),
+      recoveredFrom: 'stream-failed-after-content',
+      model,
+      timestamp: Date.now(),
+    };
   }
 
   const kind = String(finish?.kind ?? 'stop');
@@ -280,7 +401,7 @@ export function createLlmStreamFn(llm, selection, options = {}) {
     return {
       async *[Symbol.asyncIterator]() {
         try {
-          const message = await collectAssistant(stream, { provider, model });
+          const message = await collectAssistant(stream, { provider, model }, undefined, { signal: ctx.signal });
           // The loop's seam contract: a finished turn is a `done` event, a failed one is an
           // `error` event carrying the same assistant-message shape. Both are yielded rather
           // than thrown, so a provider failure becomes a classified run failure instead of an

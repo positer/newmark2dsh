@@ -3616,16 +3616,52 @@ function hiddenRouteFor(ownerId) {
 /**
  * The route this call must be relayed through, or null.
  *
- * Two independent conditions, and both are required: a route armed for this owner, and that
- * owner still holding a VIRTUAL lease. A lease that has been released cannot route - the
- * desktop it named is being torn down - so a leaked route cannot outlive its lease.
+ * THE LEASE IS THE AUTHORITY, AND THE OWNER ID IS ONLY A NAME FOR IT.
+ *
+ * The shipped version of this function asked one question - is there a route filed under the
+ * owner id THIS CALL declared - and that question is not the same as "is a hidden desktop armed
+ * for this session". Measured in the running application (2.0.11, live `computer_use`):
+ * `takeover_start` armed a desktop and reported `delivery: "hidden-desktop-agent"`, and the
+ * next `app_list` answered `ok: true, scope: "virtual-includes-occluded"` with 94 windows of the
+ * INTERACTIVE desktop and the agent's `requests_served` unchanged. The lease was held and
+ * virtual - the interactive branch's own `scope` field proves that, because it is derived from
+ * `activeLease()` - so the route existed and was simply not found under the name the call used.
+ *
+ * The caller could not have known the name mattered: `owner_id` is optional, the guide mentions
+ * it only in the sentence about `takeover_stop`, and `component.js` fills in `'dsh'` for every
+ * call that omits it. A caller that names an owner once, at the arm, therefore gets the
+ * interactive desktop for every later action while the receipt says a hidden desktop is armed.
+ *
+ * So the resolution is: the route this process has armed, which is the lease holder's, because
+ * the lease is exclusive and there is at most one armed route at a time. The declared owner is
+ * still consulted first, so a matching call is unchanged; when it does not match, the call is
+ * routed to the armed desktop AND the substitution is recorded on the route, where
+ * `hiddenHeader` reports it as `owner_id_declared` / `owner_id_routed` /
+ * `owner_resolved_from_lease`. Two independent conditions remain, and both are required: a
+ * route armed, and that route's owner still holding a VIRTUAL lease. A lease that has been
+ * released cannot route - the desktop it named is being torn down - so a leaked route cannot
+ * outlive its lease.
  */
 function hiddenRouteActive(options) {
-  const route = hiddenRouteFor(options && options.ownerId);
-  if (!route || route.closed) return null;
+  const declaredOwner = String((options && options.ownerId) || '');
   const active = activeLease();
-  if (!active || active.owner_id !== route.ownerId || active.mouse_mode !== 'virtual') return null;
-  return route;
+  if (!active || active.mouse_mode !== 'virtual') return null;
+  const declared = declaredOwner ? hiddenRouteFor(declaredOwner) : null;
+  if (declared && !declared.closed && declared.ownerId === active.owner_id) {
+    declared.resolvedFor = { declared: declaredOwner, ownerId: declared.ownerId, fromLease: false };
+    return declared;
+  }
+  /*
+   * `screen_capture` is dispatched with `skipLease` and its own owner id, and it must stay on the
+   * route it always had: it is documented as never acquiring, mutating or being affected by the
+   * lease, so a read that a lease holder happens to have armed a hidden desktop must not move it
+   * onto that desktop. The fallback below is for the lease holder's own actions.
+   */
+  if (options && options.skipLease === true) return null;
+  const held = hiddenRouteFor(active.owner_id);
+  if (!held || held.closed) return null;
+  held.resolvedFor = { declared: declaredOwner || null, ownerId: held.ownerId, fromLease: declaredOwner !== held.ownerId };
+  return held;
 }
 
 /** A fresh desktop name per arm. The agent refuses to adopt a desktop that already exists. */
@@ -3791,6 +3827,7 @@ async function hiddenResolve(route, options = {}) {
  * without knowing which code path produced the answer.
  */
 function hiddenHeader(route, header, extra = {}) {
+  const resolved = route.resolvedFor && typeof route.resolvedFor === 'object' ? route.resolvedFor : null;
   return {
     ...header,
     mouse_mode: 'virtual',
@@ -3803,6 +3840,19 @@ function hiddenHeader(route, header, extra = {}) {
       transport: 'json-lines over the agent named pipe, relayed through the windows lane',
       cross_desktop_reach_used: false,
     },
+    /*
+     * WHICH OWNER THIS CALL NAMED, AND WHICH OWNER'S DESKTOP IT WENT TO.
+     *
+     * These two fields exist because the live defect was invisible without them. The route used
+     * to be found ONLY under the owner id the call declared, so a call that named an owner the
+     * arm had not used fell through to the interactive branch and answered `ok: true` with this
+     * desktop's window list - a plausible answer to a question nobody asked. The receipt now
+     * states the owner the call declared and the owner whose desktop served it, so a
+     * substitution is a fact in the receipt rather than something a reader has to infer.
+     */
+    owner_id_declared: resolved ? resolved.declared : null,
+    owner_id_routed: resolved ? resolved.ownerId : route.ownerId,
+    owner_resolved_from_lease: resolved ? resolved.fromLease === true : false,
     physical_delivery_used: false,
     system_cursor_moved: false,
     fallback_to_real_delivery: false,
@@ -4275,6 +4325,10 @@ function hiddenFileFacts(file) {
  * By PID and never by name: every pid here was returned by the create call that made the
  * process. `-ErrorAction SilentlyContinue` makes a pid that is gone answer `$null` instead of
  * an error, and the lane's own error handling is left alone.
+ *
+ * The start time comes back with the answer because a pid is not an identity: the record has to
+ * let a reader tell "the process I made is gone" from "the number now belongs to something
+ * else", and the teardown receipt is the only place that distinction can be made.
  */
 function hiddenLivenessScript(pids) {
   const wanted = pids.map((pid) => Number(pid)).filter((pid) => Number.isFinite(pid) && pid > 0);
@@ -4284,7 +4338,9 @@ function hiddenLivenessScript(pids) {
     '$found = New-Object System.Collections.ArrayList',
     'foreach ($wantedPid in $wanted) {',
     '  $candidate = Get-Process -Id $wantedPid -ErrorAction SilentlyContinue',
-    '  [void]$found.Add(@{ pid = [int]$wantedPid; running = ($null -ne $candidate) })',
+    '  $ticks = ""',
+    '  if ($null -ne $candidate) { try { $ticks = [string]$candidate.StartTime.ToFileTimeUtc() } catch { $ticks = "" } }',
+    '  [void]$found.Add(@{ pid = [int]$wantedPid; running = ($null -ne $candidate); start_time_ticks = [string]$ticks })',
     '}',
     'Write-Output (@{ pids = @($found) } | ConvertTo-Json -Compress -Depth 4)',
   ].join('\r\n');
@@ -4320,7 +4376,11 @@ async function hiddenPidStates(pids) {
   }
   return {
     ok: true,
-    states: listed.map((state) => ({ pid: Number(state && state.pid) || 0, running: state && state.running === true })),
+    states: listed.map((state) => ({
+      pid: Number(state && state.pid) || 0,
+      running: state && state.running === true,
+      start_time_ticks: state && state.start_time_ticks !== undefined && state.start_time_ticks !== null ? String(state.start_time_ticks) : '',
+    })),
   };
 }
 
@@ -4334,8 +4394,8 @@ async function hiddenPidStates(pids) {
 async function hiddenWaitForExit(pids, timeoutMs = 15000) {
   const startedAt = Date.now();
   const wanted = pids.filter((pid) => Number.isFinite(pid) && Number(pid) > 0);
-  if (!wanted.length) return { gone: [], still_running: [], attempts: 0, elapsedMs: 0, all_gone: true };
-  let last = { states: [] };
+  if (!wanted.length) return { gone: [], still_running: [], states: [], attempts: 0, elapsedMs: 0, all_gone: true, liveness_error: null };
+  let last = { ok: true, states: [] };
   let attempts = 0;
   while (Date.now() - startedAt < timeoutMs) {
     attempts += 1;
@@ -4343,7 +4403,7 @@ async function hiddenWaitForExit(pids, timeoutMs = 15000) {
     if (last.ok === true) {
       const running = last.states.filter((state) => state.running).map((state) => state.pid);
       if (running.length === 0) {
-        return { gone: wanted, still_running: [], attempts, elapsedMs: Date.now() - startedAt, all_gone: true };
+        return { gone: wanted, still_running: [], states: last.states, attempts, elapsedMs: Date.now() - startedAt, all_gone: true, liveness_error: null };
       }
     }
     await sleep(250);
@@ -4355,6 +4415,7 @@ async function hiddenWaitForExit(pids, timeoutMs = 15000) {
     return {
       gone: [],
       still_running: wanted,
+      states: [],
       attempts,
       elapsedMs: Date.now() - startedAt,
       all_gone: false,
@@ -4365,6 +4426,7 @@ async function hiddenWaitForExit(pids, timeoutMs = 15000) {
   return {
     gone: wanted.filter((pid) => !running.includes(pid)),
     still_running: running,
+    states: last.states,
     attempts,
     elapsedMs: Date.now() - startedAt,
     all_gone: running.length === 0,
@@ -4465,6 +4527,17 @@ async function armHiddenDesktop(options, ownerId) {
     job: {
       created: Boolean(ready && ready.job_created === true),
       self_assigned: Boolean(ready && ready.job_assigned === true),
+      /*
+       * `self_assigned` is what `AssignProcessToJobObject` RETURNED; `self_in_job` is what the
+       * kernel says when asked. They are reported side by side because the whole ownership
+       * design rests on the second: a job the agent is not actually a member of inherits
+       * nothing, and every launched application then sits outside it while `kill_on_close`
+       * still reads `true`. Measured on this station in the live application: the agent's own
+       * ready file answered `job_in_job: true`, so inheritance was working, and the launched
+       * `notepad.exe` still came back outside the job - which is why the launch now measures
+       * membership instead of assuming it.
+       */
+      self_in_job: Boolean(ready && ready.job_in_job === true),
       kill_on_close: Boolean(ready && ready.job_kill_on_close === true),
       limit_flags: ready ? String(ready.job_limit_flags || '') : '',
     },
@@ -4476,6 +4549,8 @@ async function armHiddenDesktop(options, ownerId) {
     openedAt: Date.now(),
     requests: 0,
     launches: [],
+    /** The pids on this desktop that the job does NOT hold, as the agent last reported them. */
+    unheld: [],
     closed: false,
     reaped,
   };
@@ -4496,9 +4571,10 @@ async function armHiddenDesktop(options, ownerId) {
   }
   hiddenRoutes.set(ownerKey(ownerId), route);
 
-  /* The program the caller asked to start on that desktop. It inherits the job, which is what
-   * makes it the agent's to end; the pid AND start time it answers with are recorded for the
-   * teardown to check. */
+  /* The program the caller asked to start on that desktop. Whether it is IN the job is measured
+   * by the agent after the launch and reported per launch, not assumed from inheritance - see
+   * the `launch` op. A launch the job does not hold is kept in `route.unheld` so the teardown
+   * asks about that pid too, and so the arm receipt names it instead of leaving it out. */
   let launched = null;
   const commandLine = String(options.launch || '').trim();
   if (commandLine) {
@@ -4514,9 +4590,85 @@ async function armHiddenDesktop(options, ownerId) {
       start_time_utc: String(started.value.start_time_utc || ''),
       start_time_ticks: String(started.value.start_time_ticks || ''),
       in_job: started.value.in_job === true,
+      held: started.value.held === true,
+      ownership: String(started.value.ownership || (started.value.held === true ? 'inherited' : 'unowned')),
+      inherited: started.value.inherited === true,
+      assigned_after_launch: started.value.assigned_after_launch === true,
+      assign_error: Number(started.value.assign_error) || 0,
+      membership_before: Number(started.value.membership_before),
+      membership_error: Number(started.value.membership_error) || 0,
+      member_listed: started.value.member_listed === true,
+      job_present: started.value.job_present === true,
+      created_by_this_launch: started.value.created_by_this_launch !== false,
+      started_before_this_launch: started.value.started_before_this_launch === true,
       desktop_requested: String(started.value.desktop_requested || route.desktopName),
     };
     route.launches.push(launched);
+    for (const entry of Array.isArray(started.value.unheld_window_pids) ? started.value.unheld_window_pids : []) {
+      route.unheld.push({
+        pid: Number(entry && entry.pid) || 0,
+        held: false,
+        title: String((entry && entry.title) || ''),
+        class_name: String((entry && entry.class_name) || ''),
+        start_time_ticks: String((entry && entry.start_time_ticks) || ''),
+        source: 'desktop-window-after-launch',
+      });
+    }
+    /* A launched application the job does not hold is a process that will OUTLIVE the agent, and
+     * the desktop with it. It is reported as its own fact on the arm rather than as an absence. */
+    if (launched.held !== true) {
+      route.unownedLaunches = route.unownedLaunches || [];
+      route.unownedLaunches.push({
+        pid: launched.pid,
+        command_line: commandLine,
+        ownership: launched.ownership,
+        assign_error: launched.assign_error,
+        started_before_this_launch: launched.started_before_this_launch === true,
+        membership_before: launched.membership_before,
+        reason: launched.started_before_this_launch === true
+          ? 'the pid that answered began before this launch, so it was not adopted'
+          : (launched.ownership === 'unowned' && launched.assign_error ? `the job refused it (error ${launched.assign_error})` : 'the job does not hold it'),
+      });
+    }
+    /* One state read after the launch, so the ARM receipt itself names what the desktop now
+     * hosts and what it holds - the launch answer alone cannot see a target that handed its work
+     * to a process this agent never created. It is a read: nothing here terminates anything.
+     *
+     * AND IT SETTLES, BUT ONLY WHERE IT HAS TO. A packaged application's real process is created by
+     * the shell's activation host a fraction of a second AFTER the pid the launch returned, and
+     * that process is the one that will hold the desktop open. Measured on this station: launching
+     * `notepad.exe` created pid 34168 (not a job member, and the job refused it with error 5), and
+     * the Store Notepad came up as a different pid 180 ms later with a window on this desktop - so
+     * a read taken the instant after the launch named nothing and the teardown could only report
+     * "something unknown still holds it". The poll below is bounded, and it runs ONLY for a launch
+     * this job does not hold: a held child needs no watching, and the controlled case stays fast.
+     */
+    const settleMs = launched.held === true ? 0 : clampNumber(options.hiddenSettleMs, 0, 15000, 2500);
+    const settleStarted = Date.now();
+    let state = await hiddenAgentAnswer(route, 'state', {}, { timeoutMs: 20000 });
+    const unheldNow = (answer) => (answer.ok === true && Array.isArray(answer.value.unheld_window_pids) ? answer.value.unheld_window_pids : []);
+    while (settleMs > 0 && Date.now() - settleStarted < settleMs && unheldNow(state).length === 0) {
+      await sleep(250);
+      state = await hiddenAgentAnswer(route, 'state', {}, { timeoutMs: 20000 });
+    }
+    route.settleMs = Date.now() - settleStarted;
+    if (state.ok === true) {
+      route.hostedAfterLaunch = Array.isArray(state.value.hosted) ? state.value.hosted : [];
+      route.unheldAfterLaunch = Array.isArray(state.value.unheld_window_pids) ? state.value.unheld_window_pids : [];
+      for (const entry of route.unheldAfterLaunch) {
+        const pid = Number(entry && entry.pid) || 0;
+        if (pid > 0 && !route.unheld.some((known) => known.pid === pid)) {
+          route.unheld.push({
+            pid,
+            held: false,
+            title: String((entry && entry.title) || ''),
+            class_name: String((entry && entry.class_name) || ''),
+            start_time_ticks: String((entry && entry.start_time_ticks) || ''),
+            source: 'desktop-window-after-launch',
+          });
+        }
+      }
+    }
   }
   return { ok: true, route, endpoint, launched };
 }
@@ -4530,6 +4682,20 @@ function hiddenRouteReport(route) {
     agent_start_time_utc: route.agentStartTimeUtc,
     job: route.job,
     launched: route.launches,
+    /*
+     * WHAT THIS DESKTOP HOSTS THAT THE JOB DOES NOT HOLD.
+     *
+     * Reported as its own field because it is the one thing that decides whether the teardown
+     * can end it: a process outside the job is not killed by KILL_ON_JOB_CLOSE, so it keeps the
+     * desktop open after the agent is gone. Empty means "nothing was observed", never "nothing
+     * is there" - the desktop probe at the teardown is what answers the second question.
+     */
+    unowned_launches: Array.isArray(route.unownedLaunches) ? route.unownedLaunches : [],
+    unheld_desktop_pids: Array.isArray(route.unheld) ? route.unheld : [],
+    launched_settle_ms: Number(route.settleMs) || 0,
+    ownership: route.job && route.job.created === true && route.job.self_in_job === true
+      ? (route.unownedLaunches && route.unownedLaunches.length ? 'job-plus-unowned' : 'job')
+      : 'no-job',
     opened_at: route.openedAt,
     requests_served: route.requests,
     transport: 'json-lines over the agent named pipe, one connection per request, through the windows lane',
@@ -4562,8 +4728,39 @@ async function closeHiddenDesktop(route = null, options = {}) {
   const before = await hiddenAgentAnswer(route, 'state', {}, { timeoutMs: 20000 });
   const hosted = before.ok === true && Array.isArray(before.value.hosted) ? before.value.hosted : [];
   const hostedPids = hosted.map((entry) => Number(entry && entry.pid) || 0).filter((pid) => pid > 0);
+  /*
+   * EVERY PID THIS SESSION IS RESPONSIBLE FOR, EACH WITH THE REASON IT IS ON THE LIST.
+   *
+   * This is the fix for the check that could not fail. The shipped teardown asked about
+   * `[agentPid, ...jobMembers]` and nothing else, and a job member list can only ever contain
+   * what the job holds - so a launched application the job did NOT hold was never asked about,
+   * `all_processes_gone` came back `true` with the application still running, and the desktop it
+   * was sitting on stayed open. Measured in the live application: `pids_checked` was
+   * `[36516, 36516]` - the agent's pid twice - while the pid the session had launched (36744)
+   * was in `launch_pids_this_session` and alive.
+   *
+   * So the set is the union of four reads, and the sources are kept so a reader can see which
+   * question produced each pid: the agent, the job's own member list, every pid a launch of this
+   * session returned, and every pid the agent reported as owning a window on its desktop that
+   * the job does not hold.
+   */
+  const unheldBefore = before.ok === true && Array.isArray(before.value.unheld_window_pids) ? before.value.unheld_window_pids : [];
+  const sources = new Map();
+  const addPid = (pid, source, startTimeTicks = '') => {
+    const value = Number(pid);
+    if (!Number.isFinite(value) || value <= 0) return;
+    if (!sources.has(value)) sources.set(value, { pid: value, sources: [], start_time_ticks: String(startTimeTicks || '') });
+    const record = sources.get(value);
+    if (!record.sources.includes(source)) record.sources.push(source);
+    if (!record.start_time_ticks && startTimeTicks) record.start_time_ticks = String(startTimeTicks);
+  };
+  addPid(route.agentPid, 'agent');
+  for (const entry of hosted) addPid(entry && entry.pid, 'job-member', entry && entry.start_time_ticks);
+  for (const entry of route.launches) addPid(entry && entry.pid, 'launched-this-session', entry && entry.start_time_ticks);
+  for (const entry of unheldBefore) addPid(entry && entry.pid, 'unheld-desktop-window', entry && entry.start_time_ticks);
+  for (const entry of Array.isArray(route.unheld) ? route.unheld : []) addPid(entry && entry.pid, 'unheld-desktop-window', entry && entry.start_time_ticks);
+  const pids = [...sources.keys()];
   const exited = await hiddenAgentAnswer(route, 'exit', {}, { timeoutMs: 20000 });
-  const pids = [route.agentPid, ...hostedPids].filter((pid) => pid > 0);
   let verified = await hiddenWaitForExit(pids, clampNumber(options.hiddenExitWaitMs, 1000, 120000, 20000));
   let killedByThisCall = false;
   if (!verified.all_gone && Number(route.agentPid) > 0 && verified.still_running.includes(Number(route.agentPid))) {
@@ -4574,24 +4771,65 @@ async function closeHiddenDesktop(route = null, options = {}) {
   }
   const desktop = await hiddenDesktopProbe(route);
   route.closed = true;
+  /*
+   * A RESULT PER PID, AND `all_processes_gone` READ OFF IT.
+   *
+   * The pid list and the answer to "is it still running" are one record each, so the receipt
+   * shows that the question was ASKED about every pid and what each one answered. A reader can
+   * no longer be shown a boolean over a list that never contained the process that survived.
+   * A pid whose liveness could not be read is `running: null` and is NOT counted as gone: an
+   * unreadable answer is a failure to measure, and it must not be reported as a clean end.
+   */
+  const stateByPid = new Map(verified.states.map((state) => [Number(state.pid), state]));
+  const pidChecks = pids.map((pid) => {
+    const record = sources.get(pid);
+    const state = stateByPid.get(pid);
+    const running = state ? state.running === true : null;
+    return {
+      pid,
+      sources: record.sources,
+      running,
+      start_time_ticks_expected: record.start_time_ticks || '',
+      start_time_ticks_observed: state ? String(state.start_time_ticks || '') : '',
+      same_process: Boolean(state && state.start_time_ticks && record.start_time_ticks && String(state.start_time_ticks) === String(record.start_time_ticks)),
+    };
+  });
+  const alive = pidChecks.filter((check) => check.running === true).map((check) => check.pid);
+  const unreadable = pidChecks.filter((check) => check.running === null).map((check) => check.pid);
+  const allGone = verified.all_gone === true && alive.length === 0 && unreadable.length === 0;
+  const desktopStillHeld = desktop.still_openable === true;
   return {
     desktop_name: route.desktopName,
     agent_pid: route.agentPid,
     hosted_before_exit: hosted.map((entry) => ({ pid: Number(entry && entry.pid) || 0, start_time_ticks: String((entry && entry.start_time_ticks) || '') })),
-    launch_pids_this_session: route.launches.map((entry) => ({ pid: entry.pid, start_time_ticks: entry.start_time_ticks })),
+    unheld_before_exit: unheldBefore.map((entry) => ({ pid: Number(entry && entry.pid) || 0, title: String((entry && entry.title) || ''), start_time_ticks: String((entry && entry.start_time_ticks) || '') })),
+    launch_pids_this_session: route.launches.map((entry) => ({ pid: entry.pid, start_time_ticks: entry.start_time_ticks, held: entry.held === true, ownership: entry.ownership })),
     state_answered: before.ok === true,
     state_error: before.ok === true ? null : String(before.error || ''),
     exit_answered: exited.ok === true,
     exit_error: exited.ok === true ? null : String(exited.error || ''),
     agent_terminated_by_this_call: killedByThisCall,
-    pids_checked: pids,
-    all_processes_gone: verified.all_gone,
-    still_running: verified.still_running,
+    pids_checked: pidChecks,
+    pids_checked_count: pidChecks.length,
+    all_processes_gone: allGone,
+    still_running: alive,
+    pids_unreadable: unreadable,
     exit_wait_ms: verified.elapsedMs,
     exit_wait_attempts: verified.attempts,
     liveness_error: verified.liveness_error,
     desktop,
     desktop_gone: desktop.still_openable === false,
+    desktop_still_held: desktopStillHeld,
+    /*
+     * THE TWO ANSWERS TOGETHER, BECAUSE ONE OF THEM ALONE WAS THE LIE.
+     *
+     * `all_processes_gone: true` beside `desktop.still_openable: true` is a contradiction: a
+     * desktop is held by any handle OR any process assigned to it, so if every pid this session
+     * knows about is gone and the desktop still opens, a process it does NOT know about is on
+     * it. The shipped receipt printed exactly that pair and left the reader to notice.
+     */
+    unaccounted_holder: allGone && desktopStillHeld,
+    nothing_holds_the_desktop: allGone && desktop.still_openable === false,
     elapsed_ms: Date.now() - startedAt,
     requests_served: route.requests,
   };

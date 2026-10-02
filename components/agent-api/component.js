@@ -136,12 +136,43 @@
  * agent_api_send — failure modes
  * ------------------------------
  *   2  invalid_prompt · invalid_output_schema · invalid_workspace · invalid_timeout
- *      · invalid_max_steps · invalid_tool_filter
+ *      · invalid_max_steps · invalid_tool_filter · invalid_tools · empty_tool_allow
  *   3  core_service_absent · core_model_accessor_absent · core_model_accessor_threw
  *      · model_not_selected · model_unavailable · llm_unavailable · tools_unavailable
  *      · workspace_unavailable
- *   4  run_failed · schema_violation · max_tokens · max_steps
+ *   4  run_failed · schema_violation · max_tokens · max_steps · repeated_tool_failure
  *   130 aborted · timeout
+ *
+ * A RUN THAT CALLS A FAILING TOOL — the defect this contract grew out of
+ * ---------------------------------------------------------------------
+ *   Measured on the running 0.2.11 bundle: a run whose model called `memory_lab_read` for a
+ *   component that does not exist called that same tool on EVERY turn of its budget and ended at
+ *   `max_steps` — three of three turns in this component's own re-measurement, whose prompt asked
+ *   in words that the tool not be called again, and six of six in the round the user measured.
+ *   The failure DID reach the model — as a tool result with `isError: true`, which is what the
+ *   events and the second request's message list show — and its entire text was `[object Object]`,
+ *   because the MemoryLab tools report `{ ok: false, error: { … } }` and the classifier stringified
+ *   the object. A model handed a failure that says nothing has nothing to adapt to.
+ *
+ *   Three things now hold that shut, and each is a named check in the gate:
+ *
+ *   1. **the failure is legible** — `describeFailure` (lib/contract.js) extracts the message and
+ *      code from a structured failure, so a failed memory tool reads
+ *      `NOT_FOUND: Memory component not found: X {"selector":"X"}`;
+ *   2. **the model can see what it called with** — a tool call's arguments stay the JSON TEXT the
+ *      published `ToolCallBlock` declares, because that same block is echoed back to the provider
+ *      on the next turn and the adapter parses it; the object the registry needs is prepared at the
+ *      tool boundary instead (`prepareArguments`);
+ *   3. **the budget is not the thing that ends the run** — `lib/loop.js` refuses to execute the
+ *      same call after it has failed identically twice, tells the model so, and gives it a turn to
+ *      answer. A run that answers about the failure is `stop` / exit 0; a run that keeps calling
+ *      the refused tool ends as `repeated_tool_failure` (exit 4), which is a different and more
+ *      honest answer than `max_steps`.
+ *
+ *   A malformed tool call — arguments that are not valid JSON, which the DeepSeek adapter reports
+ *   as `MALFORMED_RESPONSE` at `message_stop` — is a LEGIBLE TOOL RESULT rather than a dead run:
+ *   the turn is kept (lib/llm-seam.js), the tool boundary reports what was wrong with an excerpt,
+ *   and the run continues.
  *
  * THE WORKSPACE — and why it is now honest
  * ----------------------------------------
@@ -174,7 +205,7 @@ import {
   hostProfile,
 } from './lib/contract.js';
 import { runAgentLoop } from './lib/loop.js';
-import { JUDGE_SYSTEM_PROMPT, createLlmStreamFn } from './lib/llm-seam.js';
+import { JUDGE_SYSTEM_PROMPT, createLlmStreamFn, excerpt, toolCallArgumentsChecked, toolCallKey } from './lib/llm-seam.js';
 import { readCoreSelection, verifyModelAvailable } from './lib/core-model.js';
 
 /** The four tools this component registers. */
@@ -238,6 +269,22 @@ export const DEFAULT_MAX_STEPS = 8;
 export const DEFAULT_CONTEXT_MAX_MESSAGES = 48;
 export const DEFAULT_CONTEXT_MAX_CHARS = 262144;
 
+/**
+ * The bound on every diagnostic string this component puts in an event, in characters.
+ *
+ * The event log exists so a receipt can say WHY a run looped, and the two things a reader needs
+ * are the tool result and the error. Both can be large — a tool result is arbitrary user text and
+ * a failure can carry a whole stack's worth of detail — so the payload is carried BOUNDED with
+ * the truncation stated (`…(+N chars)`) rather than either dropped or pasted whole. The envelope
+ * has a lossless-JSON boundary to cross and a caller waiting on the other side of it; a payload
+ * that blows the envelope is worse than no payload, which is the trade this constant is.
+ */
+export const EVENT_TEXT_LIMIT = 240;
+
+/** How many events one run's receipt keeps, and the total characters they may spend. */
+export const EVENT_MAX_COUNT = 64;
+export const EVENT_MAX_CHARS = 16384;
+
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isFn = (value) => typeof value === 'function';
 
@@ -262,6 +309,83 @@ function jsonSafe(value) {
   } catch {
     return false;
   }
+}
+
+/** One bounded string, for an event. Never `undefined`, and never unbounded. */
+function boundedText(value, limit = EVENT_TEXT_LIMIT) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return excerpt(value, limit);
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return excerpt(JSON.stringify(value), limit);
+  } catch {
+    return '[unserialisable]';
+  }
+}
+
+/**
+ * One loop event, as the receipt carries it.
+ *
+ * WHY THIS FUNCTION EXISTS AT ALL. The event log used to be
+ * `{ type, turn: event?.turn ?? null }` and nothing else, so `tool_execution_start` and
+ * `tool_execution_end` — the two events that say a tool was called and what came back — arrived
+ * with no payload. A receipt could show that a run had looped and could not show why, which is
+ * the only thing a reader of that receipt needs. Measured on the running 0.2.11 bundle: a run
+ * that called a failing tool on every one of its turns ended at `max_steps` with six
+ * `tool_execution_end` events carrying `{ type, turn: null }`.
+ *
+ * WHAT IT CARRIES, per type. The tool events carry the tool, the call id, the turn (now emitted
+ * by the loop — it is the turn whose assistant message asked for the call), the arguments as the
+ * model emitted them, and then either `is_error: false` with the tool's own text, or
+ * `is_error: true` with the failure's message and its classification code. Nothing else is
+ * invented: a field this function cannot state is `null` or absent, never `undefined`.
+ *
+ * AND WHY EVERY FIELD IS BUILT THE SAME WAY. `undefined` in a value position has cost this
+ * bundle two releases — `memory_lab_reindex` in 0.2.2 and this component's own
+ * `turn: event?.turn` in 0.2.8, where a completed run's answer was thrown away at the DSH
+ * lossless-JSON boundary. A new event field is exactly where a new `undefined` appears, so every
+ * value here goes through `boundedText` (which answers `null`) or through a literal.
+ */
+export function eventView(event, stats = null) {
+  const type = String(event?.type ?? '');
+  const turn = Number.isFinite(event?.turn) ? event.turn : null;
+  const base = { type, turn };
+  const callId = typeof event?.toolCallId === 'string' ? event.toolCallId : null;
+  const tool = typeof event.toolName === 'string' ? event.toolName : null;
+  if (type === 'tool_execution_start') {
+    return { ...base, tool, call_id: callId, arguments: boundedText(event?.arguments) };
+  }
+  if (type === 'tool_execution_end') {
+    const failed = event?.isError === true;
+    const content = event?.result?.content;
+    const text = Array.isArray(content)
+      ? content.map((block) => (block && block.type === 'text' ? String(block.text) : '')).filter(Boolean).join('\n')
+      : typeof content === 'string'
+        ? content
+        : '';
+    return {
+      ...base,
+      tool,
+      call_id: callId,
+      is_error: failed,
+      ...(failed
+        ? {
+            code: boundedText(event?.error?.code) ?? '',
+            error: boundedText(event?.error?.message),
+            ...(event?.refused === true ? { refused: true } : {}),
+          }
+        : { result: boundedText(text) }),
+      ...(Number.isFinite(event?.repeat) ? { repeat: event.repeat } : {}),
+    };
+  }
+  if (type === 'turn_end') {
+    const results = Array.isArray(event?.toolResults) ? event.toolResults : [];
+    return { ...base, tool_results: results.length, errors: results.filter((result) => result?.isError === true).length };
+  }
+  if (type === 'agent_end') {
+    return { ...base, stop_reason: boundedText(event?.stopReason) ?? '', ...(stats ? { events_kept: stats.kept, events_dropped: stats.dropped } : {}) };
+  }
+  return base;
 }
 
 /** Resolve the workspace for one call. Always absolute. */
@@ -571,6 +695,29 @@ export function createAgentApi({
           // does not know what a registry tool does to the world, and an ungraded tool that
           // overlapped a sibling would be a race it invented.
           concurrencySafe: false,
+          /**
+           * THE TOOL BOUNDARY, and the only place the wire's JSON text becomes the object the
+           * registry requires. `lib/llm-seam.js` used to do this to the block itself, which also
+           * sent the object back to the provider on the next turn where the published type is a
+           * string — so the model was shown its own earlier calls with no arguments at all. The
+           * parse belongs here, one layer below the message.
+           *
+           * A call whose arguments are not readable JSON throws, and the LOOP turns that throw
+           * into a tool result the model reads (`executeToolCalls` prepares inside its try). The
+           * message names the problem and quotes an excerpt, so a model that emitted a broken
+           * argument string — the `MALFORMED_RESPONSE` path, measured at 0.2.11 — is told to
+           * re-issue the call instead of watching the run die with a transport error.
+           */
+          prepareArguments(raw) {
+            const checked = toolCallArgumentsChecked(raw);
+            if (checked.ok) return checked.value;
+            const error = new Error(
+              `the arguments of this ${name} call could not be read: ${checked.reason}. ` +
+                `Re-issue the call with a single valid JSON object as its arguments.`,
+            );
+            error.code = 'MALFORMED_TOOL_ARGUMENTS';
+            throw error;
+          },
           async execute(callId, args) {
             counters.toolCalls += 1;
             const outcome = await view.tools.execute({
@@ -720,6 +867,33 @@ export function createAgentApi({
     const runTools = buildRunTools(view, toolFilter, controller.signal, exec?.agent);
     const streamFn = createLlmStreamFn(view.llm, selection, {});
     const events = [];
+    /**
+     * The event log, bounded twice: a count and a character budget.
+     *
+     * The previous log was `{ type, turn }` per event with a count cap of 64, and the reason it
+     * carried nothing was that nothing was offered to it. It is offered now (`eventView`), so it
+     * needs a size bound as well — a tool result can be arbitrarily large and this array is
+     * inside the envelope the registry validates and the caller reads. Past either bound the log
+     * says so (`events_dropped`, `events_truncated`) rather than silently stopping.
+     */
+    const eventStats = { kept: 0, dropped: 0, chars: 0, truncated: false };
+    const pushEvent = (event) => {
+      const view_ = eventView(event, eventStats);
+      const size = JSON.stringify(view_).length;
+      if (eventStats.kept >= EVENT_MAX_COUNT || eventStats.chars + size > EVENT_MAX_CHARS) {
+        eventStats.dropped += 1;
+        eventStats.truncated = true;
+        return;
+      }
+      eventStats.kept += 1;
+      eventStats.chars += size;
+      events.push(view_);
+    };
+    /* The run's OWN tool calls, not the component's lifetime total. `counters.toolCalls` is a
+     * per-instance counter that `agent_api_state` reports and every run adds to; reporting it as
+     * this run's `tool_calls` said "14" for a run that made one call. Measured live at 0.2.11:
+     * a two-turn run with a single tool call answered `tool_calls: 14`. */
+    const toolCallsBefore = counters.toolCalls;
     /* THE TEMPORARY CONVERSATION. Built here — after every refusal, so a call that answers exit 3
      * has not even made one — bounded in memory, never a session, and released in the `finally`
      * below on EVERY path: answered, failed, aborted, timed out. */
@@ -740,30 +914,36 @@ export function createAgentApi({
           streamFn,
           toolExecution: 'serial',
           maxSteps: Math.floor(steps),
+          // THE RETRY BOUND, wired where the wire shape is known. `toolCallKey` canonicalises a
+          // call's arguments through the same parse the tool boundary uses, so `{"a":1}` and
+          // `{"a": 1}` are ONE call for the bound rather than two — a bound that could be evaded
+          // by respacing JSON would not bound anything.
+          callKey: toolCallKey,
           // The directory every tool-execution context of this run carries. This component owns
           // the loop, so this is the run's working directory by construction rather than by
           // negotiation with a provider.
           workspace: workspacePath,
-          emit: async (event) => {
-            // Bounded: an event log is diagnostics, and an unbounded one on a retrying run is a
-            // memory leak with a friendly name.
-            // `turn` is `null` and never `undefined`, and that is not tidiness.
-    //
-    // DSH validates a tool's return value as LOSSLESS JSON before handing it back — the walker
-    // accepts null, booleans, strings, finite numbers, plain arrays and plain objects, and
-    // rejects `undefined` at `if (typeof current !== "object") return void 0`
-    // (`dsh-util-values/lib/index.js`). `{ turn: undefined }` made the WHOLE envelope invalid, so
-    // a judgement that had run to completion came back to its caller as
-    // `INVALID_TOOL_OUTPUT — tool "agent_api_send" returned invalid output: value is not lossless
-    // JSON` — an operation that succeeded, reported as a failure. Third time this bundle has met
-    // that boundary; `memory_lab_reindex` and the ComputerUse backends were the other two.
-    //
-    // It survived the acceptance gate because that gate calls the component's `execute` DIRECTLY,
-    // so the registry's output boundary was never applied. A run dispatched through `tools.execute`
-    // — which is how the judgement reaches this component, and how a model would — meets it every
-    // time. The gate's rounds are being routed through the registry for that reason.
-    if (events.length < 64) events.push({ type: String(event?.type ?? ''), turn: event?.turn ?? null });
-          },
+          /**
+           * The event sink, and the bound on what it keeps.
+           *
+           * `eventView` builds the payload (the tool, the call id, the turn, the arguments, the
+           * error or the result) and `pushEvent` enforces the two bounds — a count and a
+           * character budget — past which the log says it dropped events rather than growing.
+           *
+           * `turn` is `null` and never `undefined`, and that is not tidiness.
+           *
+           * DSH validates a tool's return value as LOSSLESS JSON before handing it back — the
+           * walker accepts null, booleans, strings, finite numbers, plain arrays and plain objects,
+           * and rejects `undefined` at `if (typeof current !== "object") return void 0`
+           * (`dsh-util-values/lib/index.js`). `{ turn: undefined }` made the WHOLE envelope invalid,
+           * so a judgement that had run to completion came back to its caller as
+           * `INVALID_TOOL_OUTPUT — tool "agent_api_send" returned invalid output: value is not
+           * lossless JSON` — an operation that succeeded, reported as a failure. Third time this
+           * bundle has met that boundary; `memory_lab_reindex` and the ComputerUse backends were
+           * the other two. Every field `eventView` adds is built to the same rule, and the
+           * boundary gate walks the result.
+           */
+          emit: async (event) => pushEvent(event),
         },
         controller.signal,
       );
@@ -775,7 +955,23 @@ export function createAgentApi({
         route: 'loop',
         code: aborted ? (timedOut ? 'timeout' : 'aborted') : 'run_failed',
         error: aborted ? `the run was cancelled (${timedOut ? 'timeout' : 'caller aborted'})` : `the run failed: ${error?.message ?? error}`,
-        extra: { model, context: contextStats, workspace: { ...workspaceState, enforced: true, enforced_by: 'agent-api/loop', note: 'the run was driven by this component own loop in this directory' } },
+        // The same figures the settled paths report, so a receipt for a THROWN run also says how
+        // far it got: `outcome` never arrived, so the turn and tool-call counts are the ones the
+        // event log and the counter carry.
+        extra: {
+          model,
+          context: contextStats,
+          workspace: { ...workspaceState, enforced: true, enforced_by: 'agent-api/loop', note: 'the run was driven by this component own loop in this directory' },
+          events,
+          run: {
+            turns: events.filter((event) => event.type === 'turn_start').length,
+            tool_calls: counters.toolCalls - toolCallsBefore,
+            stop_reason: aborted ? (timedOut ? 'timeout' : 'aborted') : 'threw',
+            events_kept: eventStats.kept,
+            events_dropped: eventStats.dropped,
+            recovered_turns: 0,
+          },
+        },
       });
     } finally {
       clearTimeout(timer);
@@ -806,16 +1002,44 @@ export function createAgentApi({
     const assistantTurns = outcome.messages.filter((message) => message.role === 'assistant');
     const last = assistantTurns[assistantTurns.length - 1];
     const output = blockText(last?.content);
+    /**
+     * What the run did, in the three numbers a reader of a FAILED receipt needs.
+     *
+     * A failure envelope carries no `result` — the contract is explicit that `result` is present
+     * exactly when `exit === 0` — so before this block a caller could see `code: 'max_steps'` and
+     * nothing else: not how many turns were burned, not how many tool calls were repeated. That is
+     * why MemoryLab's rebuild log can print `(judgement failed, 0 turns)` for a run that took
+     * eight turns: it reads `result.turns`, and on the failure path there is no `result` to read.
+     * The figures are reported here instead, so a receipt says what happened even when it says the
+     * run did not deliver.
+     */
+    const runFacts = {
+      turns: assistantTurns.length,
+      tool_calls: counters.toolCalls - toolCallsBefore,
+      stop_reason: String(outcome.stopReason ?? 'stop'),
+      events_kept: eventStats.kept,
+      events_dropped: eventStats.dropped,
+      /**
+       * Turns that survived a provider failure because they had already delivered their content.
+       *
+       * `lib/llm-seam.js` keeps a turn whose stream threw after delivering a tool call — the
+       * `MALFORMED_RESPONSE` path — instead of discarding it and ending the run. When that
+       * happens the receipt has to say so: a recovered turn and an ordinary one look identical
+       * from the outside, and "the provider failed here and the run continued anyway" is exactly
+       * the kind of fact a reader of a judgement receipt needs.
+       */
+      recovered_turns: assistantTurns.filter((message) => message.recoveredFrom === 'stream-failed-after-content').length,
+    };
     const base = {
       output,
       structured: null,
       provider: String(selection.provider),
       model: String(selection.model),
-      turns: assistantTurns.length,
-      tool_calls: counters.toolCalls,
+      turns: runFacts.turns,
+      tool_calls: runFacts.tool_calls,
       usage: last?.usage ?? null,
       elapsed_ms: Date.now() - startedAt,
-      stop_reason: String(outcome.stopReason ?? 'stop'),
+      stop_reason: runFacts.stop_reason,
       model_verified: verified.verified,
       workspace: workspaceReceipt,
       tool_names: runTools.map((entry) => entry.name),
@@ -834,7 +1058,7 @@ export function createAgentApi({
         released: counters.retainedMessages === 0 && counters.activeRuns === 0,
       },
     };
-    const extra = { model, workspace: workspaceReceipt, events };
+    const extra = { model, workspace: workspaceReceipt, events, run: runFacts };
 
     // A truncated, capped or aborted run is not a verdict. Only a clean stop can be a judgement.
     if (timedOut || controller.signal.aborted || outcome.stopReason === 'aborted') {
@@ -845,6 +1069,21 @@ export function createAgentApi({
     }
     if (outcome.stopReason === 'max-steps') {
       return envelope({ tool, exit: EXIT_FAILED, route: 'loop', code: 'max_steps', error: `the run did not settle within ${Math.floor(steps)} model turns, so it was stopped and its answer is not a judgement`, extra });
+    }
+    if (outcome.stopReason === 'repeated-tool-failure') {
+      /* NOT `max_steps`, and the difference is the whole point of the bound: this run stopped
+       * because it was repeating one failed call, not because it ran out of turns. A caller that
+       * reads the two as one thing cannot tell a bad prompt from a model that is stuck. */
+      return envelope({
+        tool,
+        exit: EXIT_FAILED,
+        route: 'loop',
+        code: 'repeated_tool_failure',
+        error:
+          `the run kept calling the same tool with the same arguments after that call had already failed identically, ` +
+          `so it was stopped after ${runFacts.turns} turn(s) and ${runFacts.tool_calls} tool call(s). Its answer is not a judgement`,
+        extra,
+      });
     }
     if (outcome.stopReason !== 'stop') {
       return envelope({ tool, exit: EXIT_FAILED, route: 'loop', code: 'run_failed', error: `the run did not complete: stopReason=${outcome.stopReason}${last?.diagnostic ? ` (${last.diagnostic})` : ''}`, extra });
@@ -1077,9 +1316,11 @@ export function createAgentApi({
             `What a run is not: ${isolation} ` +
             `THE TOOL SET, AND WHAT WIDENING IT MEANS. By default a run is given the memory tools and nothing else — a judge reading a memory graph needs those, and nothing else it is likely to want. \`tools: { allow: ['${ALL_TOOLS_TOKEN}'] }\` WIDENS that to every tool DSH currently exposes to the caller, and the widening is exactly as consequential as it sounds: those calls execute in the GLOBAL tool view, so they are NOT subject to the per-agent tool restriction, the tools/pre-execute guard, the approval policy or the sandbox decision that a normal tool call goes through. A run is not a DSH agent session, and widening its tool set widens what it can reach without any of that machinery watching. Choose it deliberately, for a caller you would trust to run those tools itself. Whatever the set, this component's own four tools and the reserved run_code transport are subtracted from it always, and a run may never write to the shared Newmark store except through the memory tools. ` +
             'Input: { prompt: string (REQUIRED), output_schema?: object with type "object" (the run must then answer with JSON matching it, or the call fails), workspace?: string (absolute; default <newmarkRoot>/Work, created if absent), timeout_ms?: number (default 120000), max_steps?: number (model turns before the run is stopped, default 8), tools?: { allow?: string[], deny?: string[] } (also accepted under its older name tool_filter; without allow the run is given the memory tools and nothing else; allow must not be empty, and allow: ["' + ALL_TOOLS_TOKEN + '"] means every tool DSH exposes), require_workspace?: boolean (default false) }. ' +
-            'Output on success: `result = { output, structured, provider, model, turns, tool_calls, usage, elapsed_ms, stop_reason, model_verified, workspace, tool_names, context }`, where `context` reports the temporary conversation this run held — `{ max_messages, max_chars, messages, chars, dropped_messages, dropped_chars, released }`. The history is in memory for the length of the call and released when it ends, on every path; it is never a session, is never logged, and does not survive the call. ' +
+            'Output on success: `result = { output, structured, provider, model, turns, tool_calls, usage, elapsed_ms, stop_reason, model_verified, workspace, tool_names, context }`, where `context` reports the temporary conversation this run held — `{ max_messages, max_chars, messages, chars, dropped_messages, dropped_chars, released }`. The history is in memory for the length of the call and released when it ends, on every path; it is never a session, is never logged, and does not survive the call. `turns` and `tool_calls` are THIS run\'s figures. ' +
+            'Every answer also carries `events` — the run\'s own event list, bounded in both count and characters, where each `tool_execution_start` and `tool_execution_end` names the tool, the call id, the turn, the arguments the model emitted and either the tool\'s result or the failure\'s message and code. That is what makes a receipt able to say WHY a run looped rather than only that it did. ' +
+            'WHEN A TOOL FAILS. The failure is handed back to the model as a tool result carrying the tool\'s own message (a memory tool\'s `{ ok: false, error: { … } }` is read into its message and code, never into `[object Object]`), and the run\'s model is expected to change approach or answer about it. A run that calls the same tool with the same arguments and gets the same failure repeatedly is not making progress: after two identical failures the third identical call is NOT executed, the model is told so, and it is given a turn to answer. A run that answers ends normally — exit 0 with an honest answer about the failure. A run that keeps calling the refused tool ends as exit 4 `repeated_tool_failure`, which is reported as its own code rather than as `max_steps`. Tool-call arguments that are not valid JSON become a legible tool result for the same reason, rather than a dead run. ' +
             'Worked example: `agent_api_send { prompt: "Answer with JSON: {\\"verdict\\":\\"ok\\"}", output_schema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] } }` -> `{ ok: true, tool: "agent_api_send", route: "loop", exit: 0, class: "ok", result: { output: "{\\"verdict\\":\\"ok\\"}", structured: { verdict: "ok" }, turns: 1, stop_reason: "stop", workspace: { enforced: true }, context: { messages: 1, released: true } }, model: { ok: true, provider: "deepseek", model: "deepseek-chat" } }`. ' +
-            'A non-zero exit is never a verdict. Exit 3 means NOTHING WAS ATTEMPTED: model_not_selected (nothing is authorised yet — this component refuses rather than defaulting, because a default is a model the user did not authorise), model_unavailable (a model was authorised and the provider no longer lists it), core_service_absent, core_model_accessor_absent, llm_unavailable, tools_unavailable, workspace_unavailable. Exit 4 means a run happened and did not deliver: run_failed, schema_violation, max_tokens, max_steps. Exit 130 means aborted or timed out. Treat a 3 and a 4 differently: a 3 must be reported as "no judgement was made", a 4 may be retried. ' +
+            'A non-zero exit is never a verdict. Exit 3 means NOTHING WAS ATTEMPTED: model_not_selected (nothing is authorised yet — this component refuses rather than defaulting, because a default is a model the user did not authorise), model_unavailable (a model was authorised and the provider no longer lists it), core_service_absent, core_model_accessor_absent, llm_unavailable, tools_unavailable, workspace_unavailable. Exit 4 means a run happened and did not deliver: run_failed, schema_violation, max_tokens, max_steps, repeated_tool_failure. Exit 130 means aborted or timed out. Treat a 3 and a 4 differently: a 3 must be reported as "no judgement was made", a 4 may be retried. Every exit-4 answer carries `run: { turns, tool_calls, stop_reason, recovered_turns }`, because a failure carries no `result` and a caller that wants to know how far the run got has nowhere else to read it. ' +
             `Runs are bounded and always return. ${lifecycle}`,
           parameters: {
             type: 'object',

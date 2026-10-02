@@ -168,6 +168,69 @@ export function parsedToolOutput(output) {
 }
 
 /**
+ * One failure value — whatever shape it arrived in — as a sentence a reader can act on.
+ *
+ * WHY THIS EXISTS, and it is a measured defect rather than a preference. The two classifiers
+ * below used to answer `String(result.error || …)`. A **Newmark-authored tool reports its
+ * failures as an object** — `memory_lab_read` answers
+ * `{ ok: false, error: { code: 'NOT_FOUND', message: 'Memory component not found: X',
+ * details: { selector: 'X' } } }` (`MemoryLabStoreError.toJSON()`) — and `String({…})` is
+ * exactly `"[object Object]"`.
+ *
+ * The consequence was measured on the running 0.2.11 bundle, through the real tools:
+ *
+ *   - `agent_api_tool { tool: "memory_lab_read", arguments: { component: "ZZZ-…" } }` answered
+ *     `exit: 4, code: "tool_reported_failure", error: "[object Object]"`;
+ *   - a run whose model called that tool was handed a tool result whose ENTIRE text was
+ *     `[object Object]`, with `is_error: true`; the model called the same failing tool on every
+ *     turn of its budget (3 of 3, and 6 of 6 in the round the user measured) and the run ended
+ *     at `max_steps`. The failure reached the model and told it nothing, so there was nothing to
+ *     adapt to.
+ *
+ * So the rule here is narrow and absolute: **a failure description is never `String(object)`**.
+ * The message is preferred, the code qualifies it, and the details — bounded — are kept because
+ * they are what makes the message actionable (`selector: "ZZZ-…"` says WHICH selector failed).
+ */
+export const FAILURE_DETAIL_LIMIT = 300;
+
+export function describeFailure(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  if (Array.isArray(value)) return value.map((entry) => describeFailure(entry)).filter(Boolean).join('; ');
+  if (typeof value !== 'object') return '';
+
+  const info = isPlainObject(value.info) ? value.info : {};
+  const code = typeof value.code === 'string' ? value.code : typeof info.code === 'string' ? info.code : '';
+  const message = typeof value.message === 'string' ? value.message : '';
+  const detail = isPlainObject(value.details) ? value.details : isPlainObject(value.info) ? value.info : null;
+  const head = [code, message].filter(Boolean).join(': ');
+
+  let rendered = '';
+  if (detail !== null) {
+    try {
+      const json = JSON.stringify(detail);
+      if (typeof json === 'string' && json !== '{}' && json !== 'null') {
+        rendered = json.length > FAILURE_DETAIL_LIMIT ? `${json.slice(0, FAILURE_DETAIL_LIMIT)}…(+${json.length - FAILURE_DETAIL_LIMIT} chars)` : json;
+      }
+    } catch {
+      rendered = '';
+    }
+  }
+
+  if (head) return rendered ? `${head} ${rendered}` : head;
+  if (rendered) return rendered;
+  // Last resort: the object had none of the fields a failure is described by. Serialise it rather
+  // than stringify it, because `String(object)` is the one answer this function must never give.
+  try {
+    const json = JSON.stringify(value);
+    return typeof json === 'string' && json !== '{}' ? json : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * The reference's `classifyCliToolOutput` (cli-commands.ts:294-321), rule for rule.
  *
  * The rules are transcribed in the reference's own order, because the order is load-bearing:
@@ -186,11 +249,13 @@ export function classifyToolOutput(tool, output) {
   const result = parsedToolOutput(text);
 
   // Rule 1 — a JSON object that says `ok: false` is a failure, whatever else it contains.
+  // The failure it carries may be a string OR an object, and `describeFailure` is what keeps the
+  // second shape from reaching a model as `[object Object]`. See its own note.
   if (isPlainObject(result) && result.ok === false) {
     return {
       exit: EXIT_FAILED,
       code: 'tool_reported_failure',
-      error: String(result.error || `${name} reported an unsuccessful result.`),
+      error: describeFailure(result.error) || `${name} reported an unsuccessful result.`,
     };
   }
 
@@ -267,7 +332,7 @@ export function classifyToolResult(tool, result) {
       return {
         exit: EXIT_FAILED,
         code: 'tool_reported_failure',
-        error: String(value.error || `${name} reported an unsuccessful result.`),
+        error: describeFailure(value.error) || `${name} reported an unsuccessful result.`,
       };
     }
     if (typeof value === 'string') {
@@ -280,7 +345,11 @@ export function classifyToolResult(tool, result) {
   }
 
   const info = isPlainObject(result.error?.info) ? result.error.info : {};
-  const message = String(result.error?.message ?? `${name} failed.`);
+  // `message` is a string in every shape DSH's own registry produces, and `describeFailure` returns
+  // a string unchanged — so this is the same answer for that shape, and a legible one (rather than
+  // `[object Object]`) for a tool that put an object where the message goes.
+  const message =
+    describeFailure(result.error?.message) || describeFailure(result.error) || `${name} failed.`;
   const errorName = String(info.name ?? '');
   const infoCode = String(info.code ?? '');
 
