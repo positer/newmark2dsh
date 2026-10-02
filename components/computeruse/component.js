@@ -346,12 +346,16 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
             '- `scroll` requires `x` and `y`: there is no "scroll whatever has focus", and `scroll` with only `scroll_y` answers `point_required`.',
             '- `type` is delivered as unicode key events (`text_delivery: "unicode-key-events"`), so Chinese and other non-ASCII text works.',
             '- A lone Windows key is refused by the shell, and a Windows chord is refused in virtual mode (`windows_key_requires_real_delivery`: a posted `WM_KEYDOWN` cannot open the Start menu). Use `ctrl+esc`.',
+            '',
+            'WORKING ON A HIDDEN DESKTOP. `takeover_start` with `mouse_mode: "virtual"` AND `desktop: "hidden"` arms a resident agent on a desktop of its own; every later `app_list`, `app_observe`, `app_activate`, `app_click`, `app_type`, `app_scroll` and `app_key` from that owner is then relayed to that agent, and nothing on this desktop is touched. `launch: "<command line>"` on the same call starts a program on it. `takeover_stop` ends the agent and reports what the teardown measured (`hidden_desktop.desktop_gone`, `all_processes_gone`). Virtual mode WITHOUT `desktop` is unchanged: posted window messages to a window on this desktop.',
           ].join('\n'),
           parameters: {
             type: 'object',
             properties: {
               action: { type: 'string', enum: COMPUTER_USE_ACTIONS },
               mouse_mode: { type: 'string', enum: ['real', 'virtual'], description: 'Accepted on takeover_start only.' },
+              desktop: { type: 'string', enum: ['hidden'], description: 'Accepted on takeover_start only. "hidden" arms a resident agent on a desktop of its own and routes the app_* actions to it; it requires mouse_mode "virtual".' },
+              launch: { type: 'string', description: 'Accepted on takeover_start with desktop "hidden" only: a command line to start on that hidden desktop, tracked by the pid and start time its own launch returned.' },
               owner_id: { type: 'string' },
               x: { type: 'number' },
               y: { type: 'number' },

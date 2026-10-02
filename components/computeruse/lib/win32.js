@@ -1962,10 +1962,20 @@ export function stopLane(lane) {
   workerFor(lane).stop();
 }
 
-/** Terminate every lane child process. Safe to call at any time, including from exit. */
+/**
+ * Terminate every lane child process, and every resident hidden-desktop agent.
+ *
+ * The agents are stopped HERE as well as in `takeover_stop`, because this is the path a
+ * process exit takes: an agent left behind would hold its desktop open, and a desktop held
+ * open with a process still on it is the invisible occupancy the job object exists to prevent.
+ * This cannot verify what it did - an `exit` handler is synchronous - so it is reported as
+ * `verified: false` and `takeover_stop` remains the path that measures.
+ */
 export function stopAll() {
   for (const lane of LANES) workers.get(lane).stop();
+  const hiddenStopped = stopHiddenAgentsSync();
   releaseLease('stop_all');
+  return { lanes_stopped: [...LANES], hidden_agents_stopped: hiddenStopped };
 }
 
 /** How many lane child processes are still alive right now. */
@@ -3534,7 +3544,1085 @@ async function virtualKey(options) {
 /* @virtual-mode-end */
 
 /* ------------------------------------------------------------------ *
- * 9. sequence, the takeover lease, and the dispatcher
+ * 9. the hidden-desktop route
+ *
+ * =====================================================================================
+ * WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT
+ * =====================================================================================
+ *
+ * `lib/hidden-agent.js` carries a resident agent that lives ON a hidden Windows desktop: it
+ * opens windows there, captures them there and posts messages to them there, with no
+ * cross-desktop call anywhere. Reach is a property of the calling process, and that module
+ * moves the caller ONTO the desktop instead of trying to reach across to it. Three phases
+ * tried the reach and all three came back negative.
+ *
+ * So this section adds ROUTING and no reach. It opens no desktop (that call appears nowhere in
+ * this file), it attaches no thread to another thread, and it never captures across a desktop
+ * boundary. When a caller arms a hidden desktop, the app-scoped actions are relayed to the
+ * agent over its named pipe - one JSON line per request, one connection per request - through
+ * the `windows` lane this file already owns. The lane is a SECOND ENDPOINT to that agent, not
+ * a second implementation of it: the relay script below runs inside the lane's own
+ * PowerShell, which holds no desktop handle of its own.
+ *
+ * =====================================================================================
+ * HOW A ROUTE IS ARMED, AND WHY IT IS ARMED RATHER THAN ASSUMED
+ * =====================================================================================
+ *
+ * `takeover_start` with `mouseMode: "virtual"` and `desktop: "hidden"` starts one resident
+ * agent on a fresh desktop and binds it to that owner's lease. Every app-scoped action from
+ * that owner then routes to the agent until `takeover_stop`, which exits the agent (closing
+ * the job handle its whole process tree inherited), waits for the agent and every hosted pid
+ * to be gone, and asks whether the desktop itself is still openable.
+ *
+ * The route is armed rather than assumed, and that is not decoration:
+ *
+ *   - Virtual mode WITHOUT `desktop` behaves exactly as it did before this section existed:
+ *     posted window messages to a window on this desktop. That is the interactive-desktop
+ *     control, and it still works, so nothing here silently takes a path away.
+ *   - A resident agent is a real process, so it starts when a caller asks for one - never at
+ *     module load and never on a read-only action. `mode_report` is the only action that
+ *     mentions the route without arming one.
+ *
+ * =====================================================================================
+ * OWNERSHIP OF EVERY PROCESS, AND OF THE DESKTOP
+ * =====================================================================================
+ *
+ *   - The agent's pid is the one its own launcher reported through its ready file, and every
+ *     process it starts is recorded by the pid AND the start time its own launch call
+ *     returned. Nothing here is ever selected by process name; no cleanup in this file names
+ *     a process class.
+ *   - The desktop is held by the agent's own handle. `takeover_stop` ends it by ending the
+ *     agent, and then MEASURES that the desktop is gone instead of assuming it: a desktop is
+ *     held by any handle OR any process assigned to it, which is why the job object is
+ *     load-bearing. A desktop that survives is reported as surviving, with the pids that
+ *     kept it alive.
+ * ------------------------------------------------------------------ */
+
+/** One resident agent per owner, for the life of the lease that armed it. */
+const hiddenRoutes = new Map();
+let hiddenDesktopCounter = 0;
+let hiddenAgentPromise = null;
+
+/** The agent module, loaded on first use: importing this file must spawn nothing. */
+function hiddenAgentModule() {
+  hiddenAgentPromise ??= import('./hidden-agent.js');
+  return hiddenAgentPromise;
+}
+
+function hiddenRouteFor(ownerId) {
+  return hiddenRoutes.get(ownerKey(ownerId)) || null;
+}
+
+/**
+ * The route this call must be relayed through, or null.
+ *
+ * Two independent conditions, and both are required: a route armed for this owner, and that
+ * owner still holding a VIRTUAL lease. A lease that has been released cannot route - the
+ * desktop it named is being torn down - so a leaked route cannot outlive its lease.
+ */
+function hiddenRouteActive(options) {
+  const route = hiddenRouteFor(options && options.ownerId);
+  if (!route || route.closed) return null;
+  const active = activeLease();
+  if (!active || active.owner_id !== route.ownerId || active.mouse_mode !== 'virtual') return null;
+  return route;
+}
+
+/** A fresh desktop name per arm. The agent refuses to adopt a desktop that already exists. */
+function hiddenDesktopName() {
+  hiddenDesktopCounter += 1;
+  return `NmCuHidden${String(process.pid).slice(-6)}${hiddenDesktopCounter}`;
+}
+
+/**
+ * One request to the agent, over the lane, as one JSON line.
+ *
+ * `relayThroughLane` builds the pipe client and runs it IN the `windows` lane, so the traffic
+ * leaves this process through the same transport every other action uses and the instrumented
+ * seams of this module apply to it. The answer is the agent's own JSON line.
+ */
+async function hiddenAgentAnswer(route, op, fields = {}, options = {}) {
+  if (route.closed) return { ok: false, error_code: 'hidden_agent_closed', error: `The hidden-desktop agent on ${route.desktopName} has been closed.` };
+  const mod = await hiddenAgentModule();
+  const request = { id: `${op}-${crypto.randomBytes(4).toString('hex')}`, op, ...fields };
+  const startedAt = Date.now();
+  let relay;
+  try {
+    relay = await mod.relayThroughLane(route.pipe, request, {
+      token: route.token,
+      lane: 'windows',
+      timeoutMs: clampNumber(options.timeoutMs, 1000, 300000, 60000),
+    });
+  } catch (error) {
+    return { ok: false, error_code: 'hidden_agent_relay_threw', error: error instanceof Error ? error.message : String(error), elapsedMs: Date.now() - startedAt };
+  }
+  route.requests += 1;
+  route.lastOp = op;
+  const elapsedMs = Date.now() - startedAt;
+  if (relay.ok !== true) {
+    return { ok: false, error_code: 'hidden_agent_unreachable', error: `The hidden-desktop agent on ${route.desktopName} did not answer the ${op} request: ${String(relay.error || 'no answer')}`, elapsedMs, output: String(relay.output || '').slice(-400) };
+  }
+  const value = relay.value && typeof relay.value === 'object' ? relay.value : {};
+  if (value.ok !== true) {
+    return { ok: false, error_code: 'hidden_agent_refused', error: String(value.error || `the hidden-desktop agent refused the ${op} request`), value, elapsedMs };
+  }
+  return { ok: true, value, elapsedMs };
+}
+
+/**
+ * The agent's window list, in this module's own application-record shape.
+ *
+ * Two conversions are the whole job, and both are stated in the payload rather than left to a
+ * reader to discover:
+ *
+ *   - `client_rect` is reported with its ORIGIN AT THE CLIENT, because that is the space the
+ *     agent's click and scroll requests are addressed in (a posted `WM_LBUTTONDOWN` carries
+ *     client coordinates). An app-scoped point therefore means the same thing on both routes,
+ *     which is what lets one call sequence run against either desktop unchanged.
+ *   - The window rectangle is in the hidden desktop's own coordinate space, which is not this
+ *     one. `coordinate_space` says so where it is reported.
+ */
+function hiddenApplications(answer) {
+  const raw = Array.isArray(answer.windows) ? answer.windows : [];
+  const foreground = String(answer.foreground || '').toLowerCase();
+  const desktop = String(answer.desktop || '');
+  return raw
+    .map((entry) => {
+      const rect = entry && entry.rect && typeof entry.rect === 'object' ? entry.rect : {};
+      const client = entry && entry.client && typeof entry.client === 'object' ? entry.client : {};
+      const handle = String((entry && entry.handle) || '');
+      return {
+        handle,
+        handle_key: handle.toLowerCase(),
+        title: String((entry && entry.title) || ''),
+        process_id: Number(entry && entry.pid) || 0,
+        class_name: String((entry && entry.class_name) || ''),
+        rect: normalizeRect(rect),
+        client_rect: { x: 0, y: 0, width: Math.max(0, Number(client.width) || 0), height: Math.max(0, Number(client.height) || 0) },
+        client_rect_origin: 'client',
+        visible: entry && entry.visible === true,
+        minimized: entry && entry.minimized === true,
+        foreground: handle !== '' && handle.toLowerCase() === foreground,
+        occluded: false,
+        desktop,
+      };
+    })
+    .filter((entry) => handleToInt(entry.handle) !== 0);
+}
+
+async function hiddenEnumerate(route, options = {}) {
+  const answer = await hiddenAgentAnswer(route, 'enumerate', {}, { timeoutMs: options.timeoutMs });
+  if (answer.ok !== true) return { ok: false, applications: [], error_code: answer.error_code, error: answer.error, elapsedMs: answer.elapsedMs };
+  const applications = hiddenApplications(answer.value);
+  return {
+    ok: true,
+    applications,
+    window_count: Number(answer.value.window_count) || applications.length,
+    desktop: String(answer.value.desktop || route.desktopName),
+    window_station: String(answer.value.window_station || ''),
+    foreground: String(answer.value.foreground || ''),
+    elapsedMs: answer.elapsedMs,
+    agent: answer.value,
+  };
+}
+
+/**
+ * The target of one routed action: an explicit handle, the handle a previous `app_activate`
+ * bound, or a title/class match - the same three rules the interactive resolver uses, applied
+ * to the hidden desktop's own window list.
+ */
+async function hiddenResolve(route, options = {}) {
+  const enumerated = await hiddenEnumerate(route, options);
+  if (enumerated.ok !== true) return { ok: false, applications: [], error_code: enumerated.error_code, error: enumerated.error, enumerated };
+  const applications = enumerated.applications;
+  const explicit = handleHex(options.windowHandle || options.window_handle);
+  if (explicit) {
+    const wanted = `0x${explicit}`.toLowerCase();
+    const match = applications.find((app) => app.handle_key === wanted);
+    if (match) return { ok: true, application: match, applications, enumerated };
+    return {
+      ok: false,
+      applications,
+      enumerated,
+      error_code: 'app_target_not_found',
+      error: `No window on the hidden desktop ${route.desktopName} has handle 0x${explicit} (the agent listed ${applications.length}).`,
+    };
+  }
+  const bound = virtualPointerFor(options.ownerId);
+  if (bound && bound.windowHandle) {
+    const wanted = String(bound.windowHandle).toLowerCase();
+    const match = applications.find((app) => app.handle_key === wanted);
+    if (match) return { ok: true, application: match, applications, enumerated };
+  }
+  const target = String(options.appTarget || options.app_target || '').trim();
+  if (!target) {
+    return {
+      ok: false,
+      applications,
+      enumerated,
+      error_code: 'app_target_required',
+      error: `The hidden-desktop route needs app_target or window_handle so it never falls back to the hidden desktop's foreground window. The agent listed ${applications.length} window(s) on ${route.desktopName}.`,
+    };
+  }
+  const wanted = target.toLowerCase();
+  const wantedHandle = handleHex(target);
+  let matches = wantedHandle ? applications.filter((app) => app.handle_key === `0x${wantedHandle}`.toLowerCase()) : [];
+  if (!matches.length) matches = applications.filter((app) => app.title.toLowerCase().includes(wanted));
+  if (!matches.length) matches = applications.filter((app) => app.class_name.toLowerCase().includes(wanted));
+  if (!matches.length) {
+    return {
+      ok: false,
+      applications,
+      enumerated,
+      error_code: 'app_target_not_found',
+      error: `No window on the hidden desktop ${route.desktopName} matched app_target ${target}; the agent listed ${applications.length} window(s).`,
+    };
+  }
+  return { ok: true, application: matches[0], applications, enumerated };
+}
+
+/**
+ * The receipt header every routed answer carries.
+ *
+ * `queued` is `true` only where a message really was posted to the target's queue, and it
+ * never means the application acted on it: `action_completed` stays `false` for exactly that
+ * reason. The one fact worth more than either is `target_desktop`, which names the desktop the
+ * application is on - a reader can tell a hidden-desktop action from an interactive one
+ * without knowing which code path produced the answer.
+ */
+function hiddenHeader(route, header, extra = {}) {
+  return {
+    ...header,
+    mouse_mode: 'virtual',
+    delivery: 'hidden-desktop-agent',
+    mouse_mode_effective: 'virtual',
+    target_desktop: route.desktopName,
+    routed_to: {
+      desktop: route.desktopName,
+      agent_pid: route.agentPid,
+      transport: 'json-lines over the agent named pipe, relayed through the windows lane',
+      cross_desktop_reach_used: false,
+    },
+    physical_delivery_used: false,
+    system_cursor_moved: false,
+    fallback_to_real_delivery: false,
+    ...extra,
+  };
+}
+
+/** A posted-message receipt: what the agent's own post calls answered. */
+function hiddenPosted(posted) {
+  const record = posted && typeof posted === 'object' ? posted : {};
+  const values = Object.values(record).filter((value) => typeof value === 'boolean');
+  return {
+    queued: values.length > 0 && values.every((value) => value === true),
+    action_completed: false,
+    delivery_semantics: 'queued-to-target-thread-message-queue-by-the-agent',
+    agent_posted: record,
+  };
+}
+
+async function hiddenAppListAction(action, options, mode, header, route) {
+  const enumerated = await hiddenEnumerate(route, options);
+  if (enumerated.ok !== true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      applications: [],
+      windows: [],
+      count: 0,
+      error_code: enumerated.error_code,
+      error: enumerated.error,
+      scope: 'hidden-desktop',
+      desktop_name: route.desktopName,
+      telemetry: { lane: 'hidden-agent', elapsed_ms: enumerated.elapsedMs },
+    };
+  }
+  return {
+    ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+    ok: true,
+    action,
+    applications: enumerated.applications,
+    windows: enumerated.applications,
+    count: enumerated.applications.length,
+    window_count: enumerated.window_count,
+    scope: 'hidden-desktop',
+    desktop_name: route.desktopName,
+    desktop_reported_by_the_agent: enumerated.desktop,
+    window_station_reported_by_the_agent: enumerated.window_station,
+    foreground_window: enumerated.foreground,
+    coordinate_space: {
+      window_rect: 'the hidden desktop own coordinate space',
+      client_rect_origin: 'client',
+      app_scoped_points: 'client-relative, addressed by the agent posted messages',
+    },
+    telemetry: { lane: 'hidden-agent', elapsed_ms: enumerated.elapsedMs },
+  };
+}
+
+/** The child windows of a target, as the controls a routed observation can honestly report. */
+function hiddenControls(answer) {
+  const raw = Array.isArray(answer.children) ? answer.children : [];
+  return raw.map((child) => ({
+    handle: String((child && child.handle) || ''),
+    name: String((child && child.title) || ''),
+    class_name: String((child && child.class_name) || ''),
+    control_type: semanticRole(String((child && child.class_name) || '')),
+    process_id: Number(child && child.pid) || 0,
+    visible: child && child.visible === true,
+    enabled: true,
+    controls_source: 'hidden-agent child-window enumeration',
+  }));
+}
+
+/**
+ * One routed observation: the agent captures the window ON its own desktop and the lane reads
+ * the file back.
+ *
+ * The digest is of the FILE BYTES, and it says so. It is deliberately NOT shaped like the
+ * window_capture lane's 32x18 luma digest: that digest is computed from a bitmap inside the
+ * capture lane, and dressing a byte hash up as one would be a payload that lies about where
+ * its numbers came from.
+ */
+async function hiddenAppObserveAction(action, options, mode, header, route) {
+  const resolved = await hiddenResolve(route, options);
+  if (resolved.ok !== true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: resolved.error_code,
+      error: resolved.error,
+      applications: (resolved.applications || []).slice(0, 20),
+      desktop_name: route.desktopName,
+    };
+  }
+  const application = resolved.application;
+  if (application.minimized === true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: 'window_minimized',
+      error: 'A minimized window has no capturable presentation.',
+      app: application,
+      desktop_name: route.desktopName,
+    };
+  }
+  const outPath = hiddenCapturePath(options.ownerId);
+  const capturedAt = Date.now();
+  const shot = await hiddenAgentAnswer(route, 'capture', { handle: application.handle, path: outPath }, { timeoutMs: options.timeoutMs });
+  if (shot.ok !== true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: shot.error_code,
+      error: shot.error,
+      app: application,
+      desktop_name: route.desktopName,
+      telemetry: { lane: 'hidden-agent', capture_ms: Date.now() - capturedAt },
+    };
+  }
+  const file = hiddenFileFacts(String(shot.value.path || outPath));
+  const children = await hiddenAgentAnswer(route, 'children', { handle: application.handle }, { timeoutMs: options.timeoutMs });
+  const controls = children.ok === true ? hiddenControls(children.value) : [];
+  const capture = {
+    image_path: file.path,
+    image_mime: 'image/bmp',
+    width: Number(shot.value.width) || 0,
+    height: Number(shot.value.height) || 0,
+    image_bytes: file.bytes,
+    capture_method: `agent PrintWindow(hwnd,hdc,${Number(shot.value.route) || 0}) on the hidden desktop`,
+    target_scope: application.handle,
+    lane: 'hidden-agent',
+    agent_capture_route: Number(shot.value.route) || 0,
+    digest: {
+      sha256: file.sha256,
+      sha256_prefix: file.sha256 ? file.sha256.slice(0, 16) : '',
+      bytes: file.bytes,
+      of: 'the capture file bytes, not the window_capture lane luma digest',
+    },
+    agent_reported_sha256: String(shot.value.sha256 || ''),
+    agent_reported_bytes: Number(shot.value.bytes) || 0,
+  };
+  observationsByOwner.set(ownerKey(options.ownerId), {
+    windowHandle: application.handle,
+    sceneGeneration: sceneGeneration([application], controls),
+    capturedAt: Date.now(),
+  });
+  return {
+    ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+    ok: true,
+    action,
+    observation: 'full',
+    observation_scope: 'window',
+    must_reacquire_full_observation: false,
+    app: application,
+    window: application,
+    image_path: capture.image_path,
+    image_mime: capture.image_mime,
+    width: capture.width,
+    height: capture.height,
+    image_width: capture.width,
+    image_height: capture.height,
+    image_bytes: capture.image_bytes,
+    capture,
+    controls,
+    control_count: controls.length,
+    controls_source: 'hidden-agent child-window enumeration, with no UI Automation and no geometry',
+    uia_visited: 0,
+    target_scope: capture.target_scope,
+    capture_scope: 'window',
+    desktop_name: route.desktopName,
+    telemetry: {
+      lane: 'hidden-agent',
+      capture_ms: Date.now() - capturedAt,
+      uia_ms: 0,
+      uia_lane: null,
+      uia_error: null,
+    },
+  };
+}
+
+/** Binding a target on the hidden desktop records which window receives the messages. */
+async function hiddenAppActivateAction(action, options, mode, header, route) {
+  const resolved = await hiddenResolve(route, options);
+  if (resolved.ok !== true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: resolved.error_code,
+      error: resolved.error,
+      applications: (resolved.applications || []).slice(0, 20),
+      desktop_name: route.desktopName,
+    };
+  }
+  const application = resolved.application;
+  if (application.minimized === true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: 'window_minimized',
+      error: 'A minimized window has no capturable presentation.',
+      app: application,
+      desktop_name: route.desktopName,
+    };
+  }
+  setVirtualPointer(options.ownerId, {
+    windowHandle: String(application.handle),
+    x: Math.round(application.client_rect.width / 2),
+    y: Math.round(application.client_rect.height / 2),
+    targetHandle: String(application.handle),
+  });
+  return {
+    ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+    ok: true,
+    action,
+    activated: false,
+    foreground_activated: false,
+    dry_run: options.dryRun === true,
+    bound_handle: String(application.handle),
+    app: application,
+    desktop_name: route.desktopName,
+  };
+}
+
+/**
+ * An app-scoped point in the space the agent's own requests are addressed in.
+ *
+ * The relative rule is the interactive one - a value in 0..1 is a fraction of the client area
+ * and anything else is an offset from its origin - and the refusal is the same too. What
+ * differs is the ORIGIN: the point handed to the agent is client-relative, because that is
+ * what a posted mouse message carries.
+ */
+function hiddenClientPoint(application, x, y) {
+  const client = application.client_rect || { x: 0, y: 0, width: 0, height: 0 };
+  if (client.width <= 0 || client.height <= 0) {
+    return { ok: false, error: 'The target window client area is empty, so it cannot receive posted messages.' };
+  }
+  const nx = Number(x);
+  const ny = Number(y);
+  if (!Number.isFinite(nx) && !Number.isFinite(ny)) {
+    return { ok: true, x: Math.round(client.width / 2), y: Math.round(client.height / 2), point_source: 'client centre' };
+  }
+  const relativeX = Number.isFinite(nx) && nx >= 0 && nx <= 1;
+  const relativeY = Number.isFinite(ny) && ny >= 0 && ny <= 1;
+  const px = Number.isFinite(nx) ? (relativeX ? Math.round(client.width * nx) : Math.round(nx)) : Math.round(client.width / 2);
+  const py = Number.isFinite(ny) ? (relativeY ? Math.round(client.height * ny) : Math.round(ny)) : Math.round(client.height / 2);
+  if (px < 0 || px >= client.width || py < 0 || py >= client.height) {
+    return { ok: false, error: `An app-scoped point must lie inside the target client area (0,0,${client.width}x${client.height}); received ${px},${py}.` };
+  }
+  return { ok: true, x: px, y: py, point_source: relativeX || relativeY ? 'fraction of the client area' : 'offset from the client origin' };
+}
+
+async function hiddenAppPhysicalAction(action, options, mode, header, route) {
+  const resolved = await hiddenResolve(route, options);
+  if (resolved.ok !== true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: resolved.error_code,
+      error: resolved.error,
+      applications: (resolved.applications || []).slice(0, 20),
+      desktop_name: route.desktopName,
+    };
+  }
+  const application = resolved.application;
+  if (application.minimized === true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: 'window_minimized',
+      error: 'A minimized window has no capturable presentation.',
+      app: application,
+      desktop_name: route.desktopName,
+    };
+  }
+  if (options.dryRun === true) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: true,
+      action,
+      dry_run: true,
+      app: application,
+      desktop_name: route.desktopName,
+      message_delivered: false,
+    };
+  }
+
+  if (action === 'app_click') {
+    const point = hiddenClientPoint(application, options.x, options.y);
+    if (point.ok !== true) {
+      return {
+        ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+        ok: false,
+        action,
+        error_code: 'point_outside_window',
+        error: point.error,
+        app: application,
+        desktop_name: route.desktopName,
+      };
+    }
+    const clicked = await hiddenAgentAnswer(route, 'click', { handle: application.handle, x: point.x, y: point.y }, { timeoutMs: options.timeoutMs });
+    if (clicked.ok !== true) {
+      return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: clicked.error_code, error: clicked.error, app: application, desktop_name: route.desktopName };
+    }
+    return {
+      ...hiddenHeader(route, header, hiddenPosted(clicked.value.posted)),
+      ok: true,
+      action,
+      app: application,
+      x: point.x,
+      y: point.y,
+      point_source: point.point_source,
+      coordinate_space: 'client-relative on the hidden desktop',
+      button: options.button === 'right' ? 'right' : 'left',
+      is_window: clicked.value.is_window === true,
+      desktop_name: route.desktopName,
+    };
+  }
+
+  if (action === 'app_scroll') {
+    const scrollX = Math.floor(Number(options.scrollX || options.scroll_x || 0));
+    const scrollY = Math.floor(Number(options.scrollY || options.scroll_y || 0));
+    if (!scrollX && !scrollY) {
+      return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: 'scroll_delta_required', error: 'scroll_x or scroll_y is required.', desktop_name: route.desktopName };
+    }
+    if (scrollX && !scrollY) {
+      return {
+        ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+        ok: false,
+        action,
+        error_code: 'hidden_agent_horizontal_wheel_unsupported',
+        error: 'The hidden-desktop agent posts WM_MOUSEWHEEL and nothing else, so a horizontal-only scroll is refused rather than reported as delivered. Use scroll_y, or the real mouse mode.',
+        desktop_name: route.desktopName,
+      };
+    }
+    const point = hiddenClientPoint(application, options.x, options.y);
+    if (point.ok !== true) {
+      return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: 'point_outside_window', error: point.error, app: application, desktop_name: route.desktopName };
+    }
+    const delta = -scrollY;
+    const scrolled = await hiddenAgentAnswer(route, 'scroll', { handle: application.handle, delta }, { timeoutMs: options.timeoutMs });
+    if (scrolled.ok !== true) {
+      return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: scrolled.error_code, error: scrolled.error, app: application, desktop_name: route.desktopName };
+    }
+    return {
+      ...hiddenHeader(route, header, hiddenPosted({ wheel: scrolled.value.posted === true })),
+      ok: true,
+      action,
+      app: application,
+      x: point.x,
+      y: point.y,
+      scroll_x: scrollX,
+      scroll_y: scrollY,
+      wheel_delta_delivered: delta,
+      centered: scrolled.value.centered === true,
+      desktop_name: route.desktopName,
+    };
+  }
+
+  if (action === 'app_type') {
+    const text = String(options.text || '');
+    if (!text) {
+      return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: 'text_required', error: 'text is required.', desktop_name: route.desktopName };
+    }
+    if (text.length > 4096) {
+      return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: 'text_too_long', error: 'Typing is capped at 4096 UTF-16 code units per action.', desktop_name: route.desktopName };
+    }
+    const typed = await hiddenAgentAnswer(route, 'type', { handle: application.handle, text }, { timeoutMs: options.timeoutMs });
+    if (typed.ok !== true) {
+      return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: typed.error_code, error: typed.error, app: application, desktop_name: route.desktopName };
+    }
+    const characters = Number(typed.value.characters) || 0;
+    const postedCount = Number(typed.value.posted) || 0;
+    return {
+      ...hiddenHeader(route, header, { queued: postedCount > 0 && postedCount >= characters, action_completed: false, delivery_semantics: 'WM_CHAR posted per character by the agent' }),
+      ok: true,
+      action,
+      app: application,
+      characters,
+      posted: postedCount,
+      used_edit_child: typed.value.used_edit_child === true,
+      target_control: String(typed.value.target_handle || application.handle),
+      text_delivery: 'posted WM_CHAR, one per character',
+      desktop_name: route.desktopName,
+    };
+  }
+
+  const built = resolveKeyChord(String(options.key || ''));
+  if (built.error) {
+    return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: 'key_unsupported', error: built.error, desktop_name: route.desktopName };
+  }
+  if (built.windowsKey) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: 'windows_key_requires_real_delivery',
+      error: `The hidden-desktop agent posts one key to one window, and a Windows key is system-scoped: ${String(options.key || '')} is refused rather than reported as delivered. Use the real mouse mode for this chord.`,
+      desktop_name: route.desktopName,
+    };
+  }
+  if (built.virtualKeys.length !== 1) {
+    return {
+      ...hiddenHeader(route, header, { queued: false, action_completed: false }),
+      ok: false,
+      action,
+      error_code: 'hidden_agent_single_key_only',
+      error: `The hidden-desktop agent posts one key down/up pair, so a chord cannot be held across it: ${String(options.key || '')} composes ${built.virtualKeys.length} keys. A single key is supported.`,
+      key_codes: built.virtualKeys,
+      desktop_name: route.desktopName,
+    };
+  }
+  const virtualKey = built.virtualKeys[0];
+  const pressed = await hiddenAgentAnswer(route, 'key', { handle: application.handle, vk: virtualKey }, { timeoutMs: options.timeoutMs });
+  if (pressed.ok !== true) {
+    return { ...hiddenHeader(route, header, { queued: false, action_completed: false }), ok: false, action, error_code: pressed.error_code, error: pressed.error, app: application, desktop_name: route.desktopName };
+  }
+  return {
+    ...hiddenHeader(route, header, hiddenPosted(pressed.value.posted)),
+    ok: true,
+    action,
+    app: application,
+    key: String(options.key || ''),
+    key_code: virtualKey,
+    key_delivery: 'posted WM_KEYDOWN/WM_KEYUP to the target window by the agent',
+    desktop_name: route.desktopName,
+  };
+}
+
+/** The routed answer for one action, or null when this action is not routed at all. */
+async function hiddenDesktopAction(action, options, mode, header, route) {
+  if (action === 'app_list') return await hiddenAppListAction(action, options, mode, header, route);
+  if (action === 'app_observe') return await hiddenAppObserveAction(action, options, mode, header, route);
+  if (action === 'app_activate') return await hiddenAppActivateAction(action, options, mode, header, route);
+  if (action === 'app_click' || action === 'app_type' || action === 'app_scroll' || action === 'app_key') {
+    return await hiddenAppPhysicalAction(action, options, mode, header, route);
+  }
+  if (action === 'app_drag') {
+    return failure(action, 'hidden_agent_action_unsupported', 'The hidden-desktop agent has no drag primitive: it posts clicks, keys, characters and one wheel message. Use app_click, or the real mouse mode for a drag.', hiddenHeader(route, header, { queued: false, action_completed: false, desktop_name: route.desktopName }));
+  }
+  return null;
+}
+
+/* --- arming and tearing the route down ---------------------------- */
+
+/** Where a routed capture is written. The agent writes a BMP, and the name says so. */
+function hiddenCapturePath(ownerId) {
+  return capturePath(ownerId, 'hidden').replace(/\.png$/, '.bmp');
+}
+
+/** The file facts of one capture, read back by this process. */
+function hiddenFileFacts(file) {
+  try {
+    const bytes = fs.readFileSync(file);
+    return { path: file, exists: true, bytes: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
+  } catch {
+    return { path: file, exists: false, bytes: 0, sha256: '' };
+  }
+}
+
+/**
+ * Which of these exact pids are still running, asked of a fresh PowerShell through the lane.
+ *
+ * By PID and never by name: every pid here was returned by the create call that made the
+ * process. `-ErrorAction SilentlyContinue` makes a pid that is gone answer `$null` instead of
+ * an error, and the lane's own error handling is left alone.
+ */
+function hiddenLivenessScript(pids) {
+  const wanted = pids.map((pid) => Number(pid)).filter((pid) => Number.isFinite(pid) && pid > 0);
+  return [
+    '$ErrorActionPreference = "Continue"',
+    `$wanted = @(${wanted.join(', ')})`,
+    '$found = New-Object System.Collections.ArrayList',
+    'foreach ($wantedPid in $wanted) {',
+    '  $candidate = Get-Process -Id $wantedPid -ErrorAction SilentlyContinue',
+    '  [void]$found.Add(@{ pid = [int]$wantedPid; running = ($null -ne $candidate) })',
+    '}',
+    'Write-Output (@{ pids = @($found) } | ConvertTo-Json -Compress -Depth 4)',
+  ].join('\r\n');
+}
+
+async function hiddenPidStates(pids) {
+  const wanted = pids.filter((pid) => Number.isFinite(pid) && Number(pid) > 0);
+  if (!wanted.length) return { ok: true, states: [] };
+  const result = await runInLane('windows', hiddenLivenessScript(wanted), 30000);
+  if (!result.ok) {
+    const parsed = parsePsError(result.output);
+    return { ok: false, states: [], error_code: parsed.code, error: parsed.message };
+  }
+  const parsed = parseJsonObject(result.output);
+  const listed = parsed && Array.isArray(parsed.pids) ? parsed.pids : (parsed && parsed.pids ? [parsed.pids] : null);
+  /*
+   * An unreadable answer is a FAILED check, never an empty list of survivors.
+   *
+   * The first version answered `states: []` when the lane's answer could not be parsed, and its
+   * caller reads "nothing is running" out of that - so a lane that could not answer at all
+   * produced "every process is gone". That is the shape of a check that cannot fail, and it is
+   * reported as a failure now: the teardown fails closed rather than claiming a clean end it
+   * never measured.
+   */
+  if (!listed) {
+    return {
+      ok: false,
+      states: [],
+      error_code: 'hidden_liveness_unreadable',
+      error: `the liveness check on ${wanted.join(', ')} answered something this lane could not read`,
+      output: String(result.output || '').slice(-400),
+    };
+  }
+  return {
+    ok: true,
+    states: listed.map((state) => ({ pid: Number(state && state.pid) || 0, running: state && state.running === true })),
+  };
+}
+
+/**
+ * Wait for every named pid to stop running.
+ *
+ * A process that has just been terminated keeps answering `OpenProcess` for a moment, so this
+ * polls `Get-Process` - which reports a corpse as gone - rather than trusting one read. The
+ * answer names what is still running when the deadline passes.
+ */
+async function hiddenWaitForExit(pids, timeoutMs = 15000) {
+  const startedAt = Date.now();
+  const wanted = pids.filter((pid) => Number.isFinite(pid) && Number(pid) > 0);
+  if (!wanted.length) return { gone: [], still_running: [], attempts: 0, elapsedMs: 0, all_gone: true };
+  let last = { states: [] };
+  let attempts = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    attempts += 1;
+    last = await hiddenPidStates(wanted);
+    if (last.ok === true) {
+      const running = last.states.filter((state) => state.running).map((state) => state.pid);
+      if (running.length === 0) {
+        return { gone: wanted, still_running: [], attempts, elapsedMs: Date.now() - startedAt, all_gone: true };
+      }
+    }
+    await sleep(250);
+  }
+  if (last.ok !== true) {
+    /* FAIL CLOSED. A wait that never got a readable answer knows nothing about what is running,
+     * so it says so instead of reporting an empty survivor list - which is what "all gone" would
+     * be read as. */
+    return {
+      gone: [],
+      still_running: wanted,
+      attempts,
+      elapsedMs: Date.now() - startedAt,
+      all_gone: false,
+      liveness_error: String(last.error || 'the liveness check never produced a readable answer'),
+    };
+  }
+  const running = last.states.filter((state) => state.running).map((state) => state.pid);
+  return {
+    gone: wanted.filter((pid) => !running.includes(pid)),
+    still_running: running,
+    attempts,
+    elapsedMs: Date.now() - startedAt,
+    all_gone: running.length === 0,
+    liveness_error: null,
+  };
+}
+
+/**
+ * Is the desktop still openable, asked from the lane with the agent's own maker payload?
+ *
+ * The handle this opens is CLOSED again before the answer is written - a probe that leaks the
+ * handle it opened would hold open the very desktop it is measuring. A desktop is held by any
+ * handle OR any process assigned to it, so this is the only question that distinguishes "the
+ * processes are gone" from "the desktop is gone".
+ */
+function hiddenDesktopProbeScript(desktopName, makerSource) {
+  return [
+    '$ErrorActionPreference = "Stop"',
+    "$source = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(@'",
+    Buffer.from(makerSource, 'utf8').toString('base64'),
+    "'@))",
+    'if (-not ("NmHiddenMaker" -as [type])) { Add-Type -TypeDefinition $source -ErrorAction Stop }',
+    '$errorCode = 0',
+    `$desktop = [NmHiddenMaker]::OpenByName(${psQuote(desktopName)}, [ref]$errorCode)`,
+    '$openable = ($desktop -ne [IntPtr]::Zero)',
+    '$closed = $false',
+    'if ($openable) { $closed = [NmHiddenMaker]::CloseDesktop($desktop) }',
+    `Write-Output (@{ desktop = ${psQuote(desktopName)}; still_openable = $openable; open_error = [int]$errorCode; probe_handle_closed = $closed; lane_thread_desktop = [NmHiddenMaker]::DesktopName() } | ConvertTo-Json -Compress)`,
+  ].join('\r\n');
+}
+
+async function hiddenDesktopProbe(route) {
+  let makerSource = '';
+  try {
+    makerSource = fs.readFileSync(route.makerFile, 'utf8');
+  } catch (error) {
+    return { checked: false, still_openable: null, error: `the maker payload could not be read from ${route.makerFile}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const result = await runInLane('windows', hiddenDesktopProbeScript(route.desktopName, makerSource), 30000);
+  if (!result.ok) {
+    const parsed = parsePsError(result.output);
+    return { checked: false, still_openable: null, error_code: parsed.code, error: parsed.message };
+  }
+  const parsed = parseJsonObject(result.output);
+  if (!parsed) return { checked: false, still_openable: null, error: 'the desktop probe returned an unreadable answer' };
+  return {
+    checked: true,
+    still_openable: parsed.still_openable === true,
+    open_error: Number(parsed.open_error) || 0,
+    probe_handle_closed: parsed.probe_handle_closed === true,
+    lane_thread_desktop: String(parsed.lane_thread_desktop || ''),
+    checked_from: 'the windows lane, on the interactive desktop, with no handle of its own to the agent',
+  };
+}
+
+/**
+ * Start one resident agent on a fresh desktop and bind it to this owner.
+ *
+ * The order is the measured one and it is not negotiable: the launcher creates the desktop and
+ * holds it, the agent starts onto it by `lpDesktop` and opens its OWN handle, and only then
+ * does the launcher drop its own. The agent's own ready file is the evidence that the handover
+ * happened - its presence means an agent that holds its desktop, not merely that something
+ * started.
+ */
+async function armHiddenDesktop(options, ownerId) {
+  const mod = await hiddenAgentModule();
+  const desktopName = hiddenDesktopName();
+  const ledger = mod.ledgerPath();
+
+  /*
+   * What a job handle could not survive is reaped BEFORE a new agent starts: a leaked process
+   * is a leaked desktop, and a desktop with a process on it stays openable even with every
+   * handle closed. The reaper is pid-AND-start-time matched (`NmProcessFacts.TerminateIfStartTime`
+   * refuses a mismatch), so a reused pid is left strictly alone.
+   */
+  let reaped = null;
+  try {
+    reaped = await mod.reapLedger({ file: ledger });
+    /* `terminated` while the reaper held no handle is reported below. */
+  } catch (error) {
+    reaped = { error: error instanceof Error ? error.message : String(error) };
+  }
+
+  const endpoint = await mod.startHiddenDesktopAgent({
+    desktopName,
+    ledgerFile: ledger,
+    readyWaitMs: clampNumber(options.hiddenReadyWaitMs, 5000, 180000, 60000),
+    launchTimeoutMs: clampNumber(options.hiddenLaunchTimeoutMs, 5000, 300000, 120000),
+  });
+  const ready = endpoint.ready && typeof endpoint.ready === 'object' ? endpoint.ready : null;
+  const route = {
+    ownerId,
+    desktopName: String(endpoint.desktopName || desktopName),
+    pipe: String(endpoint.pipe || ''),
+    token: String(endpoint.token || ''),
+    agentPid: ready ? Number(ready.pid) || 0 : 0,
+    agentStartTimeUtc: ready ? String(ready.start_time_utc || '') : '',
+    job: {
+      created: Boolean(ready && ready.job_created === true),
+      self_assigned: Boolean(ready && ready.job_assigned === true),
+      kill_on_close: Boolean(ready && ready.job_kill_on_close === true),
+      limit_flags: ready ? String(ready.job_limit_flags || '') : '',
+    },
+    ready,
+    scratch: String(endpoint.scratch || ''),
+    ledger,
+    makerFile: path.join(String(endpoint.payloads && endpoint.payloads.directory ? endpoint.payloads.directory : ''), 'NmHiddenMaker.cs'),
+    launcherReport: endpoint.launcher ? endpoint.launcher.report : null,
+    openedAt: Date.now(),
+    requests: 0,
+    launches: [],
+    closed: false,
+    reaped,
+  };
+
+  if (!ready || ready.ok !== true) {
+    route.closed = true;
+    return {
+      ok: false,
+      error_code: 'hidden_desktop_agent_unavailable',
+      error: String(endpoint.startError || 'the hidden-desktop agent did not report itself ready'),
+      route,
+      endpoint,
+    };
+  }
+  if (!route.agentPid) {
+    route.closed = true;
+    return { ok: false, error_code: 'hidden_desktop_agent_pid_unknown', error: 'the agent came up without reporting its own pid, so nothing could be tracked by identity', route, endpoint };
+  }
+  hiddenRoutes.set(ownerKey(ownerId), route);
+
+  /* The program the caller asked to start on that desktop. It inherits the job, which is what
+   * makes it the agent's to end; the pid AND start time it answers with are recorded for the
+   * teardown to check. */
+  let launched = null;
+  const commandLine = String(options.launch || '').trim();
+  if (commandLine) {
+    const started = await hiddenAgentAnswer(route, 'launch', { command_line: commandLine }, { timeoutMs: 60000 });
+    if (started.ok !== true) {
+      route.closed = true;
+      hiddenRoutes.delete(ownerKey(ownerId));
+      return { ok: false, error_code: 'hidden_desktop_launch_failed', error: started.error, route, endpoint, commandLine };
+    }
+    launched = {
+      command_line: commandLine,
+      pid: Number(started.value.pid) || 0,
+      start_time_utc: String(started.value.start_time_utc || ''),
+      start_time_ticks: String(started.value.start_time_ticks || ''),
+      in_job: started.value.in_job === true,
+      desktop_requested: String(started.value.desktop_requested || route.desktopName),
+    };
+    route.launches.push(launched);
+  }
+  return { ok: true, route, endpoint, launched };
+}
+
+/** The public shape of one armed route, with no token and no pipe name in it. */
+function hiddenRouteReport(route) {
+  if (!route) return null;
+  return {
+    desktop_name: route.desktopName,
+    agent_pid: route.agentPid,
+    agent_start_time_utc: route.agentStartTimeUtc,
+    job: route.job,
+    launched: route.launches,
+    opened_at: route.openedAt,
+    requests_served: route.requests,
+    transport: 'json-lines over the agent named pipe, one connection per request, through the windows lane',
+    token_reported: false,
+  };
+}
+
+/**
+ * End one route: end the agent, then MEASURE what that did.
+ *
+ * The order is the whole ownership contract. `exit` stops the agent's loop; the agent then
+ * exits, and the kernel closes the job handle it held, and KILL_ON_JOB_CLOSE terminates every
+ * process the job inherited - the launched application and its children. What is left is the
+ * desktop, and whether it is still there is asked rather than assumed.
+ */
+async function closeHiddenDesktop(route = null, options = {}) {
+  if (!route) return null;
+  /*
+   * The route leaves the registry FIRST so no new action can be routed to an agent that is
+   * being ended - and `closed` is set LAST, because `hiddenAgentAnswer` refuses a closed route.
+   *
+   * Measured: the first version set `closed` here, at the top, and then asked the agent for its
+   * state and for its exit through the very function that refuses a closed route. Both requests
+   * were refused by this code, the exit never reached the agent, and the teardown fell through
+   * to the pid fallback - which worked, and which reported `exit_answered: false` while it did.
+   * The fallback is the safety net, not the path, and this is what made the difference visible.
+   */
+  hiddenRoutes.delete(ownerKey(route.ownerId));
+  const startedAt = Date.now();
+  const before = await hiddenAgentAnswer(route, 'state', {}, { timeoutMs: 20000 });
+  const hosted = before.ok === true && Array.isArray(before.value.hosted) ? before.value.hosted : [];
+  const hostedPids = hosted.map((entry) => Number(entry && entry.pid) || 0).filter((pid) => pid > 0);
+  const exited = await hiddenAgentAnswer(route, 'exit', {}, { timeoutMs: 20000 });
+  const pids = [route.agentPid, ...hostedPids].filter((pid) => pid > 0);
+  let verified = await hiddenWaitForExit(pids, clampNumber(options.hiddenExitWaitMs, 1000, 120000, 20000));
+  let killedByThisCall = false;
+  if (!verified.all_gone && Number(route.agentPid) > 0 && verified.still_running.includes(Number(route.agentPid))) {
+    /* The agent is still running, so its own exit path did not finish. It is terminated from
+     * its own root - the pid its own ready file reported - and then measured again. */
+    try { process.kill(Number(route.agentPid)); killedByThisCall = true; } catch { killedByThisCall = false; }
+    verified = await hiddenWaitForExit(pids, clampNumber(options.hiddenExitWaitMs, 1000, 120000, 20000));
+  }
+  const desktop = await hiddenDesktopProbe(route);
+  route.closed = true;
+  return {
+    desktop_name: route.desktopName,
+    agent_pid: route.agentPid,
+    hosted_before_exit: hosted.map((entry) => ({ pid: Number(entry && entry.pid) || 0, start_time_ticks: String((entry && entry.start_time_ticks) || '') })),
+    launch_pids_this_session: route.launches.map((entry) => ({ pid: entry.pid, start_time_ticks: entry.start_time_ticks })),
+    state_answered: before.ok === true,
+    state_error: before.ok === true ? null : String(before.error || ''),
+    exit_answered: exited.ok === true,
+    exit_error: exited.ok === true ? null : String(exited.error || ''),
+    agent_terminated_by_this_call: killedByThisCall,
+    pids_checked: pids,
+    all_processes_gone: verified.all_gone,
+    still_running: verified.still_running,
+    exit_wait_ms: verified.elapsedMs,
+    exit_wait_attempts: verified.attempts,
+    liveness_error: verified.liveness_error,
+    desktop,
+    desktop_gone: desktop.still_openable === false,
+    elapsed_ms: Date.now() - startedAt,
+    requests_served: route.requests,
+  };
+}
+
+/**
+ * The last-resort teardown, for `stopAll()` and process exit, which cannot await anything.
+ *
+ * Every agent is terminated by the pid its own launcher reported. Killing the agent closes the
+ * job handle it held, and KILL_ON_JOB_CLOSE takes its whole tree with it - which is exactly
+ * why a leaked agent would be a leaked desktop and is not left to chance. This is best effort
+ * by construction: `exit` handlers are synchronous, so it cannot wait for, verify, or report
+ * anything, and `takeover_stop` remains the path that verifies.
+ */
+function stopHiddenAgentsSync() {
+  const stopped = [];
+  for (const route of hiddenRoutes.values()) {
+    route.closed = true;
+    const pid = Number(route.agentPid);
+    let killed = false;
+    if (Number.isFinite(pid) && pid > 0) {
+      try { process.kill(pid); killed = true; } catch { killed = false; }
+    }
+    stopped.push({ desktop_name: route.desktopName, agent_pid: pid, terminated: killed, verified: false });
+  }
+  hiddenRoutes.clear();
+  return stopped;
+}
+
+/* ------------------------------------------------------------------ *
+ * 10. sequence, the takeover lease, and the dispatcher
  * ------------------------------------------------------------------ */
 
 async function foregroundScene(options) {
@@ -3739,6 +4827,54 @@ function takeoverStart(options) {
       fallback_to_real_delivery: false,
     });
   }
+  /**
+   * A lease may be armed onto a hidden desktop, and that is the only thing this action starts.
+   *
+   * `desktop` is read in exactly one place, here, and the only value it accepts is `hidden`:
+   * a name it does not know is refused rather than ignored, because an ignored desktop request
+   * would silently deliver the actions to this desktop. A resident agent is a real process, so
+   * it is started when a caller asks for one and never on a read.
+   */
+  const desktopRequest = String(options.desktop || options.desktopTarget || '').trim().toLowerCase();
+  if (desktopRequest && desktopRequest !== 'hidden') {
+    return failure(action, 'desktop_unsupported', `The only desktop this lane can route to is "hidden"; received ${JSON.stringify(String(options.desktop || options.desktopTarget))}. Leave \`desktop\` out to act on this desktop.`, {
+      takeover: false,
+      requested_desktop: String(options.desktop || options.desktopTarget),
+      supported_desktops: ['hidden'],
+      mouse_mode: currentMouseMode(),
+      fallback_to_real_delivery: false,
+    });
+  }
+  if (desktopRequest === 'hidden' && requested !== 'virtual') {
+    return failure(action, 'hidden_desktop_requires_virtual_mode', 'A hidden desktop is reached with mouse_mode "virtual": the agent on it posts messages and moves no physical pointer, so asking for it with mouse_mode "real" is refused rather than downgraded.', {
+      takeover: false,
+      requested_desktop: 'hidden',
+      requested_mouse_mode: requested,
+      mouse_mode: currentMouseMode(),
+      fallback_to_real_delivery: false,
+    });
+  }
+  return { action, ownerId, requested, existing, desktopRequest };
+}
+
+/** The arm itself, which is asynchronous because a resident agent is a real process. */
+async function takeoverStartArmed(action, ownerId, requested, desktopRequest, options) {
+  let armed = null;
+  if (desktopRequest === 'hidden') {
+    armed = await armHiddenDesktop(options, ownerId);
+    if (armed.ok !== true) {
+      /* Nothing is left behind by a failed arm: the route record says `closed`, and the
+       * launcher has already closed the handle it created. */
+      return failure(action, armed.error_code, armed.error, {
+        takeover: false,
+        requested_desktop: 'hidden',
+        mouse_mode: 'real',
+        hidden_desktop: { started: false, desktop_name: armed.route ? armed.route.desktopName : '', launcher: armed.endpoint && armed.endpoint.launcher ? armed.endpoint.launcher.report : null },
+        fallback_to_real_delivery: false,
+        physical_delivery_used: false,
+      });
+    }
+  }
   lease.ownerId = ownerId;
   lease.mouseMode = requested;
   lease.acquiredAt = Date.now();
@@ -3752,7 +4888,7 @@ function takeoverStart(options) {
     action,
     takeover: true,
     mouse_mode: requested,
-    delivery: requested === 'virtual' ? 'posted-window-messages' : 'physical-desktop',
+    delivery: armed ? 'hidden-desktop-agent' : (requested === 'virtual' ? 'posted-window-messages' : 'physical-desktop'),
     lease: {
       owner_id: ownerId,
       mouse_mode: requested,
@@ -3764,13 +4900,41 @@ function takeoverStart(options) {
       released_by: LEASE_RELEASE_ACTION,
     },
     overlay: overlaySnapshot,
+    ...(armed
+      ? {
+        target_desktop: armed.route.desktopName,
+        hidden_desktop: {
+          started: true,
+          ...hiddenRouteReport(armed.route),
+          launched: armed.launched ? [armed.launched] : [],
+          reaped_before_start: armed.route.reaped
+            ? {
+              candidates: Number(armed.route.reaped.candidates) || 0,
+              terminated: Array.isArray(armed.route.reaped.terminated) ? armed.route.reaped.terminated.length : 0,
+              already_gone: Array.isArray(armed.route.reaped.already_gone) ? armed.route.reaped.already_gone.length : 0,
+              reused: Array.isArray(armed.route.reaped.reused) ? armed.route.reaped.reused.length : 0,
+              failed: Array.isArray(armed.route.reaped.failed) ? armed.route.reaped.failed.length : 0,
+              error: armed.route.reaped.error ? String(armed.route.reaped.error) : null,
+            }
+            : null,
+          routed_actions: ['app_list', 'app_observe', 'app_activate', 'app_click', 'app_type', 'app_scroll', 'app_key'],
+          end_with: 'takeover_stop',
+        },
+      }
+      : {}),
     physical_delivery_used: false,
     system_cursor_moved: false,
     fallback_to_real_delivery: false,
   };
 }
 
-function takeoverStop(options) {
+async function takeoverStartAction(options) {
+  const prepared = takeoverStart(options);
+  if (prepared.ok === false) return prepared;
+  return await takeoverStartArmed(prepared.action, prepared.ownerId, prepared.requested, prepared.desktopRequest, options);
+}
+
+async function takeoverStop(options) {
   const action = 'takeover_stop';
   const ownerId = String(options.ownerId || 'direct');
   const existing = activeLease();
@@ -3782,6 +4946,11 @@ function takeoverStop(options) {
     });
   }
   const previousOwner = existing ? existing.owner_id : null;
+  /* The hidden desktop is ended BEFORE the lease is released: the teardown needs the route the
+   * lease is holding, and the lease must not be reported as free while an agent still holds a
+   * desktop open. */
+  const route = hiddenRouteFor(ownerId);
+  const hidden = route ? await closeHiddenDesktop(route, options) : null;
   clearVirtualCursor(ownerId);
   releaseLease('takeover_stop');
   return {
@@ -3792,6 +4961,9 @@ function takeoverStop(options) {
     released_owner: previousOwner,
     lease: { held: false, owner_id: null, mouse_mode: 'real', expiry: LEASE_EXPIRY, ttl_ms: null, expires_at: null, expires_in_ms: null, released_by: LEASE_RELEASE_ACTION },
     overlay: overlayState(),
+    /* What the teardown MEASURED, or null when this lease never armed a hidden desktop. A
+     * desktop that survived is reported as surviving, with the pids that kept it alive. */
+    hidden_desktop: hidden,
     physical_delivery_used: false,
     system_cursor_moved: false,
   };
@@ -3840,8 +5012,11 @@ async function dispatchComputerUse(action, options) {
 
   // The takeover lease is pure process state, so it also works off Windows where nothing
   // can be typed or clicked. Everything that touches the desktop is refused there.
-  if (action === 'takeover_start') return takeoverStart(options);
-  if (action === 'takeover_stop') return takeoverStop(options);
+  // `takeover_start` is now asynchronous for one reason: `desktop: "hidden"` arms a resident
+  // agent on a hidden desktop, and starting a process cannot be done in a return statement.
+  // Without that option it does exactly what it did before, synchronously composed.
+  if (action === 'takeover_start') return await takeoverStartAction(options);
+  if (action === 'takeover_stop') return await takeoverStop(options);
   if (action === 'mode_report') return modeReport(action, options);
   if (action === 'wait') {
     const durationMs = clampNumber(options.durationMs ?? options.duration_ms, 0, 60000, 1000);
@@ -3864,6 +5039,23 @@ async function dispatchComputerUse(action, options) {
     lease_owner: mode.lease_owner,
     lane_routing: actionLanes(action),
   };
+
+  /**
+   * THE ROUTING DECISION, AND IT IS ONE DECISION IN ONE PLACE.
+   *
+   * When this owner's lease was armed onto a hidden desktop, the app-scoped actions are
+   * relayed to the resident agent on that desktop and no interactive-desktop code runs for
+   * them at all. It sits here, before every action branch, so no branch can accidentally act
+   * on this desktop while a caller believes it is working on the hidden one - and it is a
+   * no-op for every other call, including every virtual-mode call that did not ask for a
+   * hidden desktop. Actions the route does not carry (`observe`, `capture_screen`, `sequence`)
+   * fall through to the refusals they already had.
+   */
+  const hiddenRoute = hiddenRouteActive(options);
+  if (hiddenRoute) {
+    const routed = await hiddenDesktopAction(action, options, mode, header, hiddenRoute);
+    if (routed) return routed;
+  }
 
   if (action === 'observe') return await observeAction(action, options, mode, header);
   if (action === 'capture_screen') return await captureScreenAction(action, options, mode, header);
@@ -4519,9 +5711,31 @@ function modeReport(action, options) {
         'app_observe with app_target or window_handle (background window capture, no foreground capture)',
         'app_activate with app_target or window_handle (binds the target; it never activates anything)',
         'app_click, app_drag, app_scroll, app_type, app_key with app_target or window_handle (posted window messages)',
+        'the same actions against an agent-hosted hidden desktop, when the lease was armed with desktop "hidden": they are relayed to the resident agent on that desktop and nothing on this desktop is touched',
       ],
       requires: ['app_target or window_handle'],
       never_falls_back_to_real_delivery: true,
+    },
+    /**
+     * The hidden-desktop route, advertised as a capability.
+     *
+     * It is not advertised as an ACTION, because it is not one: it is a desktop an existing
+     * action set can be aimed at, armed on the lease. A caller that reads only this report can
+     * still see what becomes reachable, what it costs (a process that starts on request) and
+     * how it ends (the lease, with a measured teardown).
+     */
+    hidden_desktop: {
+      arm_with: 'takeover_start with mouse_mode "virtual" and desktop "hidden" (optionally launch: "<command line>" to start a program on it)',
+      routed_actions: ['app_list', 'app_observe', 'app_activate', 'app_click', 'app_type', 'app_scroll', 'app_key'],
+      not_routed: ['observe', 'capture_screen', 'sequence', 'move', 'click', 'drag', 'scroll', 'type', 'key', 'app_drag'],
+      starts_a_process_when_asked: true,
+      started_at_module_load: false,
+      transport: 'json lines over the resident agent\'s own named pipe, one connection per request, relayed through the windows lane',
+      reach: 'the agent lives on the hidden desktop and posts its own messages there: no cross-desktop call is made by this module',
+      ownership: 'the agent creates a job with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and assigns itself, so every process it launches is a member by inheritance',
+      teardown: 'takeover_stop exits the agent, measures that the agent and every hosted pid are gone, and asks whether the desktop is still openable',
+      cleanup_by_process_name: false,
+      active_routes: [...hiddenRoutes.values()].map((route) => hiddenRouteReport(route)),
     },
     physical_delivery_used: false,
   };
