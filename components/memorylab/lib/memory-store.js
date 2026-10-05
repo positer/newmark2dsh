@@ -192,6 +192,37 @@ export const TAG_EDIT_ACTION = 'TAG-EDIT';
 export const TAG_ARCHIVE_DIR = '_tag-graph';
 
 /**
+ * The hierarchy BOTH navigation reads answer from, named in every payload they return.
+ *
+ * `normalizeIndex()` builds `tags[name].parents` and `tags[name].children` from the components'
+ * `tagPaths` and from nothing else — a `parents`/`children` list stored in `index.json` is read
+ * for tag ORDER and for the cycle evidence (`storedGraphRelations()`), never as the hierarchy.
+ * So "which hierarchy did you use?" has one honest answer, and it is a value in the payload
+ * rather than a sentence in a doc.
+ */
+export const TAG_HIERARCHY_SOURCE = 'tagPaths';
+
+/** `limit` clamp for `memory_lab_root_tags`. A store may have one root per flat tag. */
+export const DEFAULT_ROOT_LIMIT = 100;
+export const MAX_ROOT_LIMIT = 1000;
+
+/** `max_tags` clamp for `memory_lab_subtag_tree`: rows in its structure table. */
+export const DEFAULT_TREE_MAX_TAGS = 500;
+export const MAX_TREE_MAX_TAGS = 5000;
+
+/** `max_components` clamp for `memory_lab_subtag_tree`: entries in its component list. */
+export const DEFAULT_TREE_MAX_COMPONENTS = 500;
+export const MAX_TREE_MAX_COMPONENTS = 5000;
+
+/**
+ * Hard cap on how deep a subtree walk descends, whatever the graph claims.
+ *
+ * A second guarantee beside the visited set, and it is the one that also bounds a DAG: a tag
+ * reachable by a million distinct paths is visited once, but the PATH to it is not.
+ */
+export const MAX_TREE_DEPTH = 64;
+
+/**
  * Bilingual synonym table. Every group folds to ONE canonical tag; the other
  * spellings are preserved in that tag node's `aliases`. `options.language`
  * (`'zh'` | `'en'`) selects which spelling of a group is canonical.
@@ -540,6 +571,46 @@ function notFoundError(selector) {
 }
 
 /**
+ * The refusal an unknown TAG gets: `NOT_FOUND`, naming the tag, in the same envelope shape
+ * `read()` answers with for a missing component.
+ *
+ * `notFoundError()` above is the COMPONENT one and keeps the reference's wording ("Memory
+ * component not found"). A tag is not a component, and a refusal that calls a tag a component
+ * sends its caller looking for the wrong thing in the wrong directory — same code, same shape,
+ * the right noun.
+ */
+function tagNotFoundError(selector, details = {}) {
+  return new MemoryLabStoreError('NOT_FOUND', `Memory Lab tag not found: ${selector}`, {
+    tag: selector,
+    ...details,
+  });
+}
+
+/**
+ * The `bounds` object a `subtag_tree` answer carries when there is no subtree to bound: a store
+ * that could not be read, or a tag that does not exist.
+ *
+ * Present rather than omitted on purpose. A caller that reads `bounds.truncated` has to get an
+ * answer on every path — `undefined` there is the shape that has cost this bundle two releases —
+ * and "0 of 0 listed, nothing dropped" is the true answer for an answer with no rows.
+ */
+function emptyTreeBounds(maxTags, maxComponents) {
+  return {
+    maxTags,
+    maxComponents,
+    maxDepth: MAX_TREE_DEPTH,
+    tagsShown: 0,
+    tagsTotal: 0,
+    tagsOmitted: 0,
+    componentsShown: 0,
+    componentsTotal: 0,
+    componentsOmitted: 0,
+    truncated: false,
+    dropped: [],
+  };
+}
+
+/**
  * The shape of a tag name with every separator removed, so `#AI-Agent`,
  * `#ai agent` and `#AI_Agent` compare equal. The reviews use it to find names
  * that are near-duplicates; it never rewrites a name.
@@ -743,6 +814,7 @@ export class MemoryLabStore {
       'memory_lab_update creates or replaces a component; pass expectedUpdatedAt from the latest read so a stale write is rejected instead of overwriting newer memory.',
       'For small edits prefer contentAppend or oldText/newText over resending the whole body. memory_lab_delete forgets a component only when the user asks.',
       'memory_lab_reindex is the deterministic rebuild; memory_lab_tag_review reports the tag-graph repairs that need your judgement (near-synonyms, a false root, a collapsed or over-split path, and a cycle — one the stored graph really holds, or two roots that each name the other as candidate parent) and memory_lab_tag_apply records the decisions you make from it, reversibly.',
+      'memory_lab_root_tags lists only the root parent tags with the size of the subtree under each, so a branch can be CHOSEN without reading the whole index; memory_lab_subtag_tree then reads one tag\'s subtree — its structure, the component names in it, and its statistics. Both are reads: they never write, never rebuild and never judge.',
       'Tag names carry one leading "#"; a tag that stands alone still gets its own single-node tagPath. Express hierarchy with tagPaths, for example [["#研究","#论文"]].',
       'Every revision is archived under archive/<slug>/ and every mutation appends one policy.jsonl line (action, slug, reason, source, timestamps, archive path, content hash) — never memory content.',
       'Never inject index or component content into the system prompt; retrieve it through these tools only when needed.',
@@ -1516,6 +1588,432 @@ export class MemoryLabStore {
       index: this.persistedIndex(loaded.index),
       contents,
     };
+  }
+
+  // -- tag-graph navigation (read-only) -------------------------------------
+
+  /**
+   * The ROOT parent tags: every tag with no parent, sized so a caller can choose one.
+   *
+   * READ-ONLY, and that word is the whole contract. It loads and normalizes the index exactly as
+   * `read()` does, reads the hierarchy named by `TAG_HIERARCHY_SOURCE`, and writes nothing at
+   * all — no rebuild, no archive snapshot, no `policy.jsonl` line, no `.bak`. It also JUDGES
+   * nothing: there is no finding, no candidate and no decision in this payload, because
+   * `memory_lab_tag_review` owns that and a navigation read that quietly ranked tags would be a
+   * second, unrecorded judgement.
+   *
+   * Why a caller wants it: `memory_lab_read` answers the whole index, and the whole index is the
+   * one thing a caller trying to CHOOSE a branch does not need. This answers only the places a
+   * descent can start, and answers for each of them the numbers that decide it — direct children,
+   * direct components, and the size of the subtree beneath it in both tags and components.
+   *
+   * `subtreeComponents` is the deduplicated union over the whole subtree, so a large but
+   * unpopulated branch (57 tags, 0 components) cannot be mistaken for a large populated one.
+   */
+  rootTags(options = {}) {
+    const loaded = this.loadIndex();
+    if (!loaded.ok) {
+      return {
+        ok: false,
+        readOnly: true,
+        root: this.root,
+        indexPath: this.indexPath,
+        requested: '',
+        roots: [],
+        counts: { roots: 0, tags: 0, components: 0, deepest: 0 },
+        window: { offset: 0, limit: 0, returned: 0, total: 0, omitted: 0 },
+        warnings: sortedUnique(loaded.warnings),
+        error: loaded.error,
+      };
+    }
+    const index = loaded.index;
+    const tags = index && index.tags && typeof index.tags === 'object' && !Array.isArray(index.tags) ? index.tags : {};
+    const components = componentList(index && index.components);
+    const knownSlugs = new Set(components.map((component) => String(component.slug)));
+    const names = Object.keys(tags);
+    const rootNames = names.filter((name) => toArray(tags[name] && tags[name].parents).length === 0);
+    const direct = (node) => sortedUnique(toArray(node && node.components)).filter((slug) => knownSlugs.has(slug));
+
+    /* One walk per root, MEMOIZED PER NODE: on this graph two branches can meet at one tag, and
+     * `subtreeOf()` is the same answer for it both times — which is what keeps a store with one
+     * root per flat tag from costing roots x tags. */
+    const memo = new Map();
+    const subtreeOf = (name) => {
+      const cached = memo.get(name);
+      if (cached) return cached;
+      const tagSet = new Set();
+      const slugSet = new Set();
+      let deepest = 0;
+      let cut = false;
+      const walk = (node, level, onPath) => {
+        if (onPath.has(node)) return; // a back-edge: stop, do not loop
+        if (level > MAX_TREE_DEPTH) {
+          cut = true;
+          return;
+        }
+        if (tagSet.has(node)) return;
+        tagSet.add(node);
+        deepest = Math.max(deepest, level);
+        for (const slug of direct(tags[node])) slugSet.add(slug);
+        const next = new Set(onPath);
+        next.add(node);
+        for (const child of sortedUnique(toArray((tags[node] || {}).children))) walk(String(child), level + 1, next);
+      };
+      walk(name, 0, new Set());
+      const result = { tagSet, slugSet, deepest, cut };
+      /* A subtree the depth cap cut short is a PARTIAL answer, and memoizing it would hand that
+       * partial answer to a root that would otherwise have walked it whole. The loaded graph
+       * cannot hold a cycle, so this guard is the cap's, not a case that occurs. */
+      if (!cut) memo.set(name, result);
+      return result;
+    };
+
+    const rows = rootNames.map((name) => {
+      const subtree = subtreeOf(name);
+      const node = tags[name] || {};
+      return {
+        tag: name,
+        aliases: sortedUnique(toArray(node.aliases)),
+        children: sortedUnique(toArray(node.children)).length,
+        components: direct(node).length,
+        subtreeTags: subtree.tagSet.size,
+        subtreeComponents: subtree.slugSet.size,
+        depth: subtree.deepest,
+      };
+    });
+    /* Biggest first, because the reason this tool exists is to choose where to descend and the
+     * branch with the most under it is the one worth naming first. Ties break on the tag name, so
+     * two reads of an unchanged graph agree field for field. */
+    rows.sort((a, b) => b.subtreeTags - a.subtreeTags || compareStrings(a.tag, b.tag));
+
+    const limit = clampInt(options && options.limit, DEFAULT_ROOT_LIMIT, 1, MAX_ROOT_LIMIT);
+    const offset = Math.max(0, Math.floor(Number(options && options.offset) || 0));
+    const page = rows.slice(offset, offset + limit);
+    const deepest = rows.reduce((most, row) => Math.max(most, row.depth), 0);
+    return {
+      ok: true,
+      readOnly: true,
+      root: this.root,
+      indexPath: this.indexPath,
+      loadedAt: isoNow(),
+      relationshipVersion: String(index.relationshipVersion || ''),
+      source: TAG_HIERARCHY_SOURCE,
+      requested: '',
+      counts: { roots: rows.length, tags: names.length, components: components.length, deepest },
+      roots: page,
+      window: {
+        offset,
+        limit,
+        returned: page.length,
+        total: rows.length,
+        omitted: Math.max(0, rows.length - offset - page.length),
+      },
+      warnings: sortedUnique(loaded.warnings),
+      instructions: [
+        'This is a READ: it reports the roots and their sizes and rewrites nothing — no rebuild, no archive, no policy.jsonl line. Descend with memory_lab_subtag_tree.',
+        `Every number here is read from the hierarchy named by source ("${TAG_HIERARCHY_SOURCE}"): the parents and children normalizeIndex() builds from the components' tagPaths, not a parents/children list stored in index.json.`,
+        'Ordered by subtreeTags, largest first, ties by tag name, so two reads of an unchanged graph agree. window.omitted says how many roots this page left out.',
+        'subtreeTags counts the tag itself plus every tag beneath it; subtreeComponents counts the distinct components carrying any of them.',
+      ],
+    };
+  }
+
+  /**
+   * One tag's SUBTREE: the structure, the component names in it, and the numbers that size it.
+   *
+   * READ-ONLY, in the same sense `rootTags()` is: no rebuild, no archive, no `policy.jsonl`
+   * line, and no judgement. It reports what is there — the store decides what OUGHT to be there,
+   * and `memory_lab_tag_review` is where that decision is made.
+   *
+   * The three things a caller asked for, and where each one is:
+   *
+   *   * `structure` — depth-first, in sorted child order, one row per tag: its name, its depth
+   *     below the tag you passed (0 for that tag itself), the tag it hangs from in THIS walk,
+   *     its child count and how many components carry it directly.
+   *   * `components` — every component in the subtree, deduplicated by slug, in the order the
+   *     walk met them. Each is reachable afterwards with `memory_lab_read`. `via` says WHY it is
+   *     listed: `self` (it carries the tag itself), `descendant` (it carries only tags beneath
+   *     it) or `both`.
+   *   * `statistics` — tags in the subtree, components in the subtree, and the depth reached.
+   *
+   * A leading `#` on the input is OPTIONAL; the store's own `normalizeTagName()` is what turns a
+   * spelling into a name, so `ai-agent` and `#AI-Agent` are one tag. An alias the index itself
+   * advertises on a node resolves to that node — a caller reading the index would otherwise be
+   * told that a tag it can see does not exist. `matchedBy` says which of the three it was.
+   *
+   * An unknown tag is `NOT_FOUND` and NAMES the tag, in the same envelope shape `read()` uses for
+   * a missing component; the refusal also carries the roots that DO exist, so a caller that
+   * guessed has something to guess from.
+   *
+   * BOUNDED. The walk itself is bounded by a visited set and `MAX_TREE_DEPTH`; the PAYLOAD is
+   * bounded by `max_tags` and `max_components`, and `bounds` states every limit and lists every
+   * thing it dropped. A truncated answer never looks like a small subtree.
+   */
+  subtagTree(input = {}) {
+    const requested = String(
+      (input && input.tag) === undefined || (input && input.tag) === null ? '' : input.tag,
+    ).trim();
+    if (!requested) {
+      throw new MemoryLabStoreError(
+        'INVALID_TAG',
+        'A tag is required: pass the tag whose subtree to read, for example "#研究".',
+        { parameter: 'tag' },
+      );
+    }
+    const maxTags = clampInt(input && input.max_tags, DEFAULT_TREE_MAX_TAGS, 1, MAX_TREE_MAX_TAGS);
+    const maxComponents = clampInt(input && input.max_components, DEFAULT_TREE_MAX_COMPONENTS, 1, MAX_TREE_MAX_COMPONENTS);
+
+    const loaded = this.loadIndex();
+    if (!loaded.ok) {
+      return {
+        ok: false,
+        readOnly: true,
+        root: this.root,
+        indexPath: this.indexPath,
+        requested,
+        tag: null,
+        structure: [],
+        components: [],
+        statistics: { tags: 0, components: 0, depth: 0, directComponents: 0, childTags: 0, leafTags: 0 },
+        bounds: emptyTreeBounds(maxTags, maxComponents),
+        warnings: sortedUnique(loaded.warnings),
+        error: loaded.error,
+      };
+    }
+    const index = loaded.index;
+    const tags = index && index.tags && typeof index.tags === 'object' && !Array.isArray(index.tags) ? index.tags : {};
+    const components = componentList(index && index.components);
+    const bySlug = new Map(components.map((component) => [String(component.slug), component]));
+    const names = Object.keys(tags);
+    const resolution = this.resolveTagSelector(requested, tags);
+
+    if (!resolution.name) {
+      const rootNames = names.filter((name) => toArray(tags[name] && tags[name].parents).length === 0);
+      return {
+        ok: false,
+        readOnly: true,
+        root: this.root,
+        indexPath: this.indexPath,
+        loadedAt: isoNow(),
+        source: TAG_HIERARCHY_SOURCE,
+        requested,
+        tag: resolution.normalized ? resolution.normalized : null,
+        matchedBy: null,
+        structure: [],
+        components: [],
+        statistics: { tags: 0, components: 0, depth: 0, directComponents: 0, childTags: 0, leafTags: 0 },
+        bounds: emptyTreeBounds(maxTags, maxComponents),
+        warnings: sortedUnique(loaded.warnings),
+        /* NOT_FOUND, naming the tag — the same code and the same envelope `memory_lab_read`
+         * answers with for a missing component. The roots ride along because a caller who guessed
+         * a tag has to be able to guess again without spending a second call to find out what the
+         * store calls anything; they are capped, and `rootTagCount` is the true total. */
+        error: tagNotFoundError(requested, {
+          normalized: resolution.normalized,
+          rootTags: rootNames.slice(0, 24),
+          rootTagCount: rootNames.length,
+          hierarchySource: TAG_HIERARCHY_SOURCE,
+        }).toJSON(),
+      };
+    }
+
+    const selected = resolution.name;
+    const structure = [];
+    const path = [];
+    const onPath = new Set();
+    const visited = new Set();
+    const carried = new Map();
+    const extraParents = new Map();
+    const backEdges = [];
+    let deepest = 0;
+    let depthCapped = false;
+
+    const visit = (name, level, parent) => {
+      if (onPath.has(name)) {
+        /* A back-edge. The graph this walk is handed CANNOT hold one — `normalizeIndex()`
+         * refuses a cyclic edge and records `cyclic-tag-edge-skipped` — so this is the walk's own
+         * guard being reported instead of swallowed, and it is NOT where a cycle that really
+         * exists on disk is named: that is `cycles.found`, read from `index.json` the way
+         * `memory_lab_tag_review` reads one. */
+        backEdges.push({ tag: name, reachedFrom: parent ? String(parent) : null, path: [...path, name] });
+        return;
+      }
+      if (level > MAX_TREE_DEPTH) {
+        depthCapped = true;
+        return;
+      }
+      if (visited.has(name)) {
+        /* Reached a second time along another branch: a shared node in a DAG, not a cycle. Every
+         * child of it was already expanded on the first pass, so nothing is lost — but the extra
+         * parent is a fact about the structure, and it is reported rather than dropped. */
+        if (parent) {
+          if (!extraParents.has(name)) extraParents.set(name, new Set());
+          extraParents.get(name).add(String(parent));
+        }
+        return;
+      }
+      visited.add(name);
+      onPath.add(name);
+      path.push(name);
+      const node = tags[name] || {};
+      const kids = sortedUnique(toArray(node.children)).filter((child) => child !== name);
+      const members = sortedUnique(toArray(node.components)).filter((slug) => bySlug.has(slug));
+      structure.push({
+        tag: name,
+        depth: level,
+        parent: parent ? String(parent) : null,
+        children: kids.length,
+        components: members.length,
+      });
+      deepest = Math.max(deepest, level);
+      for (const slug of members) {
+        if (!carried.has(slug)) carried.set(slug, new Set());
+        carried.get(slug).add(name);
+      }
+      for (const child of kids) visit(child, level + 1, name);
+      path.pop();
+      onPath.delete(name);
+    };
+    visit(selected, 0, null);
+
+    const selectedNode = tags[selected] || {};
+    const selectedDirect = sortedUnique(toArray(selectedNode.components)).filter((slug) => bySlug.has(slug));
+    const selectedMembers = new Set(selectedDirect);
+    const componentRows = [];
+    for (const [slug, tagNames] of carried) {
+      const component = bySlug.get(slug);
+      const carriesSelf = selectedMembers.has(slug);
+      const carriesBeneath = Array.from(tagNames).some((name) => name !== selected);
+      componentRows.push({
+        slug,
+        name: String((component && component.name) || slug),
+        /* WHY this component is in the list — the question a bare name cannot answer, and the
+         * distinction that matters: a component that merely carries something UNDER the tag is
+         * not a component that carries the tag. */
+        via: carriesSelf && carriesBeneath ? 'both' : carriesSelf ? 'self' : 'descendant',
+        carried: tagNames.size,
+      });
+    }
+
+    const structureShown = structure.slice(0, maxTags);
+    const componentShown = componentRows.slice(0, maxComponents);
+    const dropped = [];
+    if (structureShown.length < structure.length) {
+      dropped.push(`structure: ${structureShown.length} of ${structure.length} tags listed (max_tags=${maxTags})`);
+    }
+    if (componentShown.length < componentRows.length) {
+      dropped.push(`components: ${componentShown.length} of ${componentRows.length} listed (max_components=${maxComponents})`);
+    }
+    if (depthCapped) {
+      dropped.push(
+        `depth: the walk stopped at ${MAX_TREE_DEPTH} levels, so tags below that are neither listed nor counted (maxDepth=${MAX_TREE_DEPTH})`,
+      );
+    }
+
+    /* A cycle that really IS on disk, read the way `memory_lab_tag_review` reads one: from the raw
+     * document, before normalization, because the normalizer drops the closing edge and the graph
+     * this walk descends therefore never shows it. Restricted to the subtree the caller asked
+     * about; `elsewhere` says how many the store holds that are not in it, so "none here" cannot
+     * be read as "none anywhere" in a store that has one somewhere else. */
+    const stored = this.storedCycles();
+    const inSubtree = stored.paths.filter((cycle) => cycle.some((name) => visited.has(name)));
+    const cycles = {
+      source: 'index.json (the stored children projection, read before normalisation)',
+      read: stored.read === true,
+      found: inSubtree.map((cycle) => cycle.slice()),
+      elsewhere: Math.max(0, stored.paths.length - inSubtree.length),
+      selfEdges: stored.selfEdges.filter((name) => visited.has(name)),
+      truncated: stored.truncated === true,
+      metByTheWalk: backEdges,
+      note:
+        'The walk cannot loop and did not: it carries a visited set and a depth cap. It also cannot MEET a cycle in the graph it is handed, because normalizeIndex() refuses a cyclic edge and records cyclic-tag-edge-skipped — so metByTheWalk is empty for every index this store can load, and a cycle that really is on disk is named in found, read from the document instead. When found is not empty the structure above is the REPAIRED hierarchy, which is why the cycle is reported beside it.',
+    };
+
+    const statistics = {
+      tags: structure.length,
+      components: componentRows.length,
+      depth: deepest,
+      directComponents: selectedDirect.length,
+      childTags: sortedUnique(toArray(selectedNode.children)).length,
+      leafTags: structure.filter((row) => row.children === 0).length,
+    };
+
+    return {
+      ok: true,
+      readOnly: true,
+      root: this.root,
+      indexPath: this.indexPath,
+      loadedAt: isoNow(),
+      relationshipVersion: String(index.relationshipVersion || ''),
+      source: TAG_HIERARCHY_SOURCE,
+      requested,
+      tag: selected,
+      matchedBy: resolution.matchedBy,
+      aliases: sortedUnique(toArray(selectedNode.aliases)),
+      /* The selected tag's own node in the FULL graph, which is not the same thing as its place in
+       * this walk: a tag with a parent above it is still the root of the subtree you asked for. */
+      parents: sortedUnique(toArray(selectedNode.parents)),
+      children: sortedUnique(toArray(selectedNode.children)),
+      structure: structureShown,
+      components: componentShown,
+      statistics,
+      diamonds: Array.from(extraParents.entries())
+        .map(([tag, parents]) => ({ tag, alsoUnder: sortedUnique(Array.from(parents)) }))
+        .sort((a, b) => compareStrings(a.tag, b.tag)),
+      cycles,
+      bounds: {
+        maxTags,
+        maxComponents,
+        maxDepth: MAX_TREE_DEPTH,
+        tagsShown: structureShown.length,
+        tagsTotal: structure.length,
+        tagsOmitted: structure.length - structureShown.length,
+        componentsShown: componentShown.length,
+        componentsTotal: componentRows.length,
+        componentsOmitted: componentRows.length - componentShown.length,
+        truncated: dropped.length > 0,
+        dropped,
+      },
+      warnings: sortedUnique(loaded.warnings),
+      instructions: [
+        'This is a READ: it reports a subtree and rewrites nothing — no rebuild, no archive, no policy.jsonl line — and it judges nothing: there is no finding, candidate or decision in this payload.',
+        'structure is the depth-first table (tag, depth, parent, children, components). components is every component in the subtree, deduplicated by slug and reachable with memory_lab_read.',
+        'via says why a component is listed: "self" carries the tag itself, "descendant" carries only a tag beneath it, "both" carries the tag and something beneath it. carried is how many subtree tags it carries; WHICH ones are the structure table and memory_lab_read on the component.',
+        'bounds names every limit this payload respected and lists whatever it dropped, so a short answer is never mistaken for a small subtree. cycles names a cycle the stored graph really holds, if there is one here.',
+      ],
+    };
+  }
+
+  /**
+   * Resolve one caller-supplied tag to the name the store stores.
+   *
+   * A leading `#` is OPTIONAL on input, and the store's own `normalizeTagName()` is what decides
+   * the name: `AI-Agent`, `#AI-Agent` and `ai agent` are one tag, and `#ai-agent` is matched by
+   * comparison key. The RAW spelling is tried first, so an index that stores a tag some other way
+   * is still matched by what it actually holds — the store is the authority on its own names, and
+   * a lookup that "corrected" a name the store really uses would refuse a tag it is showing.
+   *
+   * An ALIAS the index advertises on a node resolves to that node. `memory_lab_read` hands a
+   * caller every alias in the store, so a caller that then reads one and is told NOT_FOUND has
+   * been lied to by the two tools together.
+   */
+  resolveTagSelector(selector, tags) {
+    const requested = String(selector === undefined || selector === null ? '' : selector).trim();
+    const normalized = normalizeTagName(requested);
+    const nodes = tags && typeof tags === 'object' && !Array.isArray(tags) ? tags : {};
+    const has = (name) => Boolean(name) && Object.prototype.hasOwnProperty.call(nodes, name);
+    if (has(requested)) return { name: requested, normalized, matchedBy: 'name' };
+    if (has(normalized)) return { name: normalized, normalized, matchedBy: requested === normalized ? 'name' : 'normalized' };
+    const key = normalized ? comparisonKey(normalized) : '';
+    if (key) {
+      for (const name of Object.keys(nodes)) {
+        const aliases = toArray(nodes[name] && nodes[name].aliases);
+        if (aliases.some((alias) => String(alias) === requested || comparisonKey(alias) === key)) {
+          return { name, normalized, matchedBy: 'alias' };
+        }
+      }
+    }
+    return { name: null, normalized, matchedBy: null };
   }
 
   // -- query ----------------------------------------------------------------
@@ -3815,6 +4313,14 @@ export class MemoryLabStore {
 
   formatTagApply(result) {
     return `[memory_lab_tag_apply]\n${JSON.stringify(result, null, 2)}`;
+  }
+
+  formatRootTags(result) {
+    return `[memory_lab_root_tags]\n${JSON.stringify(result, null, 2)}`;
+  }
+
+  formatSubtagTree(result) {
+    return `[memory_lab_subtag_tree]\n${JSON.stringify(result, null, 2)}`;
   }
 }
 

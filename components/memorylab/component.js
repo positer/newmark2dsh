@@ -1,7 +1,7 @@
 /**
  * Newmark Core — the **MemoryLab** component.
  *
- * Owns the durable store over the shared `~/.Newmark` user path and the seven
+ * Owns the durable store over the shared `~/.Newmark` user path and the nine
  * model-facing tools that go with it. Everything this component needs is here:
  * the store module is plugin-owned pure Node, and no harness package is
  * imported.
@@ -13,7 +13,7 @@
  */
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { MemoryLabStore, MemoryLabStoreError, TAG_DECISION_KINDS } from './lib/memory-store.js';
+import { MemoryLabStore, MemoryLabStoreError, TAG_DECISION_KINDS, DEFAULT_ROOT_LIMIT, MAX_ROOT_LIMIT, DEFAULT_TREE_MAX_TAGS, MAX_TREE_MAX_TAGS, DEFAULT_TREE_MAX_COMPONENTS, MAX_TREE_MAX_COMPONENTS } from './lib/memory-store.js';
 // The presence probe belongs to the component that owns the tool being probed, and it works
 // whether or not that component is mounted — which is the whole reason it can answer "is a judge
 // reachable" for a component that is switched off. Reading it here rather than re-implementing it
@@ -1039,7 +1039,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
     /** The ask the next judgement would dispatch, without dispatching it. */
     judgementAsk,
 
-    /** The seven model-facing tools, bundled with this component. */
+    /** The nine model-facing tools, bundled with this component. */
     tools() {
       return [
         {
@@ -1076,6 +1076,50 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
           output: { schema: { type: 'object' }, render: (args, value) => toolText(store.formatQuery(value)) },
           async execute(args) {
             return store.query({ query: String(args?.query || ''), limit: args?.limit, maxChars: args?.max_chars });
+          },
+        },
+        {
+          name: 'memory_lab_root_tags',
+          description:
+            'List the ROOT parent tags — every tag with no parent — with the numbers that decide which branch to descend into, so a caller can choose one WITHOUT reading the whole index: each root carries its direct child count, the components carrying it directly, and the size of the subtree beneath it in tags and in components. Aliases are included when the store has them. Ordered by subtree size, largest first, ties by tag name. Read-only: it writes nothing, rebuilds nothing and judges nothing. Descend with memory_lab_subtag_tree.',
+          parameters: {
+            type: 'object',
+            properties: {
+              limit: { type: 'number', description: `Roots per page, 1-${MAX_ROOT_LIMIT}, default ${DEFAULT_ROOT_LIMIT}.` },
+              offset: { type: 'number', description: 'Skip this many roots. window.omitted says how many the page left out.' },
+            },
+            required: [],
+          },
+          output: { schema: { type: 'object' }, render: (args, value) => toolText(store.formatRootTags(value)) },
+          async execute(args) {
+            return store.rootTags({ limit: args?.limit, offset: args?.offset });
+          },
+        },
+        {
+          name: 'memory_lab_subtag_tree',
+          description:
+            "Read ONE tag's subtree: the structure level by level (each tag's name, depth, parent, child count and how many components carry it directly, depth-first and in a stable order), every component name in the subtree deduplicated and reachable afterwards with memory_lab_read — each saying whether it carries the tag itself, a descendant, or both — and the statistics that size it (tags, components, depth reached). The leading '#' is optional; an unknown tag is NOT_FOUND naming the tag. Bounded: the payload respects max_tags and max_components, states every limit it respected and lists everything it dropped, so a short answer is never mistaken for a small subtree. Read-only: it writes nothing, rebuilds nothing and judges nothing.",
+          parameters: {
+            type: 'object',
+            properties: {
+              tag: {
+                type: 'string',
+                description: `The tag whose subtree to read, for example "#研究". A leading "#" is optional; an alias the store advertises resolves to its own tag. Required.`,
+              },
+              max_tags: {
+                type: 'number',
+                description: `Cap on rows in the structure table, 1-${MAX_TREE_MAX_TAGS}, default ${DEFAULT_TREE_MAX_TAGS}. Anything beyond it is counted, reported in bounds.dropped, and never silently cut.`,
+              },
+              max_components: {
+                type: 'number',
+                description: `Cap on entries in the component list, 1-${MAX_TREE_MAX_COMPONENTS}, default ${DEFAULT_TREE_MAX_COMPONENTS}. The count is still the true one; bounds.dropped says what was left out.`,
+              },
+            },
+            required: ['tag'],
+          },
+          output: { schema: { type: 'object' }, render: (args, value) => toolText(store.formatSubtagTree(value)) },
+          async execute(args) {
+            return store.subtagTree({ tag: args?.tag, max_tags: args?.max_tags, max_components: args?.max_components });
           },
         },
         {

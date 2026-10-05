@@ -7,7 +7,7 @@
 # them, which is why all four appear under one plugin card:
 #
 #   newmark2dsh          the shared Newmark root and its config
-#   newmark2dsh-memorylab     the durable store and the five memory_lab_* tools
+#   newmark2dsh-memorylab     the durable store and the nine memory_lab_* tools
 #   newmark2dsh-computeruse   the automation backends and the two ComputerUse tools
 #   preset-dev                   the Dev agent preset declaration
 #

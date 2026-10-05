@@ -2216,7 +2216,7 @@ function readPageGlobals() {
             {
               key: 'memoryLab',
               name: 'MemoryLab',
-              role: 'durable memory, five memory_lab_* tools, sidebar renderer',
+              role: 'durable memory, nine memory_lab_* tools, sidebar renderer',
               on: components.memoryLab === true,
               note: components.memoryLab === true ? 'store mounted' : 'not loaded',
               switchable: true,

@@ -6,7 +6,7 @@
  * | Component | Loaded as | Responsibility |
  * |---|---|---|
  * | `newmark-core` | Loader row `newmark-core` → `newmark2dsh` | this file: the shared Newmark root and its config |
- * | `newmark-memorylab` | a child of this row's fiber (`ctx.plugin`) | the MemoryLab store, the seven `memory_lab_*` tools |
+ * | `newmark-memorylab` | a child of this row's fiber (`ctx.plugin`) | the MemoryLab store, the nine `memory_lab_*` tools |
  * | `newmark-computeruse` | a child of this row's fiber (`ctx.plugin`) | the automation backends, the two ComputerUse tools |
  * | Dev preset | Loader row `preset-dev` → `@deepseek-ai/dsh-agent-preset` | the Dev agent preset declaration, selected by the `agent-preset-registry` entry's `selectedDefault` in the profile patch |
  *

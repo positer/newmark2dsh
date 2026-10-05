@@ -1,7 +1,7 @@
 /**
  * Newmark Core — the **MemoryLab component**.
  *
- * Owns the shared durable store at `<root>/Memory Lab` and the seven `memory_lab_*`
+ * Owns the shared durable store at `<root>/Memory Lab` and the nine `memory_lab_*`
  * tools, and publishes `window.__NEWMARK_MEMORYLAB__` for the Client half.
  *
  * It is an independent Loader row: disabling `newmark-memorylab` retires the whole
