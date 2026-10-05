@@ -1,14 +1,14 @@
 /**
  * Newmark Core — the **core component**.
  *
- * The bundle carries three components, and the Loader carries two rows:
+ * The bundle carries three components, and the Loader carries three rows:
  *
  * | Component | Loaded as | Responsibility |
  * |---|---|---|
  * | `newmark-core` | Loader row `newmark-core` → `newmark2dsh` | this file: the shared Newmark root and its config |
  * | `newmark-memorylab` | a child of this row's fiber (`ctx.plugin`) | the MemoryLab store, the nine `memory_lab_*` tools |
  * | `newmark-computeruse` | a child of this row's fiber (`ctx.plugin`) | the automation backends, the two ComputerUse tools |
- * | Dev preset | Loader row `preset-dev` → `@deepseek-ai/dsh-agent-preset` | the Dev agent preset declaration, selected by the `agent-preset-registry` entry's `selectedDefault` in the profile patch |
+ * | Dev / rDev presets | Loader rows `preset-dev`, `preset-rdev` → `@deepseek-ai/dsh-agent-preset` | the two agent-preset declarations; the registry selects the default from `agent-preset-registry`'s `selectedDefault`, which this bundle declares in its patch and never writes |
  *
  * ## Why the components do not call each other
  *
@@ -31,9 +31,10 @@
  * registered, it publishes nothing, and the Client half registers none of its
  * seats — with no coordination, and no way for one component to break another.
  *
- * The preset is the one component this row does not mount: it is a Loader row, and what the
- * switch changes is *which preset the registry selects*, a value in the profile patch
- * (`lib/preset-row.js`).
+ * The presets are the one pair of rows this row does not mount and the panel does not
+ * switch. Which preset a new task starts in is a value in the patch layers
+ * (`agent-preset-registry`'s `selectedDefault`), and the way to change it is to edit them —
+ * not to ask a plugin's config page to rewrite the user's profile.
  *
  * ## No server, no port
  *
@@ -41,7 +42,7 @@
  * contributes its own `webServer.tapIndex` transform, so the HTML the shell already
  * serves at page load carries the snapshot as page globals. The one route this
  * bundle does register is its own control surface — the two composed switches and
- * the preset row's selection.
+ * the model selection.
  */
 import { schema } from './lib/schema.js';
 import { defaultRoot, resolveRoot } from './lib/root.js';
@@ -54,16 +55,6 @@ import {
   resolveSelection,
   selectionIsListed,
 } from './lib/model-selection.js';
-import {
-  PRESET_COMPONENT_KEY,
-  PRESET_ID,
-  PRESET_ROW_ID,
-  SELECTOR_ENTRY_ID,
-  SELECTOR_ENTRY_NAME,
-  patchPathOf,
-  readPresetFromProfile,
-  setPresetSelected,
-} from './lib/preset-row.js';
 
 /** The page global this row publishes. */
 export const SNAPSHOT_GLOBAL = '__NEWMARK_CORE__';
@@ -141,26 +132,24 @@ export const name = 'newmark-core';
 
 // ## What this row injects, and why exactly this
 //
-// `webServer` is the one route this bundle owns. `profileContext` is how the profile
-// directory is *named* rather than guessed — it is the service `dsh-plugin-manager`
-// itself injects alongside `loader`, and the object `dsh-app-boot` provides with
-// `{ name, dir, patchPath, … }`. The preset switch writes the `selectedDefault` of the
-// `agent-preset-registry` entry in `<profile>/cordis.patch.yml`, so it needs that path and
-// nothing else; with the service absent the route answers 501 and says so instead of
-// inventing a path.
+// `webServer` is the one route this bundle owns — the two composed switches and the model
+// selection. Nothing here reads or writes the profile patch any more: the preset switch that
+// did is gone, and with it the need for `profileContext`. (That service was injected for
+// exactly one purpose — naming `<profile>/cordis.patch.yml` so the switch could write
+// `agent-preset-registry`'s `selectedDefault` without guessing a path — and an unused
+// injection is a dependency that can only stall the row.)
 //
 // `configEditor` was injected here once, and was used WRONG: it toggled the Dev preset by
 // writing `disabled` inside the row's *config*, where no plugin Config has such a field — so
-// the write was accepted, persisted, and did nothing at all. The preset switch therefore goes
-// through this bundle's own validated write to the profile patch (`lib/preset-row.js`).
+// the write was accepted, persisted, and did nothing at all. That dead switch is deleted
+// rather than repaired; the incident is kept in the record because it is the difference
+// between a write that lands and one that looks like it did.
 //
 // It is injected again now, for the purpose it actually has: it writes a row's **config**, and
-// choosing the bundle's model changes exactly that. The distinction is worth keeping written
-// down, because it is the difference between the preset switch being dead and this one working
-// — same call, different target. Even so it is read through `ctx.get(...)` rather than as
-// `ctx.<service>`: this row must stay mountable in a profile whose config editor is absent (the
-// base patch disables that row when there is no `profileContext`), and a hard read of a service
-// that is not there is a throw, not a `undefined`.
+// choosing the bundle's model changes exactly that. Even so it is read through `ctx.get(...)`
+// rather than as `ctx.<service>`: this row must stay mountable in a profile whose config editor
+// is absent (the base patch disables that row when there is no `profileContext`), and a hard
+// read of a service that is not there is a throw, not a `undefined`.
 //
 // `loader` is deliberately NOT injected either. `configEditor.edit(entry, change)` needs the
 // row's own Loader entry, which `ctx.fiber.entry` carries — the Loader itself puts it there
@@ -172,7 +161,7 @@ export const name = 'newmark-core';
 // no such thing as defensive access — the property read itself is the throw. A guard
 // around the *call* did not help, because the throw happened one line earlier, at the
 // read, escaped the route handler, and ended the Host process with exit code 1.
-export const inject = ['webServer', 'profileContext'];
+export const inject = ['webServer'];
 
 /**
  * The components this row loads itself. Paths, so nothing has to resolve packages.
@@ -397,42 +386,6 @@ export function apply(ctx, config) {
           };
 
           /**
-           * The preset selection's real state, read from `<profile>/cordis.patch.yml`.
-           *
-           * What the switch changes is the `agent-preset-registry` entry's
-           * `config.selectedDefault`, in the PROFILE patch, so the file is the only thing
-           * that knows the truth. `profileContext` is what names that file; without it the
-           * answer is 501 and no path is guessed.
-           */
-          const presetState = () => {            const profile = ctx.profileContext;
-            if (profile === undefined || profile === null || patchPathOf(profile) === null) {
-              return {
-                ok: false,
-                error: 'profile_context_unavailable',
-                detail:
-                  'the profileContext service names no profile patch path, so this half cannot read or ' +
-                  'write the preset selection; no path is guessed',
-              };
-            }
-            const state = readPresetFromProfile(profile);
-            return {
-              ...state,
-              // What the panel asked for, what it is called, and where the value lives:
-              // the wire key, the preset identity, and the two entries involved — the one
-              // declaring the preset and the one selecting it.
-              component: PRESET_COMPONENT_KEY,
-              preset: PRESET_ID,
-              selector: SELECTOR_ENTRY_ID,
-              declaredBy: PRESET_ROW_ID,
-              name: SELECTOR_ENTRY_NAME,
-              // `mounted` is the field the panel already reads for the composed
-              // components, so the preset answers in the same shape: the Dev preset is
-              // "on" exactly when the registry selects it.
-              mounted: state.ok === true ? state.enabled === true : false,
-            };
-          };
-
-          /**
            * Run one read, and turn a throw into the 500 the panel can display.
            *
            * `await` is safe on a plain value, so this one guard serves both the synchronous
@@ -527,7 +480,6 @@ export function apply(ctx, config) {
                     global: COMPONENT_GLOBALS[name],
                   })),
                 ],
-                [PRESET_COMPONENT_KEY]: presetState(),
                 [MODEL_COMPONENT_KEY]: await modelState(),
               }))) ?? { ok: false, error: 'handler_failed' },
             );
@@ -555,103 +507,21 @@ export function apply(ctx, config) {
             const name = String(parsed.component || '');
             const wanted = parsed.enabled === true;
 
-            // The preset is tested FIRST, and deliberately not through COMPONENTS: it is
-            // not something this bundle composes, so it has no entry in that map. Checking
-            // COMPONENTS first made this branch unreachable — the panel offered a switch
-            // that could only ever answer unknown_component.
+            // There is no preset branch here, and its absence is the design. The plugin
+            // config page switches the components this bundle COMPOSES; which preset a new
+            // task starts in is a value in the patch layers
+            // (`agent-preset-registry`'s `selectedDefault`), and a plugin's config page does
+            // not rewrite the user's profile.
             //
-            // It is compared against `PRESET_COMPONENT_KEY`, the key the GET publishes and
-            // the client row sends, and not against the Loader row id `preset-dev`. That
-            // mix-up is exactly what made this switch dead in the shipped build: the panel
-            // sent `presetDev`, this branch wanted `preset-dev`, and every click answered
-            // `unknown_component` without writing anything.
+            // The branch that used to sit here wrote exactly that field, through
+            // `lib/preset-row.js`. Three mechanisms died on it and are recorded in
+            // `verify-preset-patch.mjs`'s history: a `disabled` written inside a row's
+            // *config* (accepted, persisted, inert), an id-targeted `disabled: true` on the
+            // declaring row, and a client that sent `presetDev` to a route comparing
+            // `preset-dev` — a silent no-op that wrote nothing and logged nothing. The row is
+            // gone, the route no longer answers that key, and the value is whatever the patch
+            // layers say.
             //
-            // It is handled HERE, and not through the shell: `pluginManager.setPluginEnabled`
-            // cannot reach the preset at all, because `listPlugins()` inventories the
-            // profile's INSTALLED packages and `@deepseek-ai/dsh-agent-preset` lives in the
-            // DSH installation. What this branch writes is the `agent-preset-registry`
-            // entry's `selectedDefault` in the profile patch, after `lib/preset-row.js` has
-            // parsed the result with DSH's own parser and read the value back.
-            if (name === PRESET_COMPONENT_KEY) {
-              const profile = ctx.profileContext;
-              if (profile === undefined || profile === null || patchPathOf(profile) === null) {
-                // 501, not a guess: with no profile path there is no file to write, and a
-                // guessed path would write somewhere nobody asked for.
-                send(501, {
-                  ok: false,
-                  component: PRESET_COMPONENT_KEY,
-                  error: 'profile_context_unavailable',
-                  detail:
-                    'the profileContext service names no profile patch path, so the preset selection ' +
-                    'cannot be switched; no path is guessed and nothing was written',
-                });
-                return;
-              }
-              // `await`, and not for the promise's value — `safe` runs a synchronous body
-              // synchronously. It is awaited because `safe` IS async, so calling it without
-              // `await` binds `result` to the PROMISE rather than to what the write returned:
-              // `result.ok` would be `undefined`, the branch below would answer 400, and the
-              // failure it reported would be a failure that never happened — with the file
-              // already correctly written. That is exactly the confusing half-state this whole
-              // route exists to avoid, and it is what a one-word omission bought.
-              const result = await safe(() => setPresetSelected(profile, wanted));
-              if (result === undefined) {
-                // `safe` answers `undefined` only when its body threw, and it has already sent
-                // the 500. This is the record of what caused it: without it a switch that ended
-                // in the route's last-resort handler would leave nothing behind to look at.
-                failures.record({
-                  where: 'core/preset-switch',
-                  code: 'handler_failed',
-                  message: `switching the ${PRESET_COMPONENT_KEY} selection threw before it could answer`,
-                  fields: { component: PRESET_COMPONENT_KEY, wanted },
-                });
-                return;
-              }
-              if (result.ok !== true) {
-                /**
-                 * THE WRITE WAS REFUSED OR FAILED, and the code recorded is the module's OWN.
-                 *
-                 * `setPresetSelected` answers with a discriminated result whose `error` is the
-                 * refusal's own name — `unparseable_source`, `unparseable_result`,
-                 * `collateral_change`, `selector_entry_absent`, `patch_unreadable`,
-                 * `write_failed` — and those names are the interesting half of this failure
-                 * surface. Recording them under one summary like `preset_write_refused` would
-                 * be exactly the disguise rule 2 forbids, so `error` is carried verbatim and the
-                 * sentence it came with goes in `detail`.
-                 */
-                failures.record({
-                  where: 'core/preset-switch',
-                  code: String(result.error || 'write_refused'),
-                  message: String(result.detail || result.reason || 'the preset selection was not written'),
-                  detail: String(result.reason ?? ''),
-                  fields: {
-                    component: PRESET_COMPONENT_KEY,
-                    wanted,
-                    ...(result.line === undefined || result.line === null ? {} : { line: result.line }),
-                    ...(result.patchPath === undefined ? {} : { patchPath: String(result.patchPath) }),
-                  },
-                });
-              }
-              ctx.logger?.info?.(
-                `newmark-core: ${PRESET_COMPONENT_KEY} ${result.ok === true ? 'set to ' + String(result.selected) : 'FAILED ' + String(result.error)}` +
-                  (result.patchPath ? ` (${result.patchPath})` : ''),
-              );
-              // The receipt carries the state READ BACK FROM THE FILE, not the request.
-              // The state is also in the same shape as the GET's, so one reader serves
-              // both and the panel cannot disagree with itself.
-              send(result.ok === true ? 200 : 400, {
-                ...result,
-                component: PRESET_COMPONENT_KEY,
-                preset: PRESET_ID,
-                selector: SELECTOR_ENTRY_ID,
-                declaredBy: PRESET_ROW_ID,
-                name: SELECTOR_ENTRY_NAME,
-                mounted: result.ok === true ? result.enabled === true : false,
-                [PRESET_COMPONENT_KEY]: presetState(),
-              });
-              return;
-            }
-
             // ---------------------------------------------------------------- the model ---
             //
             // Choosing the bundle's model changes the CORE ROW'S CONFIG, and
@@ -662,8 +532,8 @@ export function apply(ctx, config) {
             // such a field, and was accepted and did nothing. Same call; the target is what
             // differed, and that history must not make this one look wrong.)
             //
-            // Tested before COMPONENTS, like the preset, because `model` is not a component
-            // key either. It is compared against MODEL_COMPONENT_KEY, the key the GET
+            // Tested before COMPONENTS, like the model's own key requires, because `model` is
+            // not a component key. It is compared against MODEL_COMPONENT_KEY, the key the GET
             // publishes and the client row sends.
             if (name === MODEL_COMPONENT_KEY) {
               const provider = typeof parsed.provider === 'string' ? parsed.provider.trim() : '';

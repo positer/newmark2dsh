@@ -1872,13 +1872,13 @@ function readPageGlobals() {
       // `["remote", "remote.settings"]` because it calls Remote methods; this half does
       // not, so it must not declare a remote namespace.
       //
-      // It declared `['slots', 'remote', 'remote.pluginManager']` while the preset was
-      // switched through `pluginManager.setPluginEnabled`. That call could not reach the
-      // row — `listPlugins()` inventories the profile's INSTALLED packages and
-      // `@deepseek-ai/dsh-agent-preset` lives in the DSH installation, so the call
-      // answered `preset row not listed` — and the namespace is now simply a dependency
-      // this half does not need. The preset switch goes through this bundle's own route
-      // like the other two, so nothing here resolves a remote service at all.
+      // It once declared `['slots', 'remote', 'remote.pluginManager']`, for a preset switch
+      // that went through `pluginManager.setPluginEnabled`. That call could not reach the row
+      // — `listPlugins()` inventories the profile's INSTALLED packages and
+      // `@deepseek-ai/dsh-agent-preset` lives in the DSH installation, so it answered
+      // `preset row not listed` — and the namespace was already unnecessary when the switch
+      // moved onto this bundle's own route. The switch is gone now; nothing here resolves a
+      // remote service at all.
       inject: ['slots'],
       apply(ctx) {
         // The two component switches, read from the same injected snapshot the
@@ -2039,15 +2039,10 @@ function readPageGlobals() {
           // The mount read and the post-switch read ask the same question, so they are the
           // same function. After a switch the panel asks again rather than trusting the
           // POST's receipt: the POST reports whether the Host accepted the change, and only
-          // the next read reports whether it took effect. Those are not the same thing — a
-          // preset switch that changed nothing still resolved without error, and the panel
-          // said nothing was wrong while the preset stayed on.
+          // the next read reports whether it took effect. Those are not the same thing.
           //
-          // All three switches — the two composed components and the preset row — now come
-          // from this one route. The Host half reads the preset's state out of
-          // `<profile>/cordis.patch.yml` — the `agent-preset-registry` entry's
-          // `selectedDefault` — so the state the panel shows is the state the registry
-          // will read.
+          // Both composed switches come from this one route, and the route answers the
+          // components and the model together — one GET, one answer, no second channel.
           const readState = () =>
             fetch('/newmark-core/components')
               .then((response) =>
@@ -2065,18 +2060,6 @@ function readPageGlobals() {
                 for (const entry of result.components) {
                   next[entry.name] = { ok: true, mounted: entry.mounted === true, detail: entry.detail };
                 }
-                // The preset answers in the same shape as the composed components, from
-                // the same route and the same read-back, so one renderer serves all three.
-                const preset = result.presetDev;
-                if (preset && typeof preset === 'object') {
-                  next.presetDev = {
-                    ok: preset.ok === true,
-                    mounted: preset.mounted === true,
-                    error: preset.error,
-                    detail: preset.detail,
-                    httpStatus: result.httpStatus,
-                  };
-                }
                 setApplied((current) => ({ ...current, ...next }));
                 return true;
               })
@@ -2085,9 +2068,9 @@ function readPageGlobals() {
           /**
            * Read the authorised model and the models DSH currently offers.
            *
-           * The read rides the SAME route the switches use: one GET answers the components,
-           * the preset and the model, so there is no second channel and no second source of
-           * truth. `GET /newmark-core/components` therefore does the whole job.
+           * The read rides the SAME route the switches use: one GET answers the components
+           * and the model, so there is no second channel and no second source of truth.
+           * `GET /newmark-core/components` therefore does the whole job.
            *
            * Every failure is reported, never swallowed: a catalogue that could not be read
            * leaves `ok: false` with the Host's own detail, which is what the block below
@@ -2169,17 +2152,9 @@ function readPageGlobals() {
           const toggle = (key, next) => {
             setPending(key);
 
-            // ONE path for all three switches, the preset included.
-            //
-            // The preset used to be special-cased here, through the shell's own
-            // `remote.pluginManager.setPluginEnabled`. That call cannot reach this row:
-            // `listPlugins()` maps `readPluginInventory(ctx).entries`, which inventories the
-            // profile's INSTALLED packages, and `@deepseek-ai/dsh-agent-preset` lives in the
-            // DSH installation — so the row was never listed and the call answered
-            // `preset row not listed`. The Host half now writes the
-            // `agent-preset-registry` entry's `selectedDefault` into the profile patch and
-            // reads the state back from the file, and this half does what it does for the
-            // other two: post, then ask what is true.
+            // ONE path for both switches. The POST carries the component key and the desired
+            // state; the read that follows is what the panel renders, so the receipt can never
+            // disagree with the row.
             fetch('/newmark-core/components', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
@@ -2242,32 +2217,6 @@ function readPageGlobals() {
               note: components.agentApi === true ? 'interface mounted' : 'not loaded',
               switchable: true,
             },
-            {
-              key: 'presetDev',
-              name: 'Dev preset',
-              // The row says what the switch does, which is a *selection* and not a
-              // lifecycle: the Loader row that declares the preset is left alone, and no
-              // field hides a preset from the picker — the registry's Config has `default`
-              // and `selectedDefault` and nothing else
-              // (`@deepseek-ai/dsh-agent-preset-registry/lib/index.js:471-474`).
-              //
-              // The words are the same ones the two component rows use — 已启用 / 已禁用 and
-              // 启用 / 禁用 — because the panel is one surface with one vocabulary. What the
-              // words mean differs per row and the note says how; the words themselves must
-              // not, or a reader has to learn the panel twice.
-              role: 'the agent preset this bundle declares; the default the registry selects',
-              // `on` here is only the pre-read placeholder. The real state is the
-              // `agent-preset-registry` entry's `selectedDefault` in the profile patch, read
-              // by the Host half from the file; the panel shows that answer as soon as the
-              // read lands.
-              on: true,
-              note: '选中即新会话以 Dev 预设启动；由 Host 半写 profile patch',
-              stateOn: '已启用',
-              stateOff: '已禁用',
-              actionOn: '禁用',
-              actionOff: '启用',
-              switchable: true,
-            },
           ];
 
           return h(
@@ -2296,10 +2245,9 @@ function readPageGlobals() {
                   h(
                     'span',
                     { className: 'nmc-config-state' },
-                    // One vocabulary across the panel: 已启用 / 已禁用, 启用 / 禁用. What each
-                    // row's words mean is the row's own business and its note says so — the
-                    // composed components load and unload, the preset row selects the default
-                    // a new session starts in. The words do not vary; the notes do.
+                    // One vocabulary across the panel: 已启用 / 已禁用, 启用 / 禁用. Every row
+                    // that carries a switch is a composed component, and its `note` says what
+                    // that component is; the words do not vary, the notes do.
                     failed ? '切换失败' : on ? row.stateOn || '已启用' : row.stateOff || '已禁用',
                   ),
                   row.switchable
