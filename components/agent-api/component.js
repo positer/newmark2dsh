@@ -35,15 +35,34 @@
  *   including MemoryLab's HTTP snapshot route, which has no Agent at all and used to force a
  *   two-step fallback.
  *
+ * WHICH TOOLS A CALLER IS SHOWN — the rule, and why it is one function
+ * ------------------------------------------------------------------
+ *   `callScope()` is the only place this is decided. A call that arrives through a
+ *   **conversation** (`exec.agent`) is answered for that conversation: its preset's tools, this
+ *   package's, and whatever else that conversation's composition registers. A call that arrives
+ *   any other way — the state route, another component in process — is answered for the
+ *   **process**: the PTC transport, this package's tools, and the tools other plugins register
+ *   globally. Every surface reads it — the state catalog, `agent_api_catalog`, the tool set a run
+ *   is offered, and the scope a dispatch is resolved for — because a catalog that reports one set
+ *   while the dispatch reaches another is the defect this rule removes.
+ *
+ *   The one asymmetry is a `ptc` conversation, and it is the registry's, not this component's:
+ *   `resolveExecution` collapses a model-direct call, so passing such an agent into `execute`
+ *   would answer `UNKNOWN_TOOL` for tools the catalog had just listed. `dispatchScope()` keeps
+ *   that call in the process-wide layer instead, and the answer says so (`presentation`, and the
+ *   receipt's `tool_reach`).
+ *
  * What a run is NOT — the cost, stated where a caller will read it
  * ---------------------------------------------------------------
  *   `RUN_ISOLATION` (lib/contract.js) is repeated in the `agent_api_send` description because
  *   a caller must know it to judge what an answer is worth:
- *   **no session log, no conversation or history entry, no subagent-catalogue entry, no
- *   `tools/pre-execute` guard, no approval policy, no sandbox decision, and no per-agent tool
- *   scope.** The tool calls a run makes execute in the GLOBAL tool view. A run is therefore
- *   not auditable through any of DSH's machinery. What it *does* carry is the authorised model
- *   and the service's own credentials.
+ *   **no session log, no conversation or history entry, no subagent-catalogue entry.** A run's
+ *   calls are resolved through `dispatchScope()` and the receipt names both halves: `tool_scope`
+ *   is whose exposure the offered list is, `tool_reach` is the layer the calls ran in. A reach of
+ *   `process` carries no agent — no guard, approval or sandbox decision applies; a reach of
+ *   `conversation` is the calling conversation's own scope, where the guards and sandbox policy
+ *   declared for it do apply. A run is not auditable through any of DSH's machinery either way.
+ *   What it *does* carry is the authorised model and the service's own credentials.
  *
  * The model is the core row's, not this component's
  * -------------------------------------------------
@@ -625,16 +644,70 @@ export function createAgentApi({
   }
 
   /**
+   * WHICH SCOPE A CALL IS RESOLVED FOR — the rule, in one place.
+   *
+   * A call that arrives through a **conversation** (`exec.agent`) is resolved for THAT
+   * conversation: `ctx.tools.schemas(agent)` chains the scope's own layer over the global one, so
+   * the answer is the preset's tools plus this package's plus whatever else that conversation's
+   * composition registers. A call with **no conversation** — the state route, another component
+   * in process — is resolved for the **process**: `schemas()` is the global layer alone, which is
+   * the PTC transport, this package's tools, and the tools other plugins register globally.
+   *
+   * Every surface here reads this one function — `agent_api_state.catalog`, `agent_api_catalog`,
+   * the tool set a run is offered, and the scope a dispatch is resolved for — because a catalog
+   * that says one thing while the dispatch does another is the defect this rule exists to remove.
+   *
+   * `presentation` is what the conversation's own MODEL is shown. Under `ptc` the registry
+   * **collapses** a model-direct call: `resolveExecution` answers `undefined` for every name but
+   * the reserved `run_code`, which surfaces as `UNKNOWN_TOOL`. That matters here because passing
+   * such an agent into `execute` would deny the very tools the catalog had just listed. `modeFor`
+   * is read defensively: a service without it cannot collapse anything, and `native` is then the
+   * honest reading.
+   */
+  function callScope(view, agent) {
+    if (agent === undefined || agent === null) return { scope: undefined, target: 'process', presentation: 'global' };
+    let presentation = 'native';
+    try {
+      if (isFn(view?.tools?.modeFor)) presentation = view.tools.modeFor(agent) === 'ptc' ? 'ptc' : 'native';
+    } catch {
+      presentation = 'native';
+    }
+    return { scope: agent, target: 'conversation', presentation };
+  }
+
+  /**
+   * The scope a DISPATCH may be resolved for.
+   *
+   * A `ptc` conversation collapses every direct call but `run_code`, so handing its agent to
+   * `execute` would turn a working dispatch into `UNKNOWN_TOOL` — a regression for exactly the
+   * presets that carry the PTC surface. Such a call therefore keeps the process-wide view: that is
+   * the layer a programmatic caller outside the conversation's transport can really reach, and the
+   * answer says so rather than pretending the conversation's own scope applied.
+   */
+  function dispatchScope(call) {
+    return call.target === 'conversation' && call.presentation !== 'ptc' ? call.scope : undefined;
+  }
+
+  /**
    * The read half, as one function, shared by the `agent_api_state` tool and the state route.
    *
-   * It executes nothing and calls no model: `ctx.tools.schemas()` projects the registry and
+   * It executes nothing and calls no model: `ctx.tools.schemas(scope)` projects the registry and
    * `serviceView()` reads references. The counters it reports are the evidence, and the gate
    * asserts them from outside by instrumenting the services it hands in.
+   *
+   * `scope` is the CALLING agent, and it is what makes this read agree with the conversation the
+   * caller is in: the registry resolves a scope's view as *its own layer over the global one*, so
+   * `schemas(agent)` is the preset's tool list plus this package's, while `schemas()` with no
+   * argument is the global layer alone — the PTC transport, this package's fifteen and whatever
+   * other plugins register globally. That IS the rule: a conversation is answered for the
+   * conversation, and anything else for the process. The route has no Agent, so it reads the
+   * process view and says so in `scope`.
    */
-  function stateEnvelope() {
+  function stateEnvelope(scope) {
     const view = serviceView();
     const profile = profileFor(view);
-    const schemas = isFn(view.tools?.schemas) ? view.tools.schemas() : [];
+    const call = callScope(view, scope);
+    const schemas = isFn(view.tools?.schemas) ? view.tools.schemas(call.scope) : [];
     const names = Array.isArray(schemas) ? schemas.map((entry) => String(entry?.name ?? '')).filter(Boolean) : [];
     return envelope({
       tool: TOOL_STATE,
@@ -647,6 +720,8 @@ export function createAgentApi({
         workspace: defaultWorkspace(),
         engine: 'own-loop',
         catalog: { count: names.length, names: names.slice().sort() },
+        scope: call.target,
+        presentation: call.presentation,
         runTools: runToolNames(names),
         counters: { ...counters },
       },
@@ -670,16 +745,23 @@ export function createAgentApi({
    * `ctx.tools.schemas(scope)` so the registry projects what THAT caller can see: "the tools DSH
    * exposes" is a statement about a viewing scope, not about the process, and asking for the
    * unrestricted global list would hand a run tools its own caller cannot reach. When there is no
-   * scope — an in-process call from another component, a route-driven read — the registry's own
-   * global view is the answer, which is what `schemas()` with no argument means.
+   * `scope` is the CALLER's agent, when the call came in with one, and it is the OFFER scope: it
+   * goes to `ctx.tools.schemas(scope)` so the registry projects what that conversation can see.
+   * "The tools DSH exposes" is a statement about a viewing scope, not about the process, so a
+   * conversation gets its own list and a route-driven call gets the process-wide one.
    *
-   * What this does NOT do, and must not be read as doing: the run's tool CALLS still execute in
-   * the global tool view. `ToolExecutionInput` carries no scope here, so
-   * `ctx.tools.restrict()` — which is per-agent and refuses a scopeless context outright — cannot
-   * narrow what a run reaches. Scoping the LIST is therefore a choice of what to offer, not a
-   * security boundary, and the `agent_api_send` description says so in those words.
+   * `reach` is the DISPATCH scope for the calls this set will make, and it is not always `scope`:
+   * a `ptc` conversation collapses direct calls, so its agent would turn every call but `run_code`
+   * into `UNKNOWN_TOOL` (`dispatchScope` owns that decision). A run therefore offers what its
+   * caller can see and executes in the widest layer it can actually reach, and the receipt says
+   * both: `tool_scope` and `tool_reach`.
+   *
+   * What this still does NOT do: the run's calls execute outside any conversation's per-agent
+   * tool restriction. `ctx.tools.restrict()` is per-agent and cannot be expressed for a scopeless
+   * call, which is why the `agent_api_send` description says a run is not audited by DSH's
+   * machinery. Scoping the LIST is a choice of what to offer; `reach` widens what may execute.
    */
-  function buildRunTools(view, filter, signal, scope) {
+  function buildRunTools(view, filter, signal, scope, reach) {
     const schemas = isFn(view.tools?.schemas) ? view.tools.schemas(scope) : [];
     const all = Array.isArray(schemas) ? schemas : [];
     const permitted = new Set(runToolNames(all.map((entry) => String(entry?.name ?? '')), filter));
@@ -720,11 +802,17 @@ export function createAgentApi({
           },
           async execute(callId, args) {
             counters.toolCalls += 1;
+            // `reach` for the same reason the catalog is scoped: a run offers the caller's tool
+            // list, so its calls must resolve in a scope that can actually carry them. Announcing
+            // one surface and executing another is the bypass this pairing exists to avoid — a
+            // tool the list showed but the resolved layer does not carry would answer
+            // `UNKNOWN_TOOL` at call time.
             const outcome = await view.tools.execute({
               callId: `agent-api-run:${callId}`,
               name,
               arguments: args ?? {},
               signal,
+              ...(reach === undefined ? {} : { agent: reach }),
             });
             const classified = classifyToolResult(name, outcome);
             if (classified.exit !== EXIT_OK) {
@@ -864,7 +952,8 @@ export function createAgentApi({
     if (callerSignal && isFn(callerSignal.addEventListener)) callerSignal.addEventListener('abort', onCallerAbort, { once: true });
 
     const startedAt = Date.now();
-    const runTools = buildRunTools(view, toolFilter, controller.signal, exec?.agent);
+    const runCall = callScope(view, exec?.agent);
+    const runTools = buildRunTools(view, toolFilter, controller.signal, runCall.scope, dispatchScope(runCall));
     const streamFn = createLlmStreamFn(view.llm, selection, {});
     const events = [];
     /**
@@ -1043,6 +1132,13 @@ export function createAgentApi({
       model_verified: verified.verified,
       workspace: workspaceReceipt,
       tool_names: runTools.map((entry) => entry.name),
+      // WHICH SCOPE, said in the receipt rather than left to be inferred: `tool_scope` is whose
+      // exposure the list above is (a conversation's, or the process's), and `tool_reach` is the
+      // layer the calls in it were resolved for. They differ for a `ptc` conversation, where the
+      // offer is the conversation's list and the reach is the process-wide one — the same split
+      // `agent_api_state` reports.
+      tool_scope: runCall.target,
+      tool_reach: dispatchScope(runCall) === undefined ? 'process' : 'conversation',
       // The temporary conversation, reported as facts rather than as a promise: how many messages
       // it held, how many characters, and what the bound evicted. `contextStats` was captured
       // BEFORE `release()` emptied the array, so these are the run's real figures; `released` is
@@ -1163,13 +1259,24 @@ export function createAgentApi({
       // The documented `ToolExecutionInput`. `callId` is a branded string at the type level and
       // an ordinary string at runtime — `dsh-tools/lib/index.js:3134` reads it with no validation
       // or brand check — while `signal` is required and `arguments` must be losslessly
-      // JSON-serializable (line 3163). No `agent` is passed: this component does not depend on a
-      // caller Agent, so a dispatch behaves identically from a tool and from a route.
+      // JSON-serializable (line 3163).
+      //
+      // `agent` is passed when the call came from a conversation AND that conversation presents
+      // its tools natively: the registry reads it — `createExecution` takes `const agent =
+      // exec.agent` and resolves visibility with `this.get(name, agent)`, and the same agent
+      // carries that conversation's guards and sandbox policy into the dispatch. It is deliberately
+      // NOT passed for a `ptc` conversation, where `resolveExecution` collapses every direct call
+      // but `run_code` and the dispatch would answer `UNKNOWN_TOOL` for tools the catalog lists;
+      // `dispatchScope` is where that decision lives and why. A route-driven call has no Agent and
+      // keeps the process-wide view.
+      const call = callScope(view, exec?.agent);
+      const reach = dispatchScope(call);
       const outcome = await view.tools.execute({
         callId: `agent-api:${counters.dispatches}:${Date.now().toString(36)}`,
         name,
         arguments: toolArgs,
         signal: controller.signal,
+        ...(reach === undefined ? {} : { agent: reach }),
       });
       const classified = classifyToolResult(name, outcome);
       if (classified.exit === EXIT_OK) {
@@ -1222,6 +1329,8 @@ export function createAgentApi({
     stateEnvelope,
     runToolNames,
     buildRunTools,
+    callScope,
+    dispatchScope,
 
     /** The four model-facing tools, bundled with this component. */
     tools() {
@@ -1232,14 +1341,15 @@ export function createAgentApi({
           name: TOOL_STATE,
           description:
             'Read this host back as JSON and answer without executing anything: the host profile, the capability table, the authorised model, the workspace, and the tool catalog as names and a count. No model request, no tool execution, no write — this is the read half, and it is the call to make before planning a run. ' +
-            'Input: {} — no parameters at all. Output: the envelope with `result = { component, root, platform, workspace, engine, catalog: { count, names }, runTools, counters: { reads, dispatches, runs, modelCalls, toolCalls } }` and `profile = { kind, platform, lifecycle, engine, model: { ok, source, provider, model, code }, capabilities: [{ id, kind, state, code?, evidence, reason }] }`. ' +
+            'Input: {} — no parameters at all. Output: the envelope with `result = { component, root, platform, workspace, engine, catalog: { count, names }, scope, presentation, runTools, counters: { reads, dispatches, runs, modelCalls, toolCalls } }` and `profile = { kind, platform, lifecycle, engine, model: { ok, source, provider, model, code }, capabilities: [{ id, kind, state, code?, evidence, reason }] }`. ' +
+            'WHICH CATALOG YOU GET depends on how you were called, and `scope` says which answered: `"conversation"` when the call arrived through one — the list is then that conversation\'s own tool exposure, its preset\'s tools plus this package\'s plus whatever else it registers, and `presentation` is what that conversation\'s model is shown (`native`, or `ptc` where direct calls collapse to the reserved `run_code`) — and `"process"` for any other route, where the list is the process-wide layer: the PTC transport, this package\'s tools, and the tools other plugins register globally. ' +
             "`state` is `available`, `unavailable` or `refused`; `refused` means the member exists and this component declines to expose it, and the reason says why. Worked example: `agent_api_state {}` -> `{ ok: true, tool: 'agent_api_state', route: 'direct', exit: 0, class: 'ok', result: { platform: 'win32', engine: 'own-loop', catalog: { count: 34 }, counters: { reads: 0, dispatches: 0, runs: 0, modelCalls: 0, toolCalls: 0 } }, profile: { kind: 'dsh-plugin', model: { ok: true, provider: 'deepseek', model: 'deepseek-chat' }, capabilities: [ … ] } }`. " +
             `Always answers with exit 0. ${lifecycle}`,
           parameters: { type: 'object', properties: {}, required: [] },
           output: { schema: { type: 'object' }, render: (args, value) => toolText(value) },
-          async execute() {
+          async execute(args, exec) {
             counters.reads += 1;
-            return stateEnvelope();
+            return stateEnvelope(exec?.agent);
           },
         },
         {
@@ -1259,7 +1369,7 @@ export function createAgentApi({
             required: [],
           },
           output: { schema: { type: 'object' }, render: (args, value) => toolText(value) },
-          async execute(args) {
+          async execute(args, exec) {
             counters.reads += 1;
             const view = serviceView();
             if (!isFn(view.tools?.schemas)) {
@@ -1269,7 +1379,12 @@ export function createAgentApi({
             const detail = args?.detail === 'full' ? 'full' : 'names';
             const limit = Number.isFinite(args?.limit) ? Math.min(Math.max(Math.floor(args.limit), 1), 200) : 50;
             const offset = Number.isFinite(args?.offset) ? Math.max(Math.floor(args.offset), 0) : 0;
-            const schemas = view.tools.schemas();
+            // The CALLING agent's view, so "the tools this caller can actually reach" is true of
+            // the caller and not of this component: the registry chains the scope's own layer over
+            // the global one, which is how a preset's tools appear. No agent — a route, another
+            // component in process — is the process-wide layer, and `scope` says which one answered.
+            const call = callScope(view, exec?.agent);
+            const schemas = view.tools.schemas(call.scope);
             const all = Array.isArray(schemas) ? schemas : [];
             const page = all.slice(offset, offset + limit);
             const tools = page.map((entry) =>
@@ -1281,7 +1396,7 @@ export function createAgentApi({
               tool: TOOL_CATALOG,
               exit: EXIT_OK,
               route: 'direct',
-              result: { detail, total: all.length, offset, returned: tools.length, truncated: offset + tools.length < all.length, tools },
+              result: { detail, scope: call.target, presentation: call.presentation, total: all.length, offset, returned: tools.length, truncated: offset + tools.length < all.length, tools },
             });
           },
         },
@@ -1291,7 +1406,9 @@ export function createAgentApi({
             'Execute one reachable tool through the DSH registry and answer in this bundle\'s standardised envelope, so a caller gets the same error classification the Newmark CLI gives rather than a raw execution result. This is the reference `tool <tool-name> [json-args]` command. A run: the tool really executes, through pre-policy, guards and post-policy. ' +
             'Input: { tool: string (REQUIRED, the exact registered name), arguments?: object (default {}, must survive a JSON round trip), timeout_ms?: number (positive, default 120000) }. Output: the envelope with `result = { dispatched, value }` on success. ' +
             "Worked example: `agent_api_tool { tool: 'read', arguments: { path: 'README.md' } }` -> `{ ok: true, tool: 'agent_api_tool', route: 'direct', exit: 0, class: 'ok', result: { dispatched: 'read', value: { … } } }`. " +
-            'This tool is a thin wrapper for callers that want the classified envelope; a model that just wants to use a tool should call that tool itself. No caller Agent is passed to the dispatch, so the call resolves in the global tool view and behaves identically from a tool and from a route. ' +
+            'This tool is a thin wrapper for callers that want the classified envelope; a model that just wants to use a tool should call that tool itself. ' +
+            'WHICH TOOLS IT CAN REACH follows the same rule as the catalog: a call arriving through a conversation is resolved for THAT conversation (`scope: "conversation"`) — the preset\'s tools, this package\'s, and whatever else that conversation registers — while a call arriving any other way, with no conversation, is resolved for the process (`scope: "process"`): the PTC transport, this package\'s tools, and the tools other plugins register globally. ' +
+            'One exception, stated because it would otherwise look like a missing tool: a conversation presenting its tools in `ptc` mode collapses direct calls — the registry admits only the reserved `run_code` — so such a call keeps the process-wide view and the answer names the presentation in `presentation`. ' +
             'Exit 2 for a missing or unusable `tool` name, non-object `arguments`, a bad `timeout_ms`, or a name that is not reachable — including this component\'s own four names, which are refused with code recursive_dispatch_refused because dispatching them would re-enter this component. Exit 3 when the registry itself is unreachable, with code tool_dispatch_unavailable. Exit 4 for a tool that ran and failed, carrying the tool\'s own message. Exit 130 when the caller aborts or the timeout fires. ' +
             `The classification does not decide whether your call was a good idea — read the tool\'s own description first. ${lifecycle}`,
           parameters: {
@@ -1314,7 +1431,7 @@ export function createAgentApi({
             'Have one prompt judged by an agent run driven by this component\'s own loop, and answer with the standardised envelope. This is the reference `send <prompt>` command, and it is the call MemoryLab\'s tag judgement uses to obtain an answer. ' +
             'It needs no DSH Agent and no session: a run works identically from a tool call and from anywhere a tool can be called, which is the only way this component may be invoked. ' +
             `What a run is not: ${isolation} ` +
-            `THE TOOL SET, AND WHAT WIDENING IT MEANS. By default a run is given the memory tools and nothing else — a judge reading a memory graph needs those, and nothing else it is likely to want. \`tools: { allow: ['${ALL_TOOLS_TOKEN}'] }\` WIDENS that to every tool DSH currently exposes to the caller, and the widening is exactly as consequential as it sounds: those calls execute in the GLOBAL tool view, so they are NOT subject to the per-agent tool restriction, the tools/pre-execute guard, the approval policy or the sandbox decision that a normal tool call goes through. A run is not a DSH agent session, and widening its tool set widens what it can reach without any of that machinery watching. Choose it deliberately, for a caller you would trust to run those tools itself. Whatever the set, this component's own four tools and the reserved run_code transport are subtracted from it always, and a run may never write to the shared Newmark store except through the memory tools. ` +
+            `THE TOOL SET, AND WHAT WIDENING IT MEANS. By default a run is given the memory tools and nothing else — a judge reading a memory graph needs those, and nothing else it is likely to want. \`tools: { allow: ['${ALL_TOOLS_TOKEN}'] }\` WIDENS that to every tool the run's \`tool_scope\` exposes: the calling conversation's own exposure when it came from one, otherwise the process-wide layer (the PTC transport, this package's tools, and the tools other plugins register globally). The receipt names both halves — \`tool_scope\` for whose exposure the list is, and \`tool_reach\` for the layer its calls were resolved in; they differ only for a \`ptc\` conversation, whose direct calls collapse to \`run_code\` and whose run therefore executes in the process-wide layer. What the widening does not buy: a run is not a DSH agent session, so it writes no session log, appears in no conversation and no subagent catalogue, and is not auditable through DSH's machinery. Where the reach is the calling conversation, that conversation's guards and sandbox policy do apply to the calls; where it is the process, none of them does. Choose it deliberately, for a caller you would trust to run those tools itself. Whatever the set, this component's own four tools and the reserved run_code transport are subtracted from it always, and a run may never write to the shared Newmark store except through the memory tools. ` +
             'Input: { prompt: string (REQUIRED), output_schema?: object with type "object" (the run must then answer with JSON matching it, or the call fails), workspace?: string (absolute; default <newmarkRoot>/Work, created if absent), timeout_ms?: number (default 120000), max_steps?: number (model turns before the run is stopped, default 8), tools?: { allow?: string[], deny?: string[] } (also accepted under its older name tool_filter; without allow the run is given the memory tools and nothing else; allow must not be empty, and allow: ["' + ALL_TOOLS_TOKEN + '"] means every tool DSH exposes), require_workspace?: boolean (default false) }. ' +
             'Output on success: `result = { output, structured, provider, model, turns, tool_calls, usage, elapsed_ms, stop_reason, model_verified, workspace, tool_names, context }`, where `context` reports the temporary conversation this run held — `{ max_messages, max_chars, messages, chars, dropped_messages, dropped_chars, released }`. The history is in memory for the length of the call and released when it ends, on every path; it is never a session, is never logged, and does not survive the call. `turns` and `tool_calls` are THIS run\'s figures. ' +
             'Every answer also carries `events` — the run\'s own event list, bounded in both count and characters, where each `tool_execution_start` and `tool_execution_end` names the tool, the call id, the turn, the arguments the model emitted and either the tool\'s result or the failure\'s message and code. That is what makes a receipt able to say WHY a run looped rather than only that it did. ' +
@@ -1334,7 +1451,7 @@ export function createAgentApi({
                 type: 'object',
                 description:
                   'Choose the tools the run may use: { allow?: string[], deny?: string[] }. Without allow, the run is given the memory_lab_* tools and nothing else — a judge needs no filesystem. ' +
-                  `allow: ['${ALL_TOOLS_TOKEN}'] widens it to EVERY tool DSH exposes to this caller, and those calls then run in the global tool view with no per-agent restriction, no pre-execute guard, no approval policy and no sandbox decision applying to them. Widening is a deliberate choice, not a convenience.`,
+                  `allow: ['${ALL_TOOLS_TOKEN}'] widens it to EVERY tool the run's \`tool_scope\` exposes — the calling conversation's own exposure, or the process-wide layer when there is none — and the receipt reports \`tool_scope\` and \`tool_reach\` so the two are never conflated. Where the reach is the calling conversation, that conversation's guards and sandbox policy apply to the calls; where it is the process, none of them does. Widening is a deliberate choice, not a convenience.`,
               },
               tool_filter: { type: 'object', description: 'The older name for `tools`; identical rule and identical consequences. `tools` wins when both are present.' },
               require_workspace: { type: 'boolean', description: 'Refuse when the run cannot be shown to work in `workspace`.' },

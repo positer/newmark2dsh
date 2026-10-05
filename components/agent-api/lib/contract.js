@@ -399,10 +399,13 @@ export const LIFECYCLE =
 export const RUN_ISOLATION =
   'A run is driven by this component own agent loop over ctx.llm.stream, so it is NOT a DSH ' +
   'agent session. It writes no session log, it appears in no conversation, history or ' +
-  'subagent catalogue, it is subject to no tools/pre-execute guard, no approval policy and no ' +
-  'sandbox decision, and it is therefore not auditable through any of them. Its tool calls ' +
-  'execute in the GLOBAL tool view rather than the calling agent scope, so a per-agent tool ' +
-  'restriction does not reach it. It sees only the tools this component chooses to give it. ' +
+  'subagent catalogue, and it is therefore not auditable through any of them. Its tool calls ' +
+  'are resolved through this component own dispatch rule, and the receipt names both halves: ' +
+  'tool_scope is whose exposure the offered list is, tool_reach is the layer its calls ran in. ' +
+  'A reach of "process" carries no agent, so no tools/pre-execute guard, approval policy or ' +
+  'sandbox decision applies to those calls; a reach of "conversation" is the calling ' +
+  'conversation own scope, where the guards and sandbox policy declared for it DO apply. ' +
+  'It sees only the tools this component chooses to give it. ' +
   'What it does carry is the model the user authorised and the credentials the llm service ' +
   'already holds, because the call goes through that service rather than around it.';
 
