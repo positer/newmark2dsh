@@ -865,7 +865,29 @@ function readPageGlobals() {
 .ml-ohead { position: absolute; top: 10px; left: 10px; right: 10px; z-index: 4; display: flex; align-items: center; gap: 8px; justify-content: space-between; pointer-events: none; }
 .ml-ochip { padding: 7px 9px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-secondary); font-size: 11px; max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ml-oactions { display: flex; gap: 6px; align-items: center; pointer-events: auto; }
-.ml-oactions select { height: 26px; border-radius: 7px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); font: inherit; font-size: 11px; }
+/* THE FOCUS-MODE MENU, drawn to DSH's own compact menu (ui-primitives Menu.module.css):
+   4px-padded card, prominent elevation, 24px rows at --dsw-radius-sm, hover and keyboard
+   focus sharing one fill, selection marked by a trailing check. Every value is a token with a
+   fallback, so a theme or another plugin overrides the token rather than the rule, and a build
+   that does not define the token still gets a menu that matches the panel. Namespaced under the
+   ml- prefix with no bare element selectors and no !important — see the ModeMenu comment above.
+
+   THE CARD IS AS WIDE AS ITS TEXT, not as wide as DSH's compact minimum. The shell's own compact
+   list reserves 156px because its rows carry labels, icons and shortcuts; these four rows are two
+   CJK characters each, so that floor left most of the card empty — the user's instruction was to
+   keep the width of the text. A max-content width with no min-width floor does exactly that: the
+   card shrinks to its longest row plus the 4px padding, and the rows stay full-width so hover and
+   the focus fill still cover the whole card. Everything else in the card keeps DSH's metrics. */
+.ml-menu-root { position: relative; display: inline-flex; }
+.ml-menubtn { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 8px; border-radius: 7px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); font: inherit; font-size: 11px; cursor: pointer; }
+.ml-menubtn:hover { background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2)); }
+.ml-menubtn:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in oklab, var(--dsw-alias-brand-primary) 40%, transparent); }
+.ml-menubtn-caret { flex: none; width: 0; height: 0; border-left: 3.5px solid transparent; border-right: 3.5px solid transparent; border-top: 4px solid currentColor; opacity: .65; }
+.ml-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 40; box-sizing: border-box; display: flex; flex-direction: column; width: max-content; padding: 4px; border-radius: var(--dsw-radius-lg, 10px); background: var(--dsw-menu-surface-fill, var(--dsw-alias-bg-overlay)); box-shadow: var(--dsw-elevation-prominent, 0 10px 30px rgb(0 0 0 / 22%)); -webkit-backdrop-filter: var(--dsw-menu-backdrop-filter, none); backdrop-filter: var(--dsw-menu-backdrop-filter, none); }
+.ml-menuitem { display: flex; align-items: center; gap: 5px; width: 100%; min-height: 24px; padding: 2px 6px; border: 0; border-radius: var(--dsw-radius-sm, 6px); background: transparent; color: var(--dsw-alias-label-primary); font: inherit; font-size: 11px; line-height: 17px; text-align: left; cursor: pointer; }
+.ml-menuitem:hover, .ml-menuitem.active, .ml-menuitem:focus-visible { background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2)); outline: none; }
+.ml-menuitem-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ml-menucheck { flex: none; width: 12px; text-align: center; color: var(--dsw-alias-label-primary); }
 `;
 
     /** A panel-level selection expressed as the overview's node id. */
@@ -874,6 +896,181 @@ function readPageGlobals() {
       if (selection.kind === 'tag' && selection.tag) return `tag:${selection.tag}`;
       if (selection.kind === 'component' && selection.slug) return `component:${selection.slug}`;
       return '';
+    }
+
+    /**
+     * THE FOCUS-MODE MENU — a DSH-styled listbox instead of a native `<select>`.
+     *
+     * Why it is not a `<select>` any more: a native select's CLOSED control can be styled, but its
+     * OPEN list is drawn by the platform, so this control used to open a light Win32 popup inside a
+     * dark themed panel — the one surface in the panel that did not follow the theme, and it could
+     * not be fixed with CSS. The control is therefore an ordinary button plus a listbox card, and
+     * the card is sized and coloured to DSH's own menu (`@deepseek-ai/dsh-client-ui-primitives`
+     * `Menu.module.css`, the compact variant: a 4px-padded card with a prominent elevation, rows of
+     * `min-height: 24px`, `padding: 2px 6px`, `--dsw-radius-sm`, 11px/17px, hover and keyboard focus
+     * sharing `--dsw-alias-interactive-bg-hover`, and selection marked by a trailing check rather
+     * than a second fill).
+     *
+     * THE ROWS CARRY THE MODE NAME AND NOTHING ELSE. An earlier revision put a one-line
+     * explanation in each row ("父链与子树同时高亮" and so on). The user's instruction was to keep the
+     * original titles only, and the instruction is also the better match for the menus this card is
+     * copying: DSH's own rows are a label plus an optional icon or shortcut, four two-character CJK
+     * words need no gloss, and a description column would make this card wider than the menus it is
+     * imitating.
+     *
+     * COMPATIBILITY WITH OTHER PLUGINS' OVERRIDES, which is the other half of the requirement:
+     *
+     *   1. Every value is a THEME TOKEN, and the tokens this build may not define are read with a
+     *      FALLBACK (`var(--dsw-menu-surface-fill, var(--dsw-alias-bg-overlay))`). So a theme — or
+     *      another plugin calling `theme.overrideTokens` — moves this menu with everything else,
+     *      and a token that is absent still leaves a menu that matches the panel around it.
+     *   2. Every selector is namespaced under `ml-` and no rule names a bare element type. Another
+     *      plugin's stylesheet cannot match these classes by accident, and ours cannot match its
+     *      markup: the rule removed here was `.ml-oactions select`, which styled an element TYPE
+     *      inside a class we do not own exclusively.
+     *   3. No `!important` anywhere, so a later override — ours or another plugin's — still wins by
+     *      ordinary cascade order. Nothing here writes to `body`, `:root` or `*`.
+     *
+     * The card renders INSIDE the overview header rather than through the shell's frame-wide
+     * floating seat: the header sits at the stage's top edge and the card opens downward well inside
+     * it, so the stage's `contain: strict` (which would clip anything reaching its edge) never cuts
+     * it, and a floating seat would add a cross-panel coordinate channel for no visible gain.
+     */
+    const MODE_OPTIONS = [
+      { value: 'both', label: '双向' },
+      { value: 'parents', label: '父链' },
+      { value: 'children', label: '子树' },
+      { value: 'direct', label: '直接' },
+    ];
+
+    function ModeMenu({ value, onChange }) {
+      const [open, setOpen] = React.useState(false);
+      const [active, setActive] = React.useState(0);
+      const rootRef = React.useRef(null);
+      const buttonRef = React.useRef(null);
+      const itemRefs = React.useRef([]);
+      const index = Math.max(0, MODE_OPTIONS.findIndex((option) => option.value === value));
+      const current = MODE_OPTIONS[index];
+      const optionId = (option) => `ml-mode-${option.value}`;
+
+      // Closing on an outside pointer and on Escape is what every menu in the shell does; the
+      // listener is capture-phase so it still fires when the pointer lands on a canvas node whose
+      // handler would otherwise swallow it.
+      React.useEffect(() => {
+        if (!open) return undefined;
+        const onPointerDown = (event) => {
+          if (rootRef.current && !rootRef.current.contains(event.target)) setOpen(false);
+        };
+        document.addEventListener('pointerdown', onPointerDown, true);
+        return () => document.removeEventListener('pointerdown', onPointerDown, true);
+      }, [open]);
+
+      const close = (refocus) => {
+        setOpen(false);
+        if (refocus && buttonRef.current) buttonRef.current.focus();
+      };
+
+      const move = (delta) => {
+        const next = (active + delta + MODE_OPTIONS.length) % MODE_OPTIONS.length;
+        setActive(next);
+        const node = itemRefs.current[next];
+        if (node && typeof node.focus === 'function') node.focus();
+      };
+
+      const onButtonKeyDown = (event) => {
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+          event.preventDefault();
+          setActive(index);
+          setOpen(true);
+          return;
+        }
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          setActive(index);
+          setOpen((wasOpen) => !wasOpen);
+        }
+      };
+
+      const onListKeyDown = (event) => {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          move(1);
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          move(-1);
+          return;
+        }
+        if (event.key === 'Home' || event.key === 'End') {
+          event.preventDefault();
+          move(event.key === 'Home' ? -active : MODE_OPTIONS.length - 1 - active);
+          return;
+        }
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onChange(MODE_OPTIONS[active].value);
+          close(true);
+          return;
+        }
+        if (event.key === 'Escape' || event.key === 'Tab') {
+          if (event.key === 'Escape') event.preventDefault();
+          close(event.key === 'Escape');
+        }
+      };
+
+      return h(
+        'div',
+        { className: 'ml-menu-root', ref: rootRef },
+        h(
+          'button',
+          {
+            className: 'ml-menubtn',
+            type: 'button',
+            ref: buttonRef,
+            'aria-haspopup': 'listbox',
+            'aria-expanded': open ? 'true' : 'false',
+            'aria-controls': open ? 'ml-mode-list' : undefined,
+            onClick: () => {
+              setActive(index);
+              setOpen((wasOpen) => !wasOpen);
+            },
+            onKeyDown: onButtonKeyDown,
+          },
+          h('span', { className: 'ml-menubtn-label' }, current.label),
+          h('span', { className: 'ml-menubtn-caret', 'aria-hidden': 'true' }),
+        ),
+        open
+          ? h(
+              'div',
+              { className: 'ml-menu', id: 'ml-mode-list', role: 'listbox', 'aria-label': 'Focus mode', onKeyDown: onListKeyDown },
+              MODE_OPTIONS.map((option, optionIndex) =>
+                h(
+                  'button',
+                  {
+                    key: option.value,
+                    id: optionId(option),
+                    className: `ml-menuitem${optionIndex === active ? ' active' : ''}${option.value === value ? ' selected' : ''}`,
+                    type: 'button',
+                    role: 'option',
+                    ref: (node) => {
+                      itemRefs.current[optionIndex] = node;
+                    },
+                    'aria-selected': option.value === value ? 'true' : 'false',
+                    onMouseEnter: () => setActive(optionIndex),
+                    onClick: () => {
+                      onChange(option.value);
+                      close(true);
+                    },
+                    onKeyDown: onListKeyDown,
+                  },
+                  h('span', { className: 'ml-menuitem-label' }, option.label),
+                  option.value === value ? h('span', { className: 'ml-menucheck', 'aria-hidden': 'true' }, '✓') : null,
+                ),
+              ),
+            )
+          : null,
+      );
     }
 
     function OverviewView({ state, selection, onFocus, onActivate }) {
@@ -1350,14 +1547,7 @@ function readPageGlobals() {
           h(
             'div',
             { className: 'ml-oactions' },
-            h(
-              'select',
-              { value: mode, 'aria-label': 'Focus mode', onChange: (event) => setMode(event.target.value) },
-              h('option', { value: 'both' }, '双向'),
-              h('option', { value: 'parents' }, '父链'),
-              h('option', { value: 'children' }, '子树'),
-              h('option', { value: 'direct' }, '直接'),
-            ),
+            h(ModeMenu, { value: mode, onChange: setMode }),
             h('span', { className: 'ml-ochip' }, `${scaleLabel}%`),
             h('button', { className: 'ml-btn', type: 'button', onClick: () => apiRef.current?.clear() }, '取消'),
             h(
@@ -1958,6 +2148,16 @@ function readPageGlobals() {
        lives: the tag is rendered by this component, so it is in the DOM only while this
        panel is mounted, and the plugin page shows one bundle at a time. No other
        plugin's rows can be on screen while this rule is.
+
+       THE ONE UNSCOPED SELECTOR IN THIS PACKAGE, and it is declared rather than hidden:
+       the data-plugin-rows ATTRIBUTE is not a namespace, so another plugin that put the
+       same attribute on its own element would be styled by it — and one that set the
+       attribute on markup of its own would have that markup hidden while our panel is
+       mounted. Neither can happen on the bundle page as the shell renders it today (one
+       bundle per page, and the attribute is the shell's own for its row section), and the
+       alternative is leaving duplicate, contradictory row controls on the page. The gate
+       keeps a list of exactly this exception, so a SECOND unscoped selector fails rather
+       than joining it quietly.
 
        The panel above replaces what it hides: it names the components and carries their
        switches, which those rows cannot do. */
