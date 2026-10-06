@@ -1301,6 +1301,11 @@ export function createAgentApi({
     if (callerSignal && isFn(callerSignal.addEventListener)) callerSignal.addEventListener('abort', onCallerAbort, { once: true });
 
     counters.dispatches += 1;
+    // Outside the try, because the catch reports it too: a dispatch that THREW still has to say which
+    // layer it was searching, and a field declared inside the try would not exist there.
+    const call = callScope(view, exec?.agent);
+    const reach = dispatchScope(call);
+    const where = { scope: call.target, presentation: call.presentation, dispatch: reach === undefined ? 'process' : 'conversation' };
     try {
       // The documented `ToolExecutionInput`. `callId` is a branded string at the type level and
       // an ordinary string at runtime — `dsh-tools/lib/index.js:3134` reads it with no validation
@@ -1314,9 +1319,8 @@ export function createAgentApi({
       // NOT passed for a `ptc` conversation, where `resolveExecution` collapses every direct call
       // but `run_code` and the dispatch would answer `UNKNOWN_TOOL` for tools the catalog lists;
       // `dispatchScope` is where that decision lives and why. A route-driven call has no Agent and
-      // keeps the process-wide view.
-      const call = callScope(view, exec?.agent);
-      const reach = dispatchScope(call);
+      // keeps the process-wide view. `call`, `reach` and `where` are computed above the try, because
+      // the catch reports `where` too.
       const outcome = await view.tools.execute({
         callId: `agent-api:${counters.dispatches}:${Date.now().toString(36)}`,
         name,
@@ -1325,11 +1329,18 @@ export function createAgentApi({
         ...(reach === undefined ? {} : { agent: reach }),
       });
       const classified = classifyToolResult(name, outcome);
+      /**
+       * WHY THE ANSWER CARRIES `where`: the description has promised it since 0.2.17 and it was NOT
+       * true — four live answers from an `rdev` conversation (two successes, two `unknown_tool`
+       * refusals) carried no scope field at all, so a caller that named a preset tool under `ptc` was
+       * told `unknown tool "read"` and nothing else. `where` holds the same three fields the read half
+       * reports, at the TOP level on both paths, so a refusal is diagnosable without a second call.
+       */
       if (classified.exit === EXIT_OK) {
-        return envelope({ tool, exit: EXIT_OK, route: 'direct', result: { dispatched: name, value: classified.result } });
+        return envelope({ tool, exit: EXIT_OK, route: 'direct', result: { dispatched: name, value: classified.result }, extra: where });
       }
       const aborted = classified.exit === EXIT_ABORTED;
-      return envelope({ tool, exit: classified.exit, route: 'direct', code: aborted && timedOut ? 'timeout' : classified.code, error: classified.error });
+      return envelope({ tool, exit: classified.exit, route: 'direct', code: aborted && timedOut ? 'timeout' : classified.code, error: classified.error, extra: where });
     } catch (error) {
       const aborted = timedOut || controller.signal.aborted || error?.name === 'AbortError';
       return envelope({
@@ -1338,6 +1349,7 @@ export function createAgentApi({
         route: 'direct',
         code: aborted ? (timedOut ? 'timeout' : 'aborted') : 'dispatch_threw',
         error: error?.message ?? String(error),
+        extra: where,
       });
     } finally {
       clearTimeout(timer);
@@ -1466,7 +1478,7 @@ export function createAgentApi({
             "Worked example: `agent_api_tool { tool: 'read', arguments: { path: 'README.md' } }` -> `{ ok: true, tool: 'agent_api_tool', route: 'direct', exit: 0, class: 'ok', result: { dispatched: 'read', value: { … } } }`. " +
             'This tool is a thin wrapper for callers that want the classified envelope; a model that just wants to use a tool should call that tool itself. ' +
             'WHICH TOOLS IT CAN REACH follows the same rule as the catalog: a call arriving through a conversation is resolved for THAT conversation (`scope: "conversation"`) — the preset\'s tools, this package\'s, and whatever else that conversation registers — while a call arriving any other way, with no conversation, is resolved for the process (`scope: "process"`): the PTC transport, this package\'s tools, and the tools other plugins register globally. ' +
-            'One exception, stated because it would otherwise look like a missing tool: a conversation presenting its tools in `ptc` mode collapses direct calls — the registry admits only the reserved `run_code` — so such a call keeps the process-wide view and the answer names the presentation in `presentation`. ' +
+            'One exception, stated because it would otherwise look like a missing tool: a conversation presenting its tools in `ptc` mode collapses direct calls — the registry admits only the reserved `run_code` — so such a call keeps the process-wide view. EVERY answer, the refusals included, carries `scope`, `presentation` and `dispatch` at its top level, so a refusal is diagnosable on the spot: `presentation: "ptc"` is why the name was not admitted, and `dispatch: "process"` is the layer that was searched. `agent_api_catalog` reports the same three, plus `not_dispatchable`, BEFORE anything is dispatched. ' +
             'Exit 2 for a missing or unusable `tool` name, non-object `arguments`, a bad `timeout_ms`, or a name that is not reachable — including this component\'s own four names, which are refused with code recursive_dispatch_refused because dispatching them would re-enter this component. Exit 3 when the registry itself is unreachable, with code tool_dispatch_unavailable. Exit 4 for a tool that ran and failed, carrying the tool\'s own message. Exit 130 when the caller aborts or the timeout fires. ' +
             `The classification does not decide whether your call was a good idea — read the tool\'s own description first. ${lifecycle}`,
           parameters: {
