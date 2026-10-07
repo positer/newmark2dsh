@@ -10,3 +10,6 @@
 
 ## 0.2.26 rendering
 Separate animation presentation from source capture and report measured frame intervals by phase. Reuse DIB/DC/Graphics, batch alpha-contour updates and coalesce UI frames; never grow an unbounded render queue. Keep native viewer bounds fixed and animate GPU transforms, preserving input isolation and explicit process cleanup. Retain DSH tokens and plugin CSS overrides in both settings surfaces.
+
+## Process-preserving presentation transfers
+Never claim HWND-thread migration: receipts expose original identity and presentation identity separately. Reserve both desktop modes during crossing. Bind ownership to the trusted DSH session. Preserve exported application jobs, clean only unexported job members using retained process handles, restore imports, and test abrupt host/broker death independently from normal stop. GPU callback cadence is distinct from source capture cadence.

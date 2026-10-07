@@ -43,6 +43,7 @@ import { createAgentApi, DEFAULT_CONTEXT_MAX_CHARS, DEFAULT_CONTEXT_MAX_MESSAGES
 import { schema } from './lib/schema.js';
 import { resolveRoot } from './lib/root.js';
 import { embedJson } from './lib/embed.js';
+import { withComputerUseCaller } from '../../lib/cu-caller.js';
 
 /**
  * The page global this component publishes. Absent on the page means the component is off.
@@ -177,6 +178,8 @@ export function apply(ctx, config) {
 
   const definitions = api.tools();
   for (const definition of definitions) {
+    const execute = definition.execute;
+    definition.execute = (args, execution) => withComputerUseCaller(execution, () => execute(args, execution));
     ctx.effect(() => ctx.tools.register(definition), `newmark-agentapi-tool-${definition.name}`);
   }
 

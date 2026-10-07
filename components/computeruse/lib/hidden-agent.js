@@ -310,6 +310,16 @@ using System.Text;
  */
 public static class NmProcessFacts
 {
+  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint timeout);
+  public static void WatchOwner(int pid) {
+    IntPtr owner = OpenProcess(0x100000, false, pid);
+    if(owner == IntPtr.Zero) Environment.Exit(0);
+    var watcher = new System.Threading.Thread(new System.Threading.ThreadStart(delegate {
+      try { WaitForSingleObject(owner, 0xffffffff); Environment.Exit(0); }
+      finally { CloseHandle(owner); }
+    }));
+    watcher.IsBackground = true; watcher.Start();
+  }
   [StructLayout(LayoutKind.Sequential)]
   public struct FILETIME { public uint Low; public uint High; }
 
@@ -1127,6 +1137,17 @@ public static class NmAgentWindow
    */
   public static int Capture(IntPtr hWnd, string path, out int width, out int height, out int route, out int printWindowError)
   {
+    RECT logical; GetWindowRect(hWnd,out logical);
+    IntPtr dpi=SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(hWnd));
+    try { return CaptureInContext(hWnd,path,logical.Right-logical.Left,logical.Bottom-logical.Top,out width,out height,out route,out printWindowError); }
+    finally { if(dpi!=IntPtr.Zero)SetThreadDpiAwarenessContext(dpi); }
+  }
+  [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd);
+  [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+  [DllImport("gdi32.dll")] static extern int SetStretchBltMode(IntPtr dc,int mode);
+  [DllImport("gdi32.dll")] static extern bool StretchBlt(IntPtr to,int x,int y,int width,int height,IntPtr from,int sx,int sy,int sourceWidth,int sourceHeight,uint operation);
+  static int CaptureInContext(IntPtr hWnd, string path,int logicalWidth,int logicalHeight,out int width,out int height,out int route,out int printWindowError)
+  {
     width = 0; height = 0; route = 0; printWindowError = 0;
     if (!IsWindow(hWnd)) return 0;
     RECT rect;
@@ -1151,6 +1172,16 @@ public static class NmAgentWindow
       else if (PrintWindow(hWnd, memoryDc, 0)) { route = 0; captured = true; }
       else if (BitBlt(memoryDc, 0, 0, w, h, windowDc, 0, 0, SRCCOPY)) { route = 3; captured = true; }
       if (!captured) { printWindowError = Marshal.GetLastWin32Error(); return 0; }
+      // Preserve the agent's advertised coordinate space, even when the target is PMv2.
+      if(logicalWidth>0&&logicalHeight>0&&(logicalWidth!=w||logicalHeight!=h)) {
+        IntPtr scaledDc=CreateCompatibleDC(windowDc),scaledBitmap=CreateCompatibleBitmap(windowDc,logicalWidth,logicalHeight);
+        if(scaledDc==IntPtr.Zero||scaledBitmap==IntPtr.Zero){if(scaledDc!=IntPtr.Zero)DeleteDC(scaledDc);if(scaledBitmap!=IntPtr.Zero)DeleteObject(scaledBitmap);return 0;}
+        IntPtr scaledPrevious=SelectObject(scaledDc,scaledBitmap);SetStretchBltMode(scaledDc,4);
+        bool scaled=StretchBlt(scaledDc,0,0,logicalWidth,logicalHeight,memoryDc,0,0,w,h,SRCCOPY);
+        if(!scaled){SelectObject(scaledDc,scaledPrevious);DeleteObject(scaledBitmap);DeleteDC(scaledDc);return 0;}
+        SelectObject(memoryDc,previous);DeleteObject(bitmap);DeleteDC(memoryDc);
+        memoryDc=scaledDc;bitmap=scaledBitmap;previous=scaledPrevious;w=logicalWidth;h=logicalHeight;
+      }
       SelectObject(memoryDc, previous);
       previous = IntPtr.Zero;
       byte[] bits = new byte[w * h * 4];
@@ -1227,6 +1258,7 @@ export const AGENT_PS1 = String.raw`param(
   [Parameter(Mandatory = $true)][string]$CsharpDir,
   [Parameter(Mandatory = $true)][string]$Token,
   [string]$LogPath = '',
+  [int]$OwnerPid = 0,
   [switch]$NoJob
 )
 
@@ -1759,6 +1791,7 @@ foreach ($typeName in $types) {
   }
 }
 
+if ($OwnerPid -gt 0) { [NmProcessFacts]::WatchOwner($OwnerPid) }
 $desktopError = 0
 $script:nmDesktopHold = [NmAgentDesktop]::OpenByName($DesktopName, [ref]$desktopError)
 $threadDesktop = [NmAgentDesktop]::ThreadDesktopName()
@@ -2393,6 +2426,7 @@ export async function startHiddenDesktopAgent(options = {}) {
     '-CsharpDir', quoteArgument(payloads.directory),
     '-Token', quoteArgument(token),
     '-LogPath', quoteArgument(agentLog),
+    '-OwnerPid', String(process.pid),
   ];
   if (options.noJob) agentArguments.push('-NoJob');
   // The agent names its own log file and writes to it with the file API. It is NOT a shell

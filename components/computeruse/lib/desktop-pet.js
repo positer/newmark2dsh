@@ -73,6 +73,17 @@ export function desktopPetContract() {
   };
 }
 
+export async function prepareDesktopPetTransfer(direction) {
+  if(!record)throw new Error('Virtual takeover must start NewMate before transferring a window');
+  fs.writeFileSync(path.join(record.directory,'transfer-motion'),direction==='in'?'in':'out');
+  for(let i=0;i<100;i++) {
+    const state=desktopPetState();
+    if(state.window && !state.window.expanded){const b=state.window.bounds,p=state.window.paint_bounds;return {x:b.x+p.x+p.width/2,y:b.y+p.y+p.height/2};}
+    await sleep(50);
+  }
+  throw new Error('NewMate did not finish closing its preview');
+}
+
 export async function stopDesktopPet(reason = 'lease_released') {
   const previous = record;
   releaseDesktopPet(reason);

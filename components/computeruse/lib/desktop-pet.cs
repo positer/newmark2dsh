@@ -143,7 +143,7 @@ internal static class DesktopCapture {
             var windows=new List<IntPtr>();
             if (!PetNative.EnumDesktopWindows(desktop, delegate(IntPtr w, IntPtr data) {
                 uint pid; PetNative.GetWindowThreadProcessId(w,out pid);
-                if (PetNative.IsIndicator(w)) return true;
+                if (PetNative.IsIndicator(w) || PetNative.GetProp(w,"Newmark2DSH.TransferSource")!=IntPtr.Zero) return true;
                 var className=new StringBuilder(256); PetNative.GetClassName(w,className,className.Capacity);
                 // Input-method service windows are marked visible even without any
                 // painted UI; PrintWindow turns their invisible rectangles black.
@@ -560,6 +560,8 @@ internal sealed class DesktopPet : Form {
         long nowTime=clock.ElapsedMilliseconds;
         if(nowTime-lastSettingsPoll>=200){
             lastSettingsPoll=nowTime;
+            string transferMotion=Path.Combine(config.directory,"transfer-motion");
+            if(exitStarted<0&&File.Exists(transferMotion))try{string direction=File.ReadAllText(transferMotion);File.Delete(transferMotion);if(viewer!=null)Collapse();stretchX.Target=stretchY.Target=1;stretchX.Velocity+=direction=="in"?-4:4;stretchY.Velocity+=direction=="in"?4:-4;}catch(IOException){}
             if (File.Exists(Path.Combine(config.directory,"stop")) || !PetFiles.Alive(config.ownerPid,ownerIdentity)) BeginExit();
             if(!String.IsNullOrEmpty(config.settingsPath) && File.Exists(config.settingsPath) && File.GetLastWriteTimeUtc(config.settingsPath)!=settingsStamp){
                 double oldScale=sizeMultiplier;LoadScale();double next=sizeMultiplier;sizeMultiplier=oldScale;ApplyScale(next,false);

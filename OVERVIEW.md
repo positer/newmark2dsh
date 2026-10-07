@@ -23,3 +23,6 @@ This repository holds the self-contained package published as `newmark2dsh`. Dev
 
 ## 0.2.26
 Configuration cards group model and NewMate controls. ComputerUse desktop-pet.cs owns persistent DIB drawing, deadline frame pacing and a GPU WebView2 read-only viewer with warm reuse. desktop-menu.cs/html and desktop-menu-client/theme.js share live DSH Menu appearance. lib/newmate-settings.js owns versioned continuous preferences. vendor/webview2 includes pinned SDK binaries, provenance and license.
+
+## 0.2.27
+`components/computeruse/lib/desktop-transfer.cs` owns the capture/control proxy, job retention/cleanup, crash guardian and WebView2 flight. Its `.js` partner compiles native code and coordinates identity-checked receipts. `takeover-lock.cs/js` hold one kernel mutex per mode across hosts. `lib/cu-caller.js` preserves DSH session identity through asynchronous Agent API dispatch. `hidden-agent.js` watches the owner lifetime. Acceptance sources and raw source/installed receipts remain in the development archive `20261007-cu-transfer`.

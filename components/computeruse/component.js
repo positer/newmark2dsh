@@ -18,6 +18,7 @@
  */
 
 import { causeChain, createErrorLog, describeError } from '../../lib/errors.js';
+import { computerUseCaller } from '../../lib/cu-caller.js';
 
 /** Newmark's action surface, exactly. */
 export const COMPUTER_USE_ACTIONS = [
@@ -25,6 +26,7 @@ export const COMPUTER_USE_ACTIONS = [
   'takeover_start', 'takeover_stop', 'move', 'click', 'drag', 'scroll',
   'type', 'key', 'wait', 'app_activate', 'app_click', 'app_drag',
   'app_scroll', 'app_type', 'app_key', 'mode_report',
+  'process_push', 'process_pull',
 ];
 
 /**
@@ -91,6 +93,8 @@ const SNAKE_TO_CAMEL = Object.freeze({
   mouse_mode: 'mouseMode',
   app_target: 'appTarget',
   window_handle: 'windowHandle',
+  process_id: 'processId',
+  transfer_id: 'transferId',
   target_id: 'targetId',
   scroll_x: 'scrollX',
   scroll_y: 'scrollY',
@@ -281,10 +285,11 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
   /** Keep the lease mirror in step with what the backend actually did. */
   function observeLeaseArgs(args, result) {
     const action = String(args?.action || '');
-    if (action === 'takeover_start') {
-      const requested = args?.mouse_mode === 'virtual' ? 'virtual' : 'real';
-      lease = { ownerId: String(args?.owner_id || 'dsh'), mouseMode: requested, acquiredAt: Date.now() };
-    } else if (action === 'takeover_stop') {
+    const parsed = typeof result === 'string' ? (()=>{try{return JSON.parse(result);}catch{return null;}})() : result;
+    if (parsed?.ok !== true) return;
+    if (action === 'takeover_start' && parsed.lease) {
+      lease = { ownerId: String(parsed.lease.owner_id || ''), mouseMode: parsed.lease.mouse_mode, acquiredAt: parsed.lease.acquired_at };
+    } else if (action === 'takeover_stop' && lease.ownerId === parsed.released_owner) {
       lease = { ownerId: '', mouseMode: 'real', acquiredAt: 0 };
     } else if (typeof result === 'string') {
       // A refusal that names another owner is authoritative: mirror it. It does not expire.
@@ -333,12 +338,13 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
            * behaviour measured in the same run, so it cannot quietly drift from the code.
            */
           description: [
-            'Drive this desktop through Newmark ComputerUse. Accepts the full action surface (observe, app_list, app_observe, wait_for, sequence, takeover_start, takeover_stop, move, click, drag, scroll, type, key, wait, app_activate and the app_* variants). Mouse mode is bound for the session at takeover_start only, and the takeover lease is exclusive to one owner.',
+            'WINDOW TRANSFER (Windows): process_push presents a selected hidden-desktop window on the real desktop; process_pull presents a selected real-desktop window inside your hidden takeover. Supply window_handle, an unambiguous process_id, or transfer_id from mode_report.desktop_transfers. These preserve the original PID, process state and HWND by interactive presentation mapping; they do not move the native window thread. Both desktop modes are reserved during a transfer; another real takeover blocks it. NewMate animates fly-out/fly-in. Posted-message-compatible Win32 windows are supported; minimized windows must be restored first, and additional dialogs/top-level windows need their own explicit selection. Closing a presentation requests closing its original window. Stopping a virtual takeover restores imported real windows and retains explicitly exported applications until they close. Use the returned presentation window_handle for subsequent actions; never the concealed original handle.',
+            'Drive this desktop through Newmark ComputerUse. Accepts the full action surface (observe, app_list, app_observe, wait_for, sequence, takeover_start, takeover_stop, move, click, drag, scroll, type, key, wait, app_activate and the app_* variants). Each mode has one exclusive takeover slot across all DSH hosts for this Windows user. Real and virtual slots may coexist; specify mouse_mode when holding both. Ownership uses the calling DSH session identity.',
             '',
             'OPENING AN APPLICATION. The Windows key does not work on this machine and it fails silently: `key: "win"` and `key: "win+r"` both answer `ok: true` with `focus_changed: true` and nothing happens, because the shell ignores synthetic Windows keys. The receipt says `windows_key_effect: "not-observed"` rather than claiming the key worked. Use the ordinary chord instead: `key: "ctrl+esc"` opens the Start menu, `type: "<the application name>"` lands in the Start menu search box, then `key: "enter"` launches it. `app_activate` NEVER launches a process: it binds a window that already exists and answers `app_target_not_found` when nothing matches, so it cannot start an application - to open one, use `ctrl+esc`.',
             '',
             'OPERATING HABITS. Each was measured in a real session; the record and its evidence are in `docs/03-computer-use-playbook.md` (Newmark2DSH).',
-            '- Call `takeover_start` before your first input, and `takeover_stop` in a `finally`. The lease is exclusive to one owner, a leaked lease leaves a topmost click-through overlay on the desktop, and `takeover_stop` refuses without the exact `owner_id` (`takeover_lease_owned_by_another_owner`).',
+            '- Call `takeover_start` before your first input, and `takeover_stop` in a `finally`. Each mode is exclusive to one DSH session; real mode leaves a topmost click-through overlay and virtual mode shows NewMate. Stop from the same session; another session receives `takeover_lease_owned_by_another_owner`. Direct API callers must keep the same `owner_id`.',
             '- `ok: true` does not mean it happened. Read the receipt fields themselves - `focus_changed`, `windows_key_effect`, `capture_scope`, `target_scope` - and where they are inconclusive verify from outside (`app_list`, or a foreground-window read) instead of trusting the return value of the action.',
             '- `observe` captures ONE WINDOW - the foreground window unless you name one - not the desktop: `capture_scope: "window"`, `capture_method: "PrintWindow(hwnd,hdc,2)"`. For the screen itself use `screen_capture` with `target: "desktop"` and check that the payload says `capture_scope: "virtual-screen"` and `target_scope: "screen"` (`capture_method: "BitBlt(screen-dc,virtual-screen)"`).',
             '- Prefer `window_handle` over `app_target`: `app_target` has failed to match a window that exists and that `app_list` had just listed with that title. `window_handle` is exact.',
@@ -347,17 +353,17 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
             '- `type` is delivered as unicode key events (`text_delivery: "unicode-key-events"`), so Chinese and other non-ASCII text works.',
             '- A lone Windows key is refused by the shell, and a Windows chord is refused in virtual mode (`windows_key_requires_real_delivery`: a posted `WM_KEYDOWN` cannot open the Start menu). Use `ctrl+esc`.',
             '',
-            'WORKING ON A HIDDEN DESKTOP. `takeover_start` with `mouse_mode: "virtual"` AND `desktop: "hidden"` arms a resident agent on a desktop of its own; every later `app_list`, `app_observe`, `app_activate`, `app_click`, `app_type`, `app_scroll` and `app_key` from that owner is then relayed to that agent, and nothing on this desktop is touched. `owner_id` is optional and you do NOT have to repeat it: the lease is exclusive, so while a hidden desktop is armed every one of those actions goes to it whether or not the call names the owner, and the receipt states both (`owner_id_declared` is what the call said, `owner_id_routed` is whose desktop answered, `owner_resolved_from_lease` is true when they differ). `launch: "<command line>"` on the same call starts a program on it; read `hidden_desktop.launched[0].held` and `hidden_desktop.unowned_launches` to see whether that program is one the job can end, because a packaged application (Notepad is one on this build) hands off to a process outside the job and is then REPORTED, not silently held. `takeover_stop` ends the agent and reports what the teardown measured: `hidden_desktop.pids_checked` is one record per pid with its own `running` answer, and `all_processes_gone`, `desktop_gone`, `desktop_still_held` and `unaccounted_holder` are what it found - a `true` beside a still-openable desktop means a process it does not know about holds it. Virtual mode WITHOUT `desktop` is unchanged: posted window messages to a window on this desktop.',
+            'WORKING ON A HIDDEN DESKTOP. `takeover_start` with `mouse_mode: "virtual"` AND `desktop: "hidden"` arms a resident agent on a desktop of its own; every later `app_list`, `app_observe`, `app_activate`, `app_click`, `app_type`, `app_scroll` and `app_key` from that owner is then relayed to that agent, and nothing on this desktop is touched. DSH supplies the stable session owner automatically, so changing or omitting a model-provided `owner_id` cannot redirect another session. Direct backend callers must reuse their owner id. Other sessions never inherit this route. `launch: "<command line>"` on the same call starts a program on it; read `hidden_desktop.launched[0].held` and `hidden_desktop.unowned_launches` to see whether that program is one the job can end, because a packaged application (Notepad is one on this build) hands off to a process outside the job and is then REPORTED, not silently held. `takeover_stop` ends the agent and reports what the teardown measured: `hidden_desktop.pids_checked` is one record per pid with its own `running` answer, and `all_processes_gone`, `desktop_gone`, `desktop_still_held` and `unaccounted_holder` are what it found - a `true` beside a still-openable desktop means a process it does not know about holds it. Virtual mode WITHOUT `desktop` is unchanged: posted window messages to a window on this desktop.',
             'CHOOSING WHAT TO LAUNCH. Prefer a traditional Win32 application (a browser, an editor, most developer tools) and avoid a packaged one (MSIX / Microsoft Store) when you have a choice - this is advice, not a refusal, and a packaged target is still started and still drivable. The reason is reclamation, not permission: a packaged application cannot be placed in the agent job, so if the agent exits unexpectedly nothing kills it, the process keeps the desktop alive, and the desktop is then occupied invisibly - the one outcome the job exists to prevent. A packaged target is not silent about this: `hidden_desktop.launched[0]` carries `held: false` and `ownership: "unowned"` with the `assign_error` that refused it, `unowned_launches` / `unheld_desktop_pids` name the process, and the teardown answers `all_processes_gone: false` with that pid in `still_running`. If you do launch one, read those fields and terminate the named pid yourself; `check-cu-hidden-leftovers.mjs` lists what is left on each desktop. Absolute path, not a bare name: `msedge.exe` alone is refused because it is not on PATH, while `C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe` starts and is `held: true`. And a refused launch does not clean up after itself - the desktop and the agent are already up and no lease was taken, so the pids have to be terminated by hand.',
           ].join('\n'),
           parameters: {
             type: 'object',
             properties: {
               action: { type: 'string', enum: COMPUTER_USE_ACTIONS },
-              mouse_mode: { type: 'string', enum: ['real', 'virtual'], description: 'Accepted on takeover_start only.' },
+              mouse_mode: { type: 'string', enum: ['real', 'virtual'], description: 'Select the real or virtual slot. Required when this session holds both. process_push/process_pull use the virtual slot and reserve both modes during the crossing.' },
               desktop: { type: 'string', enum: ['hidden'], description: 'Accepted on takeover_start only. "hidden" arms a resident agent on a desktop of its own and routes the app_* actions to it; it requires mouse_mode "virtual".' },
               launch: { type: 'string', description: 'Accepted on takeover_start with desktop "hidden" only: a command line to start on that hidden desktop, tracked by the pid and start time its own launch returned. Give an absolute path - a bare name is refused unless it is on PATH. Prefer a traditional Win32 application and avoid a packaged (MSIX / Store) one where you have the choice: a packaged target still starts and is still drivable, but it cannot be placed in the agent job, so an unexpected exit would leave it holding the desktop with nothing to reclaim it. Read `hidden_desktop.launched[0].held` (`true`, with `ownership: "inherited"`, for a target the job holds) and, if it is false, terminate the pid named in `unowned_launches` / `unheld_desktop_pids` yourself.' },
-              owner_id: { type: 'string' },
+              owner_id: { type: 'string', description: 'Direct API owner label. Inside DSH, the trusted host session identity takes precedence.' },
               x: { type: 'number' },
               y: { type: 'number' },
               start_x: { type: 'number' },
@@ -367,6 +373,8 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
               target_id: { type: 'string' },
               app_target: { type: 'string' },
               window_handle: { type: 'string' },
+              process_id: { type: 'integer', description: 'Process with exactly one source top-level window for process_push/process_pull; otherwise specify window_handle.' },
+              transfer_id: { type: 'string', description: 'Live mapping ID from mode_report.desktop_transfers or a transfer receipt.' },
               button: { type: 'string', enum: ['left', 'right'] },
               text: { type: 'string' },
               key: { type: 'string' },
@@ -385,7 +393,7 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
             required: ['action'],
           },
           output: { schema: { type: 'object' }, render: (args, value) => toolText(value) },
-          async execute(args) {
+          async execute(args, execution) {
             const action = String(args?.action || 'observe');
             const backend = await loadBackend();
             if (!backend) return UNAVAILABLE(action);
@@ -395,10 +403,12 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
              * snake_case, and the backend keeps reading camelCase.
              */
             const translated = backendOptions(args);
+            // Host-provided agent identity is authoritative, not a model-chosen owner label.
+            const caller = computerUseCaller(execution);
             const result = await runBackend(backend, {
               ...translated,
               imageDir: captionDir,
-              ownerId: String(translated.ownerId || 'dsh'),
+              ownerId: caller || String(translated.ownerId || 'dsh'),
               mouseMode: translated.mouseMode,
             });
             observeLeaseArgs(translated, result);

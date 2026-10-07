@@ -29,7 +29,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 import { overlayContractReport, overlayState as realOverlayState, releaseOverlay, startOverlay, stopOverlay } from './overlay-win32.js';
-import { desktopPetContract, desktopPetState, releaseDesktopPet, startDesktopPet, stopDesktopPet } from './desktop-pet.js';
+import { desktopPetContract, desktopPetState, releaseDesktopPet, startDesktopPet, stopDesktopPet, prepareDesktopPetTransfer } from './desktop-pet.js';
+import { acquireTakeoverLock } from './takeover-lock.js';
+import { desktopTransfers, transferReport, findDesktopTransfer, inspectTransferSource, startDesktopTransfer, returnDesktopTransfer, transferCommand, cleanupTransferredDesktop, releaseDesktopTransfersSync, restoreVirtualTransfers } from './desktop-transfer.js';
 
 /* ------------------------------------------------------------------ *
  * 1. constants, lanes, mode inventory, action tables
@@ -105,7 +107,7 @@ export const SEQUENCE_STEP_ACTIONS = Object.freeze(['move', 'click', 'drag', 'sc
 
 /** Every exported action, in one list. */
 export const ALL_ACTIONS = Object.freeze([
-  ...DESKTOP_ACTIONS, ...APP_ACTIONS, 'sequence', 'mode_report',
+  ...DESKTOP_ACTIONS, ...APP_ACTIONS, 'sequence', 'mode_report', 'process_push', 'process_pull',
 ]);
 
 /**
@@ -148,6 +150,8 @@ export const ACTION_LANES = Object.freeze({
   app_key: Object.freeze(['action']),
   sequence: Object.freeze(['action', 'windows_advisory', 'uia_advisory']),
   mode_report: Object.freeze([]),
+  process_push: Object.freeze(['windows']),
+  process_pull: Object.freeze(['windows']),
 });
 
 export function actionLanes(action) {
@@ -1973,6 +1977,7 @@ export function stopLane(lane) {
  * `verified: false` and `takeover_stop` remains the path that measures.
  */
 export function stopAll() {
+  releaseDesktopTransfersSync();
   for (const lane of LANES) workers.get(lane).stop();
   const hiddenStopped = stopHiddenAgentsSync();
   releaseLease('stop_all');
@@ -2576,7 +2581,8 @@ async function enumerateApplications(options = {}) {
       occluded: entry.occluded === true,
     }))
     .filter(entry => handleToInt(entry.handle) !== 0);
-  return { ok: true, applications, lane, elapsedMs: Date.now() - startedAt };
+  const mappedSources=new Set(desktopTransfers().map(r=>r.config.sourceHandle.toLowerCase()));
+  return { ok: true, applications:applications.filter(app=>!mappedSources.has(app.handle.toLowerCase())), lane, elapsedMs: Date.now() - startedAt };
 }
 
 function normalizeRect(rect) {
@@ -3614,38 +3620,12 @@ function hiddenRouteFor(ownerId) {
   return hiddenRoutes.get(ownerKey(ownerId)) || null;
 }
 
-/**
- * The route this call must be relayed through, or null.
- *
- * THE LEASE IS THE AUTHORITY, AND THE OWNER ID IS ONLY A NAME FOR IT.
- *
- * The shipped version of this function asked one question - is there a route filed under the
- * owner id THIS CALL declared - and that question is not the same as "is a hidden desktop armed
- * for this session". Measured in the running application (2.0.11, live `computer_use`):
- * `takeover_start` armed a desktop and reported `delivery: "hidden-desktop-agent"`, and the
- * next `app_list` answered `ok: true, scope: "virtual-includes-occluded"` with 94 windows of the
- * INTERACTIVE desktop and the agent's `requests_served` unchanged. The lease was held and
- * virtual - the interactive branch's own `scope` field proves that, because it is derived from
- * `activeLease()` - so the route existed and was simply not found under the name the call used.
- *
- * The caller could not have known the name mattered: `owner_id` is optional, the guide mentions
- * it only in the sentence about `takeover_stop`, and `component.js` fills in `'dsh'` for every
- * call that omits it. A caller that names an owner once, at the arm, therefore gets the
- * interactive desktop for every later action while the receipt says a hidden desktop is armed.
- *
- * So the resolution is: the route this process has armed, which is the lease holder's, because
- * the lease is exclusive and there is at most one armed route at a time. The declared owner is
- * still consulted first, so a matching call is unchanged; when it does not match, the call is
- * routed to the armed desktop AND the substitution is recorded on the route, where
- * `hiddenHeader` reports it as `owner_id_declared` / `owner_id_routed` /
- * `owner_resolved_from_lease`. Two independent conditions remain, and both are required: a
- * route armed, and that route's owner still holding a VIRTUAL lease. A lease that has been
- * released cannot route - the desktop it named is being torn down - so a leaked route cannot
- * outlive its lease.
- */
+/** The caller must own the virtual slot and its route. DSH supplies a stable session id;
+ * direct API callers keep their owner id. Never borrow another session's hidden route.
+ * The read-only screen_capture tool explicitly bypasses takeover routing. */
 function hiddenRouteActive(options) {
   const declaredOwner = String((options && options.ownerId) || '');
-  const active = activeLease();
+  const active = activeLease(options);
   if (!active || active.mouse_mode !== 'virtual') return null;
   const declared = declaredOwner ? hiddenRouteFor(declaredOwner) : null;
   if (declared && !declared.closed && declared.ownerId === active.owner_id) {
@@ -3659,6 +3639,7 @@ function hiddenRouteActive(options) {
    * onto that desktop. The fallback below is for the lease holder's own actions.
    */
   if (options && options.skipLease === true) return null;
+  if (declaredOwner !== active.owner_id) return null;
   const held = hiddenRouteFor(active.owner_id);
   if (!held || held.closed) return null;
   held.resolvedFor = { declared: declaredOwner || null, ownerId: held.ownerId, fromLease: declaredOwner !== held.ownerId };
@@ -3750,7 +3731,8 @@ function hiddenApplications(answer) {
 async function hiddenEnumerate(route, options = {}) {
   const answer = await hiddenAgentAnswer(route, 'enumerate', {}, { timeoutMs: options.timeoutMs });
   if (answer.ok !== true) return { ok: false, applications: [], error_code: answer.error_code, error: answer.error, elapsedMs: answer.elapsedMs };
-  const applications = hiddenApplications(answer.value);
+  const mappedSources=new Set(desktopTransfers().map(r=>r.config.sourceHandle.toLowerCase()));
+  const applications = hiddenApplications(answer.value).filter(app=>!mappedSources.has(app.handle.toLowerCase()));
   return {
     ok: true,
     applications,
@@ -4761,6 +4743,12 @@ async function closeHiddenDesktop(route = null, options = {}) {
   for (const entry of unheldBefore) addPid(entry && entry.pid, 'unheld-desktop-window', entry && entry.start_time_ticks);
   for (const entry of Array.isArray(route.unheld) ? route.unheld : []) addPid(entry && entry.pid, 'unheld-desktop-window', entry && entry.start_time_ticks);
   const pids = [...sources.keys()];
+  const retained = await cleanupTransferredDesktop(route.desktopName);
+  if(retained){
+    const preserved=new Set(retained.preserved),ended=await hiddenWaitForExit(pids.filter(pid=>!preserved.has(pid)),20000);
+    const measured=await hiddenWaitForExit(pids,1000);route.closed=true;
+    return {desktop_name:route.desktopName,agent_pid:route.agentPid,all_processes_gone:measured.all_gone,still_running:measured.still_running,pids_checked:measured.states,preserved_process_ids:[...preserved],preserved_exports:desktopTransfers().filter(r=>r.config.sourceDesktop===route.desktopName).map(transferReport),non_exported_processes_gone:ended.all_gone,desktop_gone:false,desktop_still_held:true,unaccounted_holder:!ended.all_gone,retention_reason:'Explicitly exported applications retain their original process and desktop; interactive presentations remain on the real desktop.'};
+  }
   const exited = await hiddenAgentAnswer(route, 'exit', {}, { timeoutMs: 20000 });
   let verified = await hiddenWaitForExit(pids, clampNumber(options.hiddenExitWaitMs, 1000, 120000, 20000));
   let killedByThisCall = false;
@@ -4977,13 +4965,15 @@ async function realStep(action, script, options, reserved = false) {
 
 /* --- the single-owner takeover lease ------------------------------ */
 
-const lease = {
-  ownerId: null,
-  mouseMode: 'real',
-  acquiredAt: 0,
-  lastReleaseReason: '',
-  lastOverlayError: '',
-};
+const leases = Object.fromEntries(['real','virtual'].map(mouseMode => [mouseMode, {
+  ownerId: null, mouseMode, acquiredAt: 0, lastReleaseReason: '', lastOverlayError: '', lock: null,
+}]));
+const modeOperations = new Map();
+function leaseFor(options = {}) {
+  if (options.mouseMode === 'real' || options.mouseMode === 'virtual') return leases[options.mouseMode];
+  const owner = String(options.ownerId || 'direct');
+  return Object.values(leases).find(item => item.ownerId === owner) || leases.real;
+}
 
 /**
  * The visible half of the takeover: a native screen-edge ring in real mode,
@@ -4994,45 +4984,47 @@ const lease = {
  * outcome is observable instead - `mode_report` reports `overlay.running` and the reason
  * it is not running.
  */
-let indicatorGeneration = 0;
-function overlayState() {
-  return lease.mouseMode === 'virtual' ? desktopPetState() : realOverlayState();
+const indicatorGenerations = { real: 0, virtual: 0 };
+function overlayState(options = {}) {
+  return leaseFor(options).mouseMode === 'virtual' ? desktopPetState() : realOverlayState();
 }
 
 function startTakeoverOverlay(ownerId, options = {}) {
-  const epoch = ++indicatorGeneration;
+  const lease = leaseFor({...options, ownerId});
   const mode = lease.mouseMode;
+  const epoch = ++indicatorGenerations[mode];
   const desktop = hiddenRouteFor(ownerId)?.desktopName || 'Default';
   try {
     const started = (async () => {
       if (mode === 'virtual') {
-        await stopOverlay({ reason: 'virtual_pet', action: 'takeover_overlay_replace' });
-        if (epoch !== indicatorGeneration) return;
+        if (epoch !== indicatorGenerations[mode]) return;
         return await startDesktopPet({ ownerPid: process.pid, desktop, userRoot: options.userRoot });
       }
-      releaseDesktopPet('real_mode');
-      if (epoch !== indicatorGeneration) return;
+      if (epoch !== indicatorGenerations[mode]) return;
       return await startOverlay({ ownerId, ownerPid: process.pid, durationMs: 0, action: 'takeover_start' });
     })();
-    started.then((result) => { if (epoch === indicatorGeneration && result?.ok === false) lease.lastOverlayError = result.error || 'indicator_start_failed'; }).catch((error) => { lease.lastOverlayError = error.message; });
+    started.then((result) => { if (epoch === indicatorGenerations[mode] && result?.ok === false) lease.lastOverlayError = result.error || 'indicator_start_failed'; }).catch((error) => { if(epoch === indicatorGenerations[mode]) lease.lastOverlayError = error.message; });
   } catch (error) {
     lease.lastOverlayError = error instanceof Error ? error.message : String(error);
   }
 }
 
-function releaseLease(reason) {
-  indicatorGeneration++;
-  releaseDesktopPet(reason);
+function releaseLease(reason, mode) {
+  if (!mode) { releaseLease(reason, 'real'); releaseLease(reason, 'virtual'); return {released:true,reason}; }
+  const lease = leases[mode];
+  indicatorGenerations[mode]++;
+  if(mode === 'virtual') releaseDesktopPet(reason);
   lease.lastReleaseReason = reason;
   lease.ownerId = null;
   lease.acquiredAt = 0;
   // Every exit path restores the physical mouse mode.
-  lease.mouseMode = 'real';
+  lease.lock?.release();
+  lease.lock = null;
   // The visible half of the lease: `takeover_stop`, `stopAll()` and process exit all land
   // here, so the native overlay can never outlive the lease that owns it. Time is no
   // longer one of these paths - the lease has no expiry, so nothing here fires on a clock.
   try {
-    releaseOverlay(reason);
+    if(mode === 'real') releaseOverlay(reason);
   } catch (error) {
     lease.lastOverlayError = error instanceof Error ? error.message : String(error);
   }
@@ -5046,7 +5038,8 @@ function releaseLease(reason) {
  * process dying). The three duration fields report `null` rather than a number, because a
  * number would be read as a real deadline by every caller that trusts it.
  */
-function activeLease() {
+function activeLease(options = {}) {
+  const lease = leaseFor(options);
   if (!lease.ownerId) return null;
   return {
     owner_id: lease.ownerId,
@@ -5060,8 +5053,8 @@ function activeLease() {
   };
 }
 
-function currentMouseMode() {
-  const active = activeLease();
+function currentMouseMode(options = {}) {
+  const active = activeLease(options);
   return active ? active.mouse_mode : 'real';
 }
 
@@ -5069,7 +5062,7 @@ function takeoverStart(options) {
   const action = 'takeover_start';
   const ownerId = String(options.ownerId || 'direct');
   const requested = options.mouseMode === 'virtual' ? 'virtual' : 'real';
-  const existing = activeLease();
+  const existing = activeLease({...options,mouseMode:requested});
   if (existing && existing.owner_id !== ownerId) {
     return failure(action, 'takeover_lease_occupied', `The takeover lease is held by ${existing.owner_id}; it was not stolen.`, {
       takeover: false,
@@ -5117,7 +5110,9 @@ function takeoverStart(options) {
 
 /** The arm itself, which is asynchronous because a resident agent is a real process. */
 async function takeoverStartArmed(action, ownerId, requested, desktopRequest, options) {
+  const lease = leases[requested];
   let armed = null;
+  if(IS_WINDOWS && !lease.lock?.alive())return failure(action,'takeover_lock_lost','The global takeover guard was lost before arming.',{takeover:false,fallback_to_real_delivery:false});
   if (desktopRequest === 'hidden') {
     armed = await armHiddenDesktop(options, ownerId);
     if (armed.ok !== true) {
@@ -5133,14 +5128,18 @@ async function takeoverStartArmed(action, ownerId, requested, desktopRequest, op
       });
     }
   }
+  if(IS_WINDOWS && !lease.lock?.alive()) {
+    if(armed?.route)await closeHiddenDesktop(armed.route,options);
+    return failure(action,'takeover_lock_lost','The global takeover guard was lost during arming.',{takeover:false,fallback_to_real_delivery:false});
+  }
   lease.ownerId = ownerId;
   lease.mouseMode = requested;
   lease.acquiredAt = Date.now();
   // There is no timer to arm: the lease has no time limit and only `takeover_stop`
   // (or the owning process dying) releases it.
   // The takeover is only real once the screen itself carries the effect.
-  startTakeoverOverlay(ownerId, options);
-  const overlaySnapshot = overlayState();
+  startTakeoverOverlay(ownerId, {...options,mouseMode:requested});
+  const overlaySnapshot = overlayState({mouseMode:requested});
   return {
     ok: true,
     action,
@@ -5189,13 +5188,26 @@ async function takeoverStartArmed(action, ownerId, requested, desktopRequest, op
 async function takeoverStartAction(options) {
   const prepared = takeoverStart(options);
   if (prepared.ok === false) return prepared;
-  return await takeoverStartArmed(prepared.action, prepared.ownerId, prepared.requested, prepared.desktopRequest, options);
+  const lease = leases[prepared.requested];
+  const acquired = !lease.lock;
+  if(acquired && IS_WINDOWS) {
+    const lock = await acquireTakeoverLock(prepared.requested,{onLost:()=>stopAll()});
+    if(!lock.ok)return failure('takeover_start',lock.error_code,'Another DSH host holds this desktop mode; it was not stolen.',{requested_mouse_mode:prepared.requested,takeover:false,scope:'windows-user',fallback_to_real_delivery:false});
+    lease.lock=lock;
+  }
+  try {
+    const result = await takeoverStartArmed(prepared.action, prepared.ownerId, prepared.requested, prepared.desktopRequest, options);
+    if(result.ok!==true && acquired){const lock=lease.lock;lock?.release();lease.lock=null;await lock?.closed;}
+    return result;
+  } catch(error){if(acquired){const lock=lease.lock;lock?.release();lease.lock=null;await lock?.closed;}throw error;}
 }
 
 async function takeoverStop(options) {
   const action = 'takeover_stop';
   const ownerId = String(options.ownerId || 'direct');
-  const existing = activeLease();
+  const lease = !options.mouseMode && !Object.values(leases).some(item=>item.ownerId===ownerId)
+    ? Object.values(leases).find(item=>item.ownerId) || leaseFor(options) : leaseFor(options);
+  const existing = activeLease({mouseMode:lease.mouseMode});
   if (existing && existing.owner_id !== ownerId) {
     return failure(action, 'takeover_lease_owned_by_another_owner', `The takeover lease belongs to ${existing.owner_id}; ${ownerId} cannot release it.`, {
       takeover: false,
@@ -5204,16 +5216,19 @@ async function takeoverStop(options) {
     });
   }
   const previousOwner = existing ? existing.owner_id : null;
+  if(lease.mouseMode==='virtual')await restoreVirtualTransfers(ownerId);
   // Release the viewer's capture handles before auditing hidden-desktop teardown.
-  indicatorGeneration++;
-  await stopDesktopPet('takeover_stop');
+  indicatorGenerations[lease.mouseMode]++;
+  if(lease.mouseMode === 'virtual') await stopDesktopPet('takeover_stop');
   /* The hidden desktop is ended BEFORE the lease is released: the teardown needs the route the
    * lease is holding, and the lease must not be reported as free while an agent still holds a
    * desktop open. */
-  const route = hiddenRouteFor(ownerId);
+  const route = lease.mouseMode === 'virtual' ? hiddenRouteFor(ownerId) : null;
   const hidden = route ? await closeHiddenDesktop(route, options) : null;
   clearVirtualCursor(ownerId);
-  releaseLease('takeover_stop');
+  const lock = lease.lock;
+  releaseLease('takeover_stop',lease.mouseMode);
+  await lock?.closed;
   return {
     ok: true,
     action,
@@ -5221,7 +5236,7 @@ async function takeoverStop(options) {
     mouse_mode: 'real',
     released_owner: previousOwner,
     lease: { held: false, owner_id: null, mouse_mode: 'real', expiry: LEASE_EXPIRY, ttl_ms: null, expires_at: null, expires_in_ms: null, released_by: LEASE_RELEASE_ACTION },
-    overlay: overlayState(),
+    overlay: overlayState({mouseMode:lease.mouseMode}),
     /* What the teardown MEASURED, or null when this lease never armed a hidden desktop. A
      * desktop that survived is reported as surviving, with the pids that kept it alive. */
     hidden_desktop: hidden,
@@ -5233,7 +5248,7 @@ async function takeoverStop(options) {
 /** The effective mode of one action. Only takeover_start can change the session mode. */
 function effectiveMouseMode(options) {
   const requested = options.mouseMode === 'virtual' ? 'virtual' : (options.mouseMode === 'real' ? 'real' : undefined);
-  const active = activeLease();
+  const active = activeLease(options);
   if (active) {
     return {
       mode: active.mouse_mode,
@@ -5250,11 +5265,50 @@ function effectiveMouseMode(options) {
 
 export async function runComputerUse(options = {}) {
   const action = String((options && options.action) || 'observe').toLowerCase();
+  const transferring=['process_push','process_pull'].includes(action);
+  if(transferring)options={...options,mouseMode:'virtual'};
+  let transient = null;
+  let crossing = null;
+  let crossingReserved = false;
+  let operationMode = null;
   try {
+    const readonly = ['mode_report','wait','observe','app_observe','app_list','capture_screen','wait_for'];
+    const protectedAction = !readonly.includes(action);
+    if(protectedAction) {
+      if(!transferring&&(options.windowHandle||options.window_handle)){
+        const mapping=findDesktopTransfer({windowHandle:options.windowHandle||options.window_handle});
+        if(mapping&&handleToInt(options.windowHandle||options.window_handle)===handleToInt(mapping.config.sourceHandle))return stringifyResult(failure(action,'window_is_mapped','Use the presentation handle to avoid controlling the same application through two desktop modes.',{transfer:transferReport(mapping)}));
+        if(mapping&&leaseFor(options).mouseMode!==mapping.status.side)return stringifyResult(failure(action,'presentation_mode_mismatch','Select the mode that owns the presentation side.',{transfer:transferReport(mapping)}));
+      }
+      const ownerId = String(options.ownerId || 'direct');
+      const own = Object.values(leases).filter(item=>item.ownerId===ownerId);
+      if(own.length>1 && !['real','virtual'].includes(options.mouseMode))return stringifyResult(failure(action,'takeover_mode_required','This owner holds both modes; specify mouse_mode explicitly.'));
+      const mode = action==='takeover_start' ? (options.mouseMode==='virtual'?'virtual':'real') : leaseFor(options).mouseMode;
+      const held = leases[mode];
+      if(action!=='takeover_stop' && held.ownerId && held.ownerId!==ownerId)return stringifyResult(failure(action,'takeover_lease_occupied','Another session owns this mode; its delivery route cannot be inherited.',{lock_owner:held.ownerId,requested_owner:ownerId,mouse_mode:mode,expires_in_ms:null,fallback_to_real_delivery:false}));
+      if(modeOperations.has(mode))return stringifyResult(failure(action,'takeover_mode_busy','An operation is already in flight for this mode.',{mouse_mode:mode,fallback_to_real_delivery:false}));
+      operationMode=mode;modeOperations.set(mode,ownerId);
+      if(transferring){
+        if(!held.ownerId||!hiddenRouteFor(ownerId))return stringifyResult(failure(action,'hidden_takeover_required','Start a virtual hidden-desktop takeover before transferring a window.'));
+        if(modeOperations.has('real')||(leases.real.ownerId&&leases.real.ownerId!==ownerId))return stringifyResult(failure(action,'takeover_lease_occupied','The real desktop is busy with another takeover.'));
+        modeOperations.set('real',ownerId);crossingReserved=true;
+        if(!leases.real.lock){crossing=await acquireTakeoverLock('real',{onLost:()=>stopAll()});if(!crossing.ok)return stringifyResult(failure(action,'takeover_lease_occupied','Another DSH host owns the real desktop.'));}
+      }
+      if(IS_WINDOWS && !held.lock && action!=='takeover_start' && action!=='takeover_stop') {
+        transient=await acquireTakeoverLock(mode,{onLost:()=>stopAll()});
+        if(!transient.ok)return stringifyResult(failure(action,'takeover_lease_occupied','Another DSH host owns this mode.',{mouse_mode:mode,scope:'windows-user',fallback_to_real_delivery:false}));
+      }
+    }
     const result = await dispatchComputerUse(action, options || {});
     return stringifyResult(result);
   } catch (error) {
     return stringifyResult(failure(action, 'internal_error', error instanceof Error ? error.message : String(error)));
+  } finally {
+    crossing?.release?.();await crossing?.closed;
+    if(crossingReserved)modeOperations.delete('real');
+    transient?.release?.();
+    await transient?.closed;
+    if(operationMode)modeOperations.delete(operationMode);
   }
 }
 
@@ -5279,11 +5333,12 @@ async function dispatchComputerUse(action, options) {
   if (action === 'takeover_start') return await takeoverStartAction(options);
   if (action === 'takeover_stop') return await takeoverStop(options);
   if (action === 'mode_report') return modeReport(action, options);
+  if (['process_push','process_pull'].includes(action)) return processTransferAction(action,options);
   if (action === 'wait') {
     const durationMs = clampNumber(options.durationMs ?? options.duration_ms, 0, 60000, 1000);
     const startedAt = Date.now();
     await sleep(durationMs);
-    return { ok: true, action, duration_ms: Date.now() - startedAt, mouse_mode: currentMouseMode(), physical_delivery_used: false };
+    return { ok: true, action, duration_ms: Date.now() - startedAt, mouse_mode: currentMouseMode(options), physical_delivery_used: false };
   }
 
   if (!IS_WINDOWS) return unsupportedPlatform(action);
@@ -5874,14 +5929,52 @@ async function sequenceAction(action, options, mode, header) {
   return { ...header, ...result };
 }
 
+async function processTransferAction(action,options){
+  const ownerId=String(options.ownerId||'direct'),route=hiddenRouteFor(ownerId),push=action==='process_push',side=push?'real':'virtual';
+  if(!route)return failure(action,'hidden_takeover_required','A hidden virtual takeover is required.');
+  const existing=findDesktopTransfer(options);
+  if(existing&&existing.status.side===side)return failure(action,'already_on_target_desktop','The selected presentation is already on the requested side.',{transfer:transferReport(existing)});
+  if(existing&&existing.status.side==='virtual'&&existing.config.ownerId!==ownerId)return failure(action,'transfer_owned_by_another_session','The virtual presentation belongs to another session.');
+  if(!existing&&!options.windowHandle&&!options.processId&&!options.appTarget)return failure(action,'transfer_target_required','Specify window_handle, process_id, app_target or an existing transfer_id.');
+  if(options.transferId&&!existing)return failure(action,'transfer_not_found','No live presentation matches transfer_id.');
+  let config;
+  if(existing){
+    config={...existing.config,ownerId,side,targetDesktop:push?'Default':route.desktopName,jobSourcePid:existing.status.job_handle!=='0x0'?existing.status.pid:0,jobSourceStart:existing.status.start,jobHandle:existing.status.job_handle};
+  }else{
+    const listed=push?await hiddenEnumerate(route,options):await enumerateApplications({...options,virtualScope:true,includeMinimized:true});
+    if(!listed.ok)return failure(action,listed.error_code||'enumeration_failed',listed.error);
+    const candidates=listed.applications.filter(app=>options.windowHandle?app.handle.toLowerCase()===('0x'+handleHex(options.windowHandle)).toLowerCase():options.processId?app.process_id===Number(options.processId):app.title.toLowerCase().includes(String(options.appTarget).toLowerCase()));
+    if(candidates.length!==1)return failure(action,'transfer_requires_one_window','Select one unambiguous top-level window; multi-window processes require an explicit window_handle.',{windows:candidates});
+    const app=candidates[0];if(!app.visible||app.minimized)return failure(action,'transfer_window_not_visible','Restore the source window before transferring it.');
+    if(app.process_id===process.pid||/NewMate/.test(app.title))return failure(action,'transfer_protected_window','The transfer controller and NewMate cannot be transferred.');
+    const job=push?await hiddenAgentAnswer(route,'state',{},options):null;
+    if(push&&(!job.ok||!job.value.hosted.some(entry=>Number(entry.pid)===app.process_id)))return failure(action,'transfer_unowned_process','Only an application held by this hidden desktop job can be exported.');
+    config={sourceDesktop:push?route.desktopName:'Default',targetDesktop:push?'Default':route.desktopName,sourceHandle:app.handle,sourcePid:app.process_id,side,ownerId,title:app.title,...app.rect,jobSourcePid:push?route.agentPid:0,jobHandle:push?job.value.job_handle:'0x0'};
+    const facts=await inspectTransferSource(config);if(facts.pid!==config.sourcePid)throw Error('Source process changed during transfer');Object.assign(config,{sourceStart:facts.start,jobSourceStart:facts.job_start,sourceX:facts.x,sourceY:facts.y,sourceStyle:facts.style,x:facts.x,y:facts.y,width:facts.width,height:facts.height});
+  }
+  if(options.dryRun)return {ok:true,action,dry_run:true,original_process_restarted:false,native_window_migrated:false,interactive_mapping:true,target_desktop:config.targetDesktop};
+  const anchor=await prepareDesktopPetTransfer(push?'out':'in');
+  if(existing&&config.targetDesktop===config.sourceDesktop){
+    const returned=await returnDesktopTransfer(existing,{anchor});return {ok:true,action,...returned};
+  }
+  if(existing)await transferCommand(existing,'park');
+  let started;try{started=await startDesktopTransfer(config,{anchor});}catch(error){if(existing)await transferCommand(existing,'show');throw error;}
+  if(existing)await transferCommand(existing,'handoff');
+  return {ok:true,action,...transferReport(started.record),animation:started.animation,scope:'selected-top-level-window',system_cursor_moved:false};
+}
+
 function modeReport(action, options) {
-  const active = activeLease();
+  const lease = leaseFor(options);
+  const active = activeLease(options);
   return {
     ok: true,
     action,
     platform: process.platform,
     supported: IS_WINDOWS,
-    mouse_mode: currentMouseMode(),
+    mouse_mode: currentMouseMode(options),
+    takeover_slots: Object.fromEntries(['real','virtual'].map(mouseMode=>[mouseMode,activeLease({mouseMode})])),
+    takeover_scope: 'windows-user-across-dsh-hosts',
+    desktop_transfers: desktopTransfers().map(transferReport),
     requested_mouse_mode: options.mouseMode,
     mouse_mode_mutable_by_action: false,
     mode_inventory: MODE_INVENTORY,
@@ -5935,7 +6028,7 @@ function modeReport(action, options) {
     lease_release_restores_mouse_mode: 'real',
     // The takeover effect is a native window covering the whole screen, not the DSH
     // page's CSS ring: `running` is what is on screen, `reason` is why it is not.
-    overlay: overlayState(),
+    overlay: overlayState(options),
     overlay_contract: lease.mouseMode === 'virtual' ? desktopPetContract() : overlayContractReport(),
     overlay_last_error: lease.lastOverlayError || undefined,
     lanes: laneDiagnostics(),
