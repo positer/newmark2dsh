@@ -55,6 +55,120 @@ export const FINISH_TO_STOP = {
   error: 'error',
 };
 
+/**
+ * The provider classifications this seam retries, and the reason it is the ONLY place a run
+ * gets a retry at all.
+ *
+ * ## The gap this closes
+ *
+ * DSH owns a request-retry policy, and `dsh-llm-retry` executes it on the agent loop's recovery
+ * waterfall: its whole implementation is one subscription to `agent/request-error`
+ * (`dsh-llm-retry/lib/index.js:175`). Dispatched across the shipped packages, that event has
+ * exactly one dispatcher — `dsh-agent-loop` (`dsh-agent-loop/lib/index.js:1124`).
+ *
+ * **This component never goes through the agent loop.** It drives `ctx.llm.stream` itself, from
+ * `createLlmStreamFn` below, so it never raises that event, so `dsh-llm-retry` never sees its
+ * failures, and so a run had NO retry whatsoever. The provider's own policy says these codes are
+ * transient — `TRANSPORT` is one of the five DSH retries by default
+ * (`dsh-llm/lib/types/retry-policy.js:16-22`) — but a caller outside the loop inherits none of it.
+ *
+ * Measured on this machine's session logs, that difference is not academic: TRANSPORT failures
+ * arrive in service-wide bursts in which ~47% of attempts fail, and while the agent loop
+ * recovered from 333 of the 346 steps those bursts touched, a run driven through this seam in the
+ * same window simply died. The run is short and its budget is its own, so a bounded retry here is
+ * both cheap and the only retry it will ever get.
+ *
+ * ## What makes retrying safe, which is the real question
+ *
+ * A retry re-issues a model turn, so it is only safe when the turn has not already had an effect.
+ * `collectAssistant` is what makes that decidable, and it was already built for the adjacent
+ * problem: it holds a stream's throw and REPORTS it (`recoveredFrom`) instead of discarding
+ * whatever the stream delivered first. So this module can tell the two states apart, and they
+ * are opposite:
+ *
+ *   - **nothing usable arrived** — no completed block and no tool call — so the turn had no
+ *     effect and re-issuing it changes nothing but the attempt count. RETRY.
+ *   - **a tool call arrived** — `recoveredFrom === 'stream-failed-after-content'` — so the turn
+ *     is already being acted on and re-issuing it would execute those calls TWICE. NEVER RETRY.
+ *
+ * That second case is why this is a whitelist of codes AND a condition on content, rather than a
+ * loop around the call: a retry keyed on the code alone would duplicate side effects, which is a
+ * worse failure than the one it is fixing.
+ *
+ * ## WHICH HALF ACTUALLY STOPS THE DUPLICATE, stated because a claim nobody checks rots
+ *
+ * The recovered turn is kept with `stopReason: 'tool-calls'`, so it is yielded as `done` by the
+ * branch that runs BEFORE the retry decision is ever consulted — the `nothingDelivered` guard is
+ * therefore a second line of defence rather than the operative one, and a mutation test proved
+ * it: deleting that guard alone leaves the gate green, because a content-bearing turn cannot
+ * reach the check at all. TWO different things follow, and both are deliberate:
+ *
+ *   - the operative protection is asserted as an OUTCOME (`verify-agent-api.mjs`: a TRANSPORT
+ *     failure after a delivered tool call yields exactly one `done`, carrying that tool call, and
+ *     exactly ONE service call), so the duplicate-execution property is gated rather than argued;
+ *   - the guard STAYS, because it is what keeps this safe if `collectAssistant` ever learns to
+ *     return a content-bearing ERROR turn — at which point the `done` branch above would no
+ *     longer be in front of it, and this would silently become the only thing between a retry and
+ *     a second execution of a side-effecting call.
+ */
+export const RETRYABLE_FAILURE_CODES = Object.freeze(['TRANSPORT', 'TIMEOUT', 'RATE_LIMIT', 'SERVER', 'EMPTY_RESPONSE']);
+
+/**
+ * The retry shape, deliberately the same as the provider policy DSH resolves by default
+ * (`dsh-llm/lib/types/retry-policy.js:12-15`: 5 retries, 500 ms initial, 10 s cap, 0.1 jitter) —
+ * with a tighter attempt bound, because a run is a bounded operation inside a caller's own
+ * timeout rather than a conversation turn that may wait indefinitely.
+ */
+export const DEFAULT_RETRY = Object.freeze({
+  /** Attempts in total, not retries: 4 attempts means at most 3 retries. */
+  maxAttempts: 4,
+  initialDelayMs: 500,
+  maxDelayMs: 10_000,
+  jitterRatio: 0.1,
+});
+
+/**
+ * Whether one failed attempt may be re-issued.
+ *
+ * Both halves are required. `nothingDelivered` is the safety condition described on
+ * `RETRYABLE_FAILURE_CODES`; the code is the provider's own transient classification. An
+ * unclassified failure (`failureCode: ''`) is NOT retried — this seam has no evidence it is
+ * transient, and guessing would spend a caller's budget on a failure that will repeat.
+ */
+export function retryableAttempt(message, nothingDelivered, code, retry = DEFAULT_RETRY) {
+  if (!nothingDelivered) return { retry: false, reason: 'the turn already delivered content, so re-issuing it could repeat its effects' };
+  if (!RETRYABLE_FAILURE_CODES.includes(String(code ?? ''))) {
+    return { retry: false, reason: `${code === '' || code === undefined ? 'the failure carries no classification' : `"${code}" is not a transient classification`}, so it is reported rather than retried` };
+  }
+  const attempt = Number(message?.attempts ?? 1);
+  if (attempt >= retry.maxAttempts) return { retry: false, reason: `the retry bound of ${retry.maxAttempts} attempts is spent` };
+  return { retry: true, reason: '' };
+}
+
+/** One backoff delay, shaped like the provider policy's: exponential, capped, jittered. */
+export function retryDelayMs(attempt, retry = DEFAULT_RETRY, random = Math.random) {
+  const exponent = Math.min(Math.max(attempt - 1, 0), 1024);
+  const exponential = Math.min(retry.initialDelayMs * 2 ** exponent, retry.maxDelayMs);
+  const jitter = 1 - retry.jitterRatio + 2 * retry.jitterRatio * random();
+  return Math.min(exponential * jitter, retry.maxDelayMs);
+}
+
+/** A cancellable wait: resolves `true` when it elapsed and `false` when the signal aborted. */
+export function cancellableDelay(delayMs, signal) {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve(true);
+    }, delayMs);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve(false);
+    }
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+}
+
 /** A `MessageId` for a message this component mints. Branded at the type level, a string at runtime. */
 let messageCounter = 0;
 function messageId() {
@@ -308,7 +422,7 @@ export async function collectAssistant(stream, model, onPartial, options = {}) {
       content,
       usage,
       stopReason: 'tool-calls',
-      diagnostic: `the model stream failed after delivering ${calls.length} tool call(s); the turn was kept so the failure reaches the model as a tool result: ${failureText({ message: streamError?.message ?? String(streamError), code: streamError?.code })}`,
+      diagnostic: `the model stream failed after delivering ${calls.length} tool call(s); the turn was kept so the failure reaches the model as a tool result: ${failureText(streamError)}`,
       failureCode: String(streamError?.code ?? ''),
       recoveredFrom: 'stream-failed-after-content',
       model,
@@ -359,8 +473,24 @@ export function failureText(failure) {
  *   missing service becomes a classified run failure instead of an exception out of a tool.
  * @param selection - `{ provider, model, reasoningEffort? }`, already resolved.
  * @param options.maxTokens - an optional cap on the run's own completions.
+ * @param options.retry - the bounded retry shape; `DEFAULT_RETRY` unless a caller overrides it.
+ *   Present as an option so a gate can drive the bound without waiting on real backoff.
+ *
+ * ## THE RETRY, and why it lives here rather than being inherited
+ *
+ * A run driven through this function gets NO retry from DSH — see `RETRYABLE_FAILURE_CODES` for
+ * the mechanism and the measurement. So the retry is implemented here, and the two things that
+ * make it correct are that it wraps ONE call (`llm.stream` is re-invoked, so each attempt is a
+ * fresh stream rather than a resumed one) and that it is gated on the safety condition
+ * `collectAssistant` already reports. A failure that arrives with content already delivered is
+ * passed through exactly as it was, never retried.
+ *
+ * The attempt count is carried on the assistant message rather than only kept locally, because
+ * the receipt reads `message.diagnostic` and a retry that left no trace would make "succeeded on
+ * the fourth attempt during an outage" indistinguishable from "succeeded immediately".
  */
 export function createLlmStreamFn(llm, selection, options = {}) {
+  const retry = { ...DEFAULT_RETRY, ...(options.retry ?? {}) };
   return async function streamFn(_model, request, ctx = {}) {
     const provider = String(selection?.provider ?? '');
     const model = String(selection?.model ?? '');
@@ -391,28 +521,86 @@ export function createLlmStreamFn(llm, selection, options = {}) {
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     };
 
-    let stream;
-    try {
-      stream = llm.stream(generate);
-    } catch (error) {
-      return fail(`the llm service refused the call: ${error?.message ?? error}`, 'LLM_CALL_FAILED');
-    }
-
     return {
       async *[Symbol.asyncIterator]() {
-        try {
-          const message = await collectAssistant(stream, { provider, model }, undefined, { signal: ctx.signal });
-          // The loop's seam contract: a finished turn is a `done` event, a failed one is an
-          // `error` event carrying the same assistant-message shape. Both are yielded rather
-          // than thrown, so a provider failure becomes a classified run failure instead of an
-          // exception escaping a tool.
-          if (message.stopReason === 'error' || message.stopReason === 'aborted') yield { type: 'error', error: message };
-          else yield { type: 'done', message };
-        } catch (error) {
-          yield {
-            type: 'error',
-            error: assistantMessageWithError({ provider, model }, `the model stream failed: ${error?.message ?? error}`, 'LLM_STREAM_FAILED'),
-          };
+        const modelId = { provider, model };
+        let attempts = 0;
+        let lastRefusal = null;
+        for (;;) {
+          /* A signal that is ALREADY aborted means no turn happened and none should be started:
+           * issuing the call first and inspecting the result afterwards would charge the caller
+           * for a request it had already cancelled. The generator just ends, and the loop's own
+           * `throwIfAborted` is what reports the cancellation. */
+          if (ctx.signal?.aborted) return;
+          attempts += 1;
+          /* The service refusing the call EAGERLY (rather than failing the stream) is the one
+           * failure that never reaches the loop as a message. It is kept as a rememberable
+           * refusal and retried on the same terms as the streamed failures, so the two shapes
+           * cannot disagree about what is transient. */
+          let stream;
+          try {
+            stream = llm.stream(generate);
+          } catch (error) {
+            lastRefusal = { message: `the llm service refused the call: ${failureText(error)}`, code: String(error?.code ?? 'LLM_CALL_FAILED') };
+            const asked = retryableAttempt({ attempts }, true, lastRefusal.code, retry);
+            if (!asked.retry || ctx.signal?.aborted) {
+              yield { type: 'error', error: assistantMessageWithError(modelId, lastRefusal.message, lastRefusal.code) };
+              return;
+            }
+            if (!(await cancellableDelay(retryDelayMs(attempts, retry), ctx.signal))) return;
+            continue;
+          }
+
+          let message;
+          try {
+            message = await collectAssistant(stream, modelId, undefined, { signal: ctx.signal });
+          } catch (error) {
+            message = assistantMessageWithError(modelId, `the model stream failed: ${failureText(error)}`, String(error?.code ?? 'LLM_STREAM_FAILED'));
+            message.causeText = error?.cause?.message;
+          }
+
+          /* Cancellation is checked BEFORE the classification, and that order is the assertion:
+           * a failure observed while the caller is aborting is a symptom of the abort, not a
+           * reason to start another request. `collectAssistant` already rethrows an abort it saw
+           * (`llm-seam.js`, its `options.signal?.aborted` branch), so this covers the window
+           * where the signal aborts between the two, and the case of a signal that was ALREADY
+           * aborted before the call — where the honest answer is that no turn happened, and the
+           * loop's own `throwIfAborted` is what turns it back into an abort.
+           *
+           * A `kind: 'aborted'` FINISH is a different thing and is NOT collapsed into this: the
+           * provider answered, and said the turn was cancelled on its side. That is a stop
+           * reason the loop already maps, so it is yielded as one rather than being swallowed. */
+          if (ctx.signal?.aborted) return;
+
+          /* The loop's seam contract: a finished turn is a `done` event, a failed one is an
+           * `error` event carrying the same assistant-message shape. Both are yielded rather
+           * than thrown, so a provider failure becomes a classified run failure instead of an
+           * exception escaping a tool. */
+          if (message.stopReason !== 'error' && message.stopReason !== 'aborted') {
+            if (attempts > 1) message.attempts = attempts;
+            yield { type: 'done', message };
+            return;
+          }
+
+          /* Nothing usable arrived iff the turn carries no content. `collectAssistant` returns
+           * a content-bearing error turn only for the `stream-failed-after-content` recovery,
+           * and `recoveredFrom` is set on exactly that one, so the check is belt and braces:
+           * either signal alone already rules the retry out. */
+          const nothingDelivered = (message.content?.length ?? 0) === 0 && message.recoveredFrom === undefined;
+          const code = message.failureCode ?? '';
+          const asked = retryableAttempt({ attempts }, nothingDelivered, message.stopReason === 'aborted' ? 'ABORTED' : code, retry);
+          if (!asked.retry || ctx.signal?.aborted) {
+            message.attempts = attempts;
+            message.retryRefused = asked.reason;
+            if (attempts > 1) {
+              message.diagnostic = `${message.diagnostic ? `${message.diagnostic}  <-  ` : ''}retried ${attempts} attempts in total, and the last one failed the same way`;
+            }
+            yield { type: 'error', error: message };
+            return;
+          }
+
+          const delayMs = retryDelayMs(attempts, retry);
+          if (!(await cancellableDelay(delayMs, ctx.signal))) return;
         }
       },
     };

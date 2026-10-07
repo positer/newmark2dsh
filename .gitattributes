@@ -1,0 +1,9 @@
+# The release tarball is built on Linux by the publish workflow, so the files it reads must be
+# byte-stable across checkouts. Without this, a Windows checkout rewrites the workflow and the
+# shell scripts to CRLF, and the blob that ships differs from the one that was rehearsed.
+* text=auto eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf

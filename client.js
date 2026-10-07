@@ -162,7 +162,7 @@ function readPageGlobals() {
     root: (memory && memory.root) || (core && core.root) || '',
     platform: (core && core.platform) || '',
     generatedAt: (memory && memory.generatedAt) || (core && core.generatedAt) || '',
-    components: { memoryLab: Boolean(memory), computerUse: Boolean(automation) },
+    components: { memoryLab: Boolean(memory), computerUse: Boolean(automation), agentApi: Boolean(api) },
     computerUse: automation || FREE_LEASE,
     agentApi: api || null,
   };
@@ -2224,6 +2224,7 @@ function readPageGlobals() {
           const [pending, setPending] = React.useState('');
           const [applied, setApplied] = React.useState({});
           const [loaded, setLoaded] = React.useState(false);
+          const [hostCompose, setHostCompose] = React.useState(null);
 
           // The authorised model, read from the same route and shown in its own block below
           // the component rows. It is deliberately NOT a row in `rows`: a row is a switch, and
@@ -2253,6 +2254,7 @@ function readPageGlobals() {
               )
               .then((result) => {
                 if (!result || !Array.isArray(result.components)) return false;
+                if (typeof result.compose === 'boolean') setHostCompose(result.compose);
                 const next = {};
                 // Carry `detail` through too: it is the Host's own description of what it
                 // read, and dropping it left the panel able to show only a boolean, which
@@ -2384,7 +2386,7 @@ function readPageGlobals() {
               key: 'core',
               name: 'Newmark Core',
               role: 'shared user store, page snapshot',
-              on: Boolean(payload),
+              on: hostCompose === null ? Boolean(payload) : hostCompose,
               note: payload && payload.root ? payload.root : 'no snapshot on this page',
               switchable: false,
             },
@@ -2432,6 +2434,12 @@ function readPageGlobals() {
                 const answered = answer && answer.ok === true && typeof answer.mounted === 'boolean';
                 const on = answered ? answer.mounted : row.on;
                 const failed = answer && answer.ok === false;
+                // The mount receipt and the note must describe the same state, including
+                // after a hot enable when the original page had no Agent API injection.
+                const note = row.key === 'agentApi' ? (on ? 'interface mounted' : 'not loaded')
+                  : row.key === 'memoryLab' ? (on ? 'store mounted' : 'not loaded')
+                  : row.key === 'computerUse' ? (on ? (lease ? (lease.held ? 'lease held by ' + (lease.ownerId || 'unknown') : 'loaded, lease free') : 'loaded, lease state unavailable') : 'not loaded')
+                  : row.note;
                 return h(
                   'li',
                   { key: row.key, className: 'nmc-config-row' },
@@ -2485,7 +2493,7 @@ function readPageGlobals() {
                       : // On success the Host's own `detail` wins over the row's prose: it
                         // is what the file holds, named by line, and a state the panel
                         // cannot see is exactly the failure this row exists to show.
-                        (answered && answer.detail ? String(answer.detail) : row.note),
+                        (answered && answer.detail ? String(answer.detail) : note),
                   ),
                 );
               }),

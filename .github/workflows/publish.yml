@@ -67,8 +67,14 @@ jobs:
           set -eu
           fail=0
 
-          # 1. Both components ship, with their manifests, and are composed by the core row.
-          for component in memorylab computeruse; do
+          # 1. Every component ships, with its manifest, and is composed by the core row.
+          #
+          #    This list is the one place the workflow states a component roster, and it went
+          #    stale exactly the way a roster does: `agent-api` was added to the bundle and the
+          #    loop kept checking two, so a tarball that had lost the Agent API half entirely
+          #    would still have passed this step. A roster that silently under-covers is worse
+          #    than no roster, because it reads as a guarantee.
+          for component in memorylab computeruse agent-api; do
             manifest="components/$component/package.json"
             [ -f "$manifest" ] || { echo "::error::missing $manifest"; fail=1; continue; }
             node -e "
@@ -104,11 +110,17 @@ jobs:
             const rows = lines
               .filter((line) => line.startsWith('    - id: '))
               .map((line) => line.slice(10).trim());
-            if (rows.length !== 2 || rows[0] !== 'newmark-core' || rows[1] !== 'preset-dev') {
-              console.error('the patch must declare exactly the core row and the preset row, found: ' + rows.join(', '));
+            // THREE rows, and the third is the one that broke this guard: `preset-rdev` was
+            // added to the bundle, the check still demanded exactly two, so the release was
+            // blocked by the workflow rather than by the package. The roster is stated here in
+            // order, so adding a fourth row fails loudly and is brought up to date deliberately
+            // instead of slipping past a length that no longer means anything.
+            const expected = ['newmark-core', 'preset-dev', 'preset-rdev'];
+            if (rows.length !== expected.length || rows.some((row, i) => row !== expected[i])) {
+              console.error('the patch must declare exactly ' + expected.join(', ') + ', found: ' + rows.join(', '));
               process.exit(1);
             }
-            for (const name of ['newmark2dsh-memorylab', 'newmark2dsh-computeruse']) {
+            for (const name of ['newmark2dsh-memorylab', 'newmark2dsh-computeruse', 'newmark2dsh-agent-api']) {
               if (lines.some((line) => line.trim() === 'name: ' + JSON.stringify(name))) {
                 console.error('the patch declares a row for ' + name);
                 process.exit(1);
@@ -116,8 +128,11 @@ jobs:
             }
           " || fail=1
 
-          # 3. The files the bundle cannot work without.
-          for f in index.js client.js cordis.patch.yml components/memorylab/lib/memory-store.js components/computeruse/lib/win32.js components/computeruse/lib/overlay-win32.js; do
+          # 3. The files the bundle cannot work without — one per component, plus the three
+          #    the core row itself needs. `agent-api`'s entry is its seam, because a bundle that
+          #    ships the Agent API's tools but not the module that drives the model call installs
+          #    cleanly and then fails at the first run.
+          for f in index.js client.js cordis.patch.yml components/memorylab/lib/memory-store.js components/computeruse/lib/win32.js components/computeruse/lib/overlay-win32.js components/agent-api/lib/llm-seam.js; do
             [ -f "$f" ] || { echo "::error::missing $f"; fail=1; }
           done
 
