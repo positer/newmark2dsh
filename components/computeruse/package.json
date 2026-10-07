@@ -1,6 +1,6 @@
 {
   "name": "newmark2dsh-computeruse",
-  "version": "0.2.24",
+  "version": "0.2.26",
   "private": true,
   "type": "module",
   "description": "Newmark Core component: the Windows and Linux automation backends and the two ComputerUse tools.",
@@ -11,6 +11,8 @@
   "files": [
     "index.js",
     "component.js",
-    "lib/*.js"
+    "lib/*.js",
+    "lib/*.html",
+    "vendor/webview2/*"
   ]
 }

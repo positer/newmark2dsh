@@ -20,3 +20,6 @@ This repository holds the self-contained package published as `newmark2dsh`. Dev
 | `archive/` | Local operation records, excluded from Git and npm |
 
 0.2.24 adds the NewMate desktop indicator, motion and remembered size. All 45 runtime/package files are synchronized from the locally validated development package. Publication and installation receipts are retained in the development workspace's timestamped release archive.
+
+## 0.2.26
+Configuration cards group model and NewMate controls. ComputerUse desktop-pet.cs owns persistent DIB drawing, deadline frame pacing and a GPU WebView2 read-only viewer with warm reuse. desktop-menu.cs/html and desktop-menu-client/theme.js share live DSH Menu appearance. lib/newmate-settings.js owns versioned continuous preferences. vendor/webview2 includes pinned SDK binaries, provenance and license.

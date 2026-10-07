@@ -18,6 +18,7 @@ import { createComputerUse } from './component.js';
 import { schema } from './lib/schema.js';
 import { embedJson } from './lib/embed.js';
 import { resolveRoot } from './lib/root.js';
+import { installMenuThemeBridge } from './lib/desktop-menu-theme.js';
 
 /** The page global this row publishes. */
 export const SNAPSHOT_GLOBAL = '__NEWMARK_COMPUTERUSE__';
@@ -53,6 +54,7 @@ export function apply(ctx, config) {
   const leaseTtlMs = Number.isFinite(config?.leaseTtlMs) && config.leaseTtlMs > 0 ? Math.floor(config.leaseTtlMs) : 120000;
 
   const computeruse = createComputerUse({ root, logger: ctx.logger, leaseTtlMs });
+  const menuTheme = process.platform === 'win32' ? installMenuThemeBridge(ctx, root) : null;
 
   const definitions = computeruse.tools();
   for (const definition of definitions) {
@@ -68,7 +70,7 @@ export function apply(ctx, config) {
         } catch {
           payload = { held: false, ownerId: '', mouseMode: 'real', ttlMs: 0, remainingMs: 0 };
         }
-        const script = `<script>window.${SNAPSHOT_GLOBAL}=${embedJson(payload)};</script>`;
+        const script = `<script>window.${SNAPSHOT_GLOBAL}=${embedJson({...payload, menuTheme})};</script>`;
         const at = html.indexOf('</head>');
         return at === -1 ? script + html : html.slice(0, at) + script + html.slice(at);
       }),

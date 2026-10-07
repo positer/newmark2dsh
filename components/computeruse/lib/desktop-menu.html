@@ -1,0 +1,41 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-__NEWMATE_NONCE__'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+</head><body>
+<script nonce="__NEWMATE_NONCE__">
+(() => {
+  const snapshot=__NEWMATE_SNAPSHOT__;
+  const send=value=>window.chrome.webview.postMessage(value);
+  for(const [name,value] of Object.entries(snapshot.htmlAttributes)) document.documentElement.setAttribute(name,value);
+  for(const [name,value] of Object.entries(snapshot.bodyAttributes)) document.body.setAttribute(name,value);
+  const theme=document.createElement('style');theme.textContent=snapshot.css;document.head.append(theme);
+  // Only window placement is native-specific; presentation stays in the DSH cascade.
+  const layout=document.createElement('style');layout.textContent=`
+    html:root,html:root body { margin:0!important;padding:0!important;width:100%!important;height:100%!important;min-width:0!important;min-height:0!important;overflow:hidden!important;background:transparent!important; }
+    html:root body { display:block!important; }
+    [data-newmate-menu] { position:relative!important;left:0!important;top:0!important;bottom:auto!important;right:auto!important;visibility:visible!important;transform:none!important;max-height:none!important;width:max-content; }
+  `;document.head.append(layout);
+  const template=document.createElement('template');template.innerHTML=snapshot.html;
+  const menu=template.content.querySelector('[data-newmate-menu]');document.body.append(menu);
+  const slider=menu.querySelector('[data-newmate-slider]'),output=menu.querySelector('[data-newmate-output]');
+  const show=value=>{slider.value=String(value*100);output.textContent=(Math.round(value*1000)/10)+'%';};
+  window.newmateSetScale=show;show(snapshot.currentScale);
+  let pending;
+  const commit=()=>{clearTimeout(pending);send({kind:'scale',value:Number(slider.value)/100});};
+  slider.addEventListener('input',()=>{output.textContent=slider.value+'%';clearTimeout(pending);pending=setTimeout(commit,50);});
+  slider.addEventListener('change',commit);
+  slider.addEventListener('pointerup',commit);
+  let last='';
+  const measure=()=>{
+    const rect=menu.getBoundingClientRect(),style=getComputedStyle(menu);
+    const result={kind:'ready',dpr:devicePixelRatio,width:Math.ceil(rect.width),height:Math.ceil(rect.height),radius:parseFloat(style.borderTopLeftRadius)||0};
+    const key=JSON.stringify(result);if(key!==last){last=key;send(result);}
+  };
+  document.addEventListener('keydown',event=>{
+    if(event.key==='Escape'){event.preventDefault();send({kind:'close'});return;}
+    if(event.key==='Tab'){event.preventDefault();slider.focus();}
+  });
+  document.addEventListener('contextmenu',event=>event.preventDefault());
+  new ResizeObserver(measure).observe(menu);document.fonts.ready.then(measure);requestAnimationFrame(measure);
+})();
+</script></body></html>

@@ -37,6 +37,25 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
+    const NEWMATE_SLIDER_CSS = `@layer newmate-controls {
+      .newmate-size-control { box-sizing:border-box; width:260px; max-width:100%; padding:12px; color:var(--dsw-alias-label-primary); font:inherit; }
+      .newmate-size-heading,.newmate-size-limits { display:flex; justify-content:space-between; gap:16px; }
+      .newmate-size-heading { margin-bottom:12px; font-size:13px; }
+      .newmate-size-limits { font-size:11px; opacity:.65; margin-top:6px; }
+      .newmate-size-control input { display:block; width:100%; margin:0; cursor:pointer; accent-color:var(--dsw-alias-label-primary); }
+      .newmate-size-control output { font-variant-numeric:tabular-nums; min-width:46px; text-align:right; }
+      .nmc-config-section { display:grid; gap:12px; padding:16px 0; }
+      .nmc-config-section + .nmc-config-section { border-top:1px solid var(--dsw-alias-border-secondary); }
+      .nmc-config-subhead { font-size:13px; margin:0; font-weight:500; }
+    }`;
+    function NewMateSizeControl({value=1,onChange,disabled=false,title='NewMate 大小'}) {
+      const percent=Math.round(value*1000)/10;
+      return h('div',{className:'newmate-size-control','data-newmate-size':''},
+        h('div',{className:'newmate-size-heading'},h('span',null,title),h('output',{'data-newmate-output':''},percent+'%')),
+        h('input',{type:'range',min:30,max:300,step:.1,value:percent,disabled,'aria-label':'NewMate 大小倍率','data-newmate-slider':'',onChange:event=>onChange?.(Number(event.target.value)/100)}),
+        h('div',{className:'newmate-size-limits'},h('span',null,'30%'),h('span',null,'300%')));
+    }
+
 
     /**
      * The harness's Markdown renderer, when the shell has it.
@@ -2071,6 +2090,24 @@ function readPageGlobals() {
       // remote service at all.
       inject: ['slots'],
       apply(ctx) {
+        ctx.effect(() => {
+          if(typeof document==='undefined' || typeof document.createElement!=='function' || window.__NEWMARK_CORE__?.platform!=='win32') return ()=>{};
+          let disposed=false, stop=()=>{}, activeToken='', polling=false;
+          const connect=async()=>{
+            if(disposed||polling) return;polling=true;
+            try {
+              const response=await fetch('/newmark-computeruse/menu-theme',{credentials:'same-origin'});
+              if(!response.ok){stop();stop=()=>{};activeToken='';return;}
+              const connection=await response.json();if(disposed||connection.token===activeToken)return;
+              const module=await import(connection.client);if(disposed)return;
+              stop();stop=module.startDshMenuThemeBridge({React,createRoot:require('react-dom/client').createRoot,
+                Menu:require('@deepseek-ai/dsh-client-ui-primitives').Menu,connection,renderSlider:NewMateSizeControl,sliderCss:NEWMATE_SLIDER_CSS});activeToken=connection.token;
+            } catch(error) { if(!disposed) console.warn('NewMate menu bridge:',error.message); }
+            finally {polling=false;}
+          };
+          const timer=setInterval(connect,5000);connect();
+          return ()=>{disposed=true;clearInterval(timer);stop();};
+        }, 'newmate-dsh-menu-theme');
         // The two component switches, read from the same injected snapshot the
         // panel reads. The injection lands in <head> before the plugin loader
         // boots, so it is already present here. If it is absent the component
@@ -2111,6 +2148,20 @@ function readPageGlobals() {
 
         /** Panel styles. Theme tokens only, so both colour schemes follow the shell. */
         const CONFIG_CSS = `
+    .nmc-config-settings { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr)); gap:16px; align-items:stretch; }
+    .nmc-config-card { min-width:0; display:flex; flex-direction:column; align-items:stretch; gap:12px; padding:20px; border:1px solid var(--dsw-alias-border-secondary); border-radius:16px; background:var(--dsw-alias-bg-elevated); }
+    .nmc-config-category { font-size:11px; color:var(--dsw-alias-label-tertiary); letter-spacing:.06em; }
+    .nmc-config-card .nmc-config-subhead { margin:0; font-size:16px; font-weight:600; line-height:1.5; color:var(--dsw-alias-label-primary); }
+    .nmc-config-description { margin:0; font-size:12px; line-height:1.7; color:var(--dsw-alias-label-secondary); }
+    .nmc-config-section-heading { display:grid; gap:6px; margin-bottom:4px; }
+    .nmc-config-section-heading .nmc-config-head { margin:0; font-size:16px; }
+    .nmc-config-card .nmc-config-model { padding:0; border:0; background:transparent; gap:12px; }
+    .nmc-config-card .nmc-config-model-pick { flex-direction:column; align-items:stretch; gap:6px; }
+    .nmc-config-card .nmc-config-select { width:100%; min-height:36px; flex:auto; border-radius:9px; }
+    .nmc-config-card .newmate-size-control { width:100%; padding:8px 0; margin-top:4px; }
+    .nmc-config-card .newmate-size-heading { margin-bottom:18px; }
+    .nmc-config-footnote { margin-top:auto; padding-top:12px; border-top:1px solid var(--dsw-alias-border-secondary); color:var(--dsw-alias-label-tertiary); font-size:11px; line-height:1.7; }
+    .nmc-config-card .nmc-config-model-note { line-height:1.7; overflow-wrap:anywhere; word-break:normal; }
     .nmc-config { display: flex; flex-direction: column; gap: 10px; }
     .nmc-config-head { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
     .nmc-config-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -2236,6 +2287,35 @@ function readPageGlobals() {
           const [modelState, setModelState] = React.useState(null);
           const [modelBusy, setModelBusy] = React.useState(false);
           const [modelError, setModelError] = React.useState('');
+          const [petScale,setPetScale]=React.useState(null),[petError,setPetError]=React.useState('');
+          const petWrite=React.useRef({pending:null,busy:false,revision:0,live:true});
+          React.useEffect(()=>{
+            const control=petWrite.current;control.live=true;
+            const read=async()=>{
+              const revision=control.revision;
+              if(control.busy||control.pending!==null)return;
+              try {
+                const response=await fetch('/newmark-core/components'+'?view=newMate'),body=await response.json();
+                if(control.live && revision===control.revision && body.newMate){setPetScale(body.newMate.sizeMultiplier);setPetError(body.newMate.ok?'':body.newMate.error);}
+              } catch(error){if(control.live)setPetError(error.message);}
+            };
+            read();const timer=setInterval(read,1000);
+            return()=>{control.live=false;clearInterval(timer);};
+          },[]);
+          const savePetScale=async value=>{
+            setPetScale(value);const control=petWrite.current;control.pending=value;control.revision++;
+            if(control.busy)return;control.busy=true;
+            try {
+              while(control.pending!==null){
+                const next=control.pending;control.pending=null;
+                const response=await fetch('/newmark-core/components',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({component:'newMate',sizeMultiplier:next})});
+                const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'大小保存失败');
+                if(control.live)setPetError('');
+              }
+            } catch(error){if(control.live)setPetError(error.message);control.pending=null;}
+            finally{control.busy=false;}
+          };
+
 
           // The mount read and the post-switch read ask the same question, so they are the
           // same function. After a switch the panel asks again rather than trusting the
@@ -2424,8 +2504,9 @@ function readPageGlobals() {
           return h(
             'section',
             { className: 'nmc-config' },
-            h('style', null, CONFIG_CSS),
-            h('div', { className: 'nmc-config-head' }, '组件'),
+            h('style', null, CONFIG_CSS+NEWMATE_SLIDER_CSS),
+            h('section',{className:'nmc-config-section','aria-label':'组件'},
+            h('h3', { className: 'nmc-config-head' }, '组件'),
             h(
               'ul',
               { className: 'nmc-config-list' },
@@ -2498,10 +2579,16 @@ function readPageGlobals() {
                 );
               }),
             ),
+            ),
+            h('section',{className:'nmc-config-section','aria-label':'配置'},
+            h('div',{className:'nmc-config-section-heading'},h('h3',{className:'nmc-config-head'},'配置'),h('p',{className:'nmc-config-description'},'设置智能体使用的模型与 NewMate 的桌面显示。')),
+            h('div',{className:'nmc-config-settings'},
+            h('section',{className:'nmc-config-card','aria-label':'准用模型'},
+            h('span',{className:'nmc-config-category'},'智能体'),
             h(
-              'div',
-              { className: 'nmc-config-head' },
-              '模型（准用）',
+              'h4',
+              { className: 'nmc-config-subhead' },
+              '准用模型',
             ),
             h(
               'div',
@@ -2641,6 +2728,16 @@ function readPageGlobals() {
                   )
                 : null,
               modelError ? h('div', { className: 'nmc-config-model-warn' }, modelError) : null,
+            ),
+            ),
+            h('section',{className:'nmc-config-card','aria-label':'NewMate'},
+            h('span',{className:'nmc-config-category'},'桌面助手'),
+            h('h4',{className:'nmc-config-subhead'},'NewMate'),
+            h('p',{className:'nmc-config-description'},'拖动滑杆调整显示大小，桌宠右键菜单会同步更新。'),
+            h(NewMateSizeControl,{value:petScale??1,onChange:savePetScale,disabled:petScale===null,title:'显示大小'}),
+            h('div',{className:petError?'nmc-config-model-warn':'nmc-config-footnote',role:petError?'alert':undefined},petError || '默认 100% · 自动保存，启动时恢复上次大小'),
+            ),
+            ),
             ),
           );
         }

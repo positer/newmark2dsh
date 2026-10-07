@@ -18,6 +18,10 @@ internal static class PetNative {
     [StructLayout(LayoutKind.Sequential)] internal struct Size { public int X, Y; public Size(int x, int y) { X=x; Y=y; } }
     [StructLayout(LayoutKind.Sequential)] internal struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential, Pack=1)] internal struct Blend { public byte Operation, Flags, Alpha, Format; }
+    [StructLayout(LayoutKind.Sequential)] internal struct BitmapInfo {public uint Size;public int Width,Height;public ushort Planes,Bits;public uint Compression,ImageSize;public int XPels,YPels;public uint Used,Important;}
+    [DllImport("gdi32.dll")] internal static extern IntPtr CreateDIBSection(IntPtr dc,ref BitmapInfo info,uint usage,out IntPtr bits,IntPtr section,uint offset);
+    [DllImport("winmm.dll")] internal static extern uint timeBeginPeriod(uint period);
+    [DllImport("winmm.dll")] internal static extern uint timeEndPeriod(uint period);
     internal delegate bool EnumWindow(IntPtr window, IntPtr data);
     [DllImport("user32.dll")] internal static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] internal static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
@@ -63,16 +67,47 @@ internal static class PetNative {
     internal static object Bounds(Rectangle r) { return new { x=r.X, y=r.Y, width=r.Width, height=r.Height }; }
 }
 
+// A single pending UI frame, paced by a monotonic deadline instead of WM_TIMER quantization.
+internal sealed class PetFrameClock : IDisposable {
+    private readonly Control owner;private readonly Action frame;private readonly Stopwatch clock=Stopwatch.StartNew();
+    private System.Threading.Timer timer;private int pending;private double deadline;private volatile bool stopped=true;private bool resolution;
+    internal PetFrameClock(Control owner,Action frame){this.owner=owner;this.frame=frame;}
+    internal void Start(){if(!stopped)return;stopped=false;deadline=clock.Elapsed.TotalMilliseconds;resolution=PetNative.timeBeginPeriod(1)==0;timer=new System.Threading.Timer(Pulse,null,0,4);}
+    private void Pulse(object state){if(stopped)return;double now=clock.Elapsed.TotalMilliseconds;if(now<deadline || Interlocked.CompareExchange(ref pending,1,0)!=0)return;
+        deadline=Math.Max(deadline+1000.0/60,now);
+        try{owner.BeginInvoke(new Action(delegate{try{if(!stopped&&!owner.IsDisposed)frame();}finally{Interlocked.Exchange(ref pending,0);}}));}
+        catch(InvalidOperationException){Interlocked.Exchange(ref pending,0);}
+    }
+    internal void Stop(){if(stopped)return;stopped=true;if(timer!=null){timer.Dispose();timer=null;}if(resolution){PetNative.timeEndPeriod(1);resolution=false;}}
+    public void Dispose(){Stop();}
+}
+// Reuse the memory DC, premultiplied DIB and Graphics until the canvas dimensions change.
+internal sealed class PetSurface : IDisposable {
+    internal readonly Bitmap Bitmap;internal readonly Graphics Graphics;internal readonly IntPtr DC;
+    private IntPtr dib,old;
+    internal PetSurface(int width,int height){
+        DC=PetNative.CreateCompatibleDC(IntPtr.Zero);var info=new PetNative.BitmapInfo{Size=40,Width=width,Height=-height,Planes=1,Bits=32};IntPtr bits;
+        dib=PetNative.CreateDIBSection(DC,ref info,0,out bits,IntPtr.Zero,0);
+        if(dib==IntPtr.Zero){PetNative.DeleteDC(DC);throw new InvalidOperationException("Cannot allocate NewMate surface");}
+        old=PetNative.SelectObject(DC,dib);Bitmap=new Bitmap(width,height,width*4,PixelFormat.Format32bppPArgb,bits);Graphics=Graphics.FromImage(Bitmap);
+        Graphics.InterpolationMode=InterpolationMode.HighQualityBilinear;Graphics.PixelOffsetMode=PixelOffsetMode.HighQuality;
+    }
+    public void Dispose(){Graphics.Dispose();Bitmap.Dispose();PetNative.SelectObject(DC,old);PetNative.DeleteObject(dib);PetNative.DeleteDC(DC);}
+}
+
 internal sealed class PetConfig {
     public int ownerPid { get; set; }
     public string desktop { get; set; }
     public string asset { get; set; }
     public string directory { get; set; }
     public string settingsPath { get; set; }
+    public string menuThemePath { get; set; }
+    public string menuShellPath { get; set; }
+    public string menuCachePath { get; set; }
 }
 
 internal static class PetFiles {
-    internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+    internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength=12*1024*1024 };
     internal static void Write(string path, string value) {
         string temp = path + ".tmp";
         File.WriteAllText(temp, value);
@@ -178,75 +213,87 @@ internal sealed class PetSpring {
 }
 
 internal sealed class DesktopViewer : Form {
-    internal Bitmap Frame;
+    private readonly PetConfig config;
+    private readonly Microsoft.Web.WebView2.WinForms.WebView2 web=new Microsoft.Web.WebView2.WinForms.WebView2();
+    private bool closed,busy,dirty;private double progress;private string frameSource="";private Bitmap frame;
+    internal bool Ready;internal long PresentedFrames;internal bool HasFrame;
     internal string Message="正在加载虚拟桌面…";
     internal Action Collapse;
-    internal Rectangle FullBounds;
-    internal Point Anchor;
-    internal double Scale;
-    internal DesktopViewer() {
-        Text="Newmark Virtual Desktop — Read Only";
-        FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false;
-        StartPosition=FormStartPosition.Manual; AutoScaleMode=AutoScaleMode.None;
-        DoubleBuffered=true; KeyPreview=true; BackColor=Color.FromArgb(25,27,31);
-        SetStyle(ControlStyles.ResizeRedraw,true);
+    internal Rectangle FullBounds,ContentBounds;
+    internal new Point Anchor;
+    internal new double Scale;
+    internal Bitmap Frame {get{return frame;}set{frame=value;HasFrame=value!=null;if(value!=null){using(var bytes=new MemoryStream()){value.Save(bytes,ImageFormat.Png);frameSource="data:image/png;base64,"+Convert.ToBase64String(bytes.ToArray());}}else frameSource="";Submit();}}
+    internal DesktopViewer(PetConfig config) {
+        this.config=config;Text="Newmark Virtual Desktop — Read Only";FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;
+        StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;KeyPreview=true;BackColor=Color.Magenta;TransparencyKey=Color.Magenta;
+        web.Dock=DockStyle.Fill;web.DefaultBackgroundColor=Color.Transparent;
+        web.CreationProperties=new Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties {UserDataFolder=config.menuCachePath??Path.Combine(config.directory,"viewer-cache")};
+        Controls.Add(web);Shown+=delegate{Initialize();};
     }
-    protected override CreateParams CreateParams { get { var cp=base.CreateParams; cp.ExStyle|=0x88; return cp; } }
-    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); PetNative.MarkViewer(Handle); }
-    protected override void OnHandleDestroyed(EventArgs e) { PetNative.UnmarkViewer(Handle); base.OnHandleDestroyed(e); }
-    protected override bool ProcessCmdKey(ref Message msg, Keys keys) {
-        if (keys==Keys.Escape || keys==(Keys.Alt|Keys.F4)) Collapse();
-        return true; // Viewer input has no delivery path to the source desktop.
+    protected override CreateParams CreateParams {get{var cp=base.CreateParams;cp.ExStyle|=0x88;return cp;}}
+    protected override void OnHandleCreated(EventArgs e){base.OnHandleCreated(e);PetNative.MarkViewer(Handle);}
+    protected override void OnHandleDestroyed(EventArgs e){PetNative.UnmarkViewer(Handle);base.OnHandleDestroyed(e);}
+    protected override bool ProcessCmdKey(ref Message msg,Keys keys){if(keys==Keys.Escape||keys==(Keys.Alt|Keys.F4))Collapse();return true;}
+    private async void Initialize(){
+        try{
+            await web.EnsureCoreWebView2Async(null);if(closed)return;var core=web.CoreWebView2;
+            core.Settings.AreDefaultContextMenusEnabled=false;core.Settings.AreDevToolsEnabled=false;core.Settings.AreBrowserAcceleratorKeysEnabled=false;core.Settings.IsZoomControlEnabled=false;core.Settings.IsStatusBarEnabled=false;
+            core.PermissionRequested+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2PermissionRequestedEventArgs e){e.State=Microsoft.Web.WebView2.Core.CoreWebView2PermissionState.Deny;};
+            core.NewWindowRequested+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2NewWindowRequestedEventArgs e){e.Handled=true;};
+            core.WebMessageReceived+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2WebMessageReceivedEventArgs e){string value=e.TryGetWebMessageAsString();if(value=="ready"){Ready=true;Submit();web.Focus();}else if(value=="close")Collapse();else if(value=="frame")PresentedFrames++;};
+            string file=Path.Combine(config.directory,"viewer.html");File.WriteAllText(file,ViewerHtml,Encoding.UTF8);string uri=new Uri(file).AbsoluteUri;
+            core.NavigationStarting+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2NavigationStartingEventArgs e){if(e.Uri!=uri)e.Cancel=true;};
+            core.Navigate(uri);
+        }catch(Exception ex){Message="虚拟桌面渲染不可用："+ex.Message;Ready=false;Collapse();}
     }
-    internal void SetProgress(double progress) {
-        progress=Math.Max(0,Math.Min(1,progress));
-        // Logarithmic scale keeps the visual zoom rate proportional to size.
-        Scale=Math.Exp(Math.Log(0.08)*(1-progress));
-        int w=Math.Max(1,(int)Math.Round(FullBounds.Width*Scale));
-        int h=Math.Max(1,(int)Math.Round(FullBounds.Height*Scale));
-        double cx=Anchor.X+(FullBounds.Left+FullBounds.Width/2.0-Anchor.X)*progress;
-        double cy=Anchor.Y+(FullBounds.Top+FullBounds.Height/2.0-Anchor.Y)*progress;
-        Rectangle next=progress>=1 ? FullBounds : new Rectangle((int)Math.Round(cx-w/2.0),(int)Math.Round(cy-h/2.0),w,h);
-        if (Bounds!=next) Bounds=next;
-        double opacity=Math.Max(0.01,Math.Min(1,progress*1.6));
-        if (Math.Abs(Opacity-opacity)>0.005) Opacity=opacity;
-        Invalidate();
+    internal void SetFrameFile(string file,DateTime stamp){HasFrame=true;frameSource=new Uri(file).AbsoluteUri+"?v="+stamp.Ticks;Submit();}
+    internal void ClearFrame(){HasFrame=false;frameSource="";Submit();}
+    internal void SetProgress(double value){
+        progress=Math.Max(0,Math.Min(1,value));Scale=Math.Exp(Math.Log(.08)*(1-progress));
+        int w=Math.Max(1,(int)Math.Round(FullBounds.Width*Scale)),h=Math.Max(1,(int)Math.Round(FullBounds.Height*Scale));
+        double cx=Anchor.X+(FullBounds.Left+FullBounds.Width/2.0-Anchor.X)*progress,cy=Anchor.Y+(FullBounds.Top+FullBounds.Height/2.0-Anchor.Y)*progress;
+        ContentBounds=progress>=1?FullBounds:new Rectangle((int)Math.Round(cx-w/2),(int)Math.Round(cy-h/2),w,h);
+        if(Bounds!=FullBounds)Bounds=FullBounds;Submit();
     }
-    protected override void OnPaint(PaintEventArgs e) {
-        base.OnPaint(e);
-        if (FullBounds.Width<=0) return;
-        e.Graphics.ScaleTransform((float)ClientSize.Width/FullBounds.Width,(float)ClientSize.Height/FullBounds.Height);
-        if (Frame!=null) {
-            float scale=Math.Min((float)FullBounds.Width/Frame.Width,(float)FullBounds.Height/Frame.Height);
-            int w=(int)(Frame.Width*scale), h=(int)(Frame.Height*scale);
-            e.Graphics.DrawImage(Frame,new Rectangle((FullBounds.Width-w)/2,(FullBounds.Height-h)/2,w,h));
-        }
-        using (var font=new Font("Microsoft YaHei UI",11)) {
-            string caption=Message.Length==0 ? "NewMate · 虚拟桌面只读预览   |   Esc 或点击 NewMate 收起" : Message+"   |   Esc 收起";
-            SizeF size=e.Graphics.MeasureString(caption,font);
-            using (var brush=new SolidBrush(Color.FromArgb(225,25,27,31))) e.Graphics.FillRectangle(brush,12,12,size.Width+24,size.Height+16);
-            e.Graphics.DrawString(caption,font,Brushes.White,24,20);
-        }
+    private async void Submit(){
+        dirty=true;if(!Ready||busy||closed)return;busy=true;
+        try{while(dirty&&!closed){dirty=false;var state=new{progress=progress,x=Anchor.X-FullBounds.Left,y=Anchor.Y-FullBounds.Top,width=FullBounds.Width,height=FullBounds.Height,src=frameSource,message=Message};await web.CoreWebView2.ExecuteScriptAsync("window.updateNewMate("+PetFiles.Json.Serialize(state)+")");}}
+        catch(Exception ex){if(!closed)Message=ex.Message;}finally{busy=false;}
     }
-    protected override void Dispose(bool disposing) { if (disposing && Frame!=null) { Frame.Dispose(); Frame=null; } base.Dispose(disposing); }
+    private const string ViewerHtml=@"<!doctype html><meta charset='utf-8'><meta http-equiv='Content-Security-Policy' content=""default-src 'none'; img-src data: file:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'""><style>
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;user-select:none}#surface{position:absolute;inset:0;background:#191b1f;transform-origin:0 0;will-change:transform,opacity;overflow:hidden}img{position:absolute;width:100%;height:100%;object-fit:contain}#caption{position:absolute;top:12px;left:12px;padding:8px 12px;background:#191b1fe1;color:white;font:14px 'Microsoft YaHei UI',sans-serif;border-radius:8px}
+    </style><div id='surface'><img id='frame'><div id='caption'></div></div><script>
+    const surface=document.getElementById('surface'),picture=document.getElementById('frame'),caption=document.getElementById('caption');let latest,scheduled=false,src='';
+    window.updateNewMate=state=>{latest=state;if(scheduled)return;scheduled=true;requestAnimationFrame(()=>{scheduled=false;const s=latest,p=s.progress,k=Math.exp(Math.log(.08)*(1-p)),x=s.x*innerWidth/s.width,y=s.y*innerHeight/s.height,cx=x+(innerWidth/2-x)*p,cy=y+(innerHeight/2-y)*p;surface.style.transform='translate3d('+(cx-innerWidth*k/2)+'px,'+(cy-innerHeight*k/2)+'px,0) scale('+k+')';surface.style.opacity=Math.min(1,p*1.6);caption.textContent=(s.message||'NewMate · 虚拟桌面只读预览')+'   |   Esc 或点击 NewMate 收起';if(s.src!==src){src=s.src;picture.src=src;picture.style.display=src?'block':'none';}window.chrome.webview.postMessage('frame');});};
+    document.addEventListener('keydown',e=>{e.preventDefault();e.stopPropagation();if(e.key==='Escape'||(e.altKey&&e.key==='F4'))window.chrome.webview.postMessage('close');},true);document.addEventListener('contextmenu',e=>e.preventDefault());window.chrome.webview.postMessage('ready');
+    </script>";
+    protected override void Dispose(bool disposing){closed=true;if(disposing){if(frame!=null)frame.Dispose();web.Dispose();}base.Dispose(disposing);}
 }
 
 internal sealed class DesktopPet : Form {
     private readonly PetConfig config;
     private readonly string configPath;
     private readonly long ownerIdentity;
-    private readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer();
+    private readonly PetFrameClock timer;
+    private PetSurface surface;
+    private Bitmap painted;
+    private byte[] basePixels,paintPixels;
+    private int pixelStride;
+    private double[] outlineCos,outlineSin;
     private readonly Stopwatch clock=Stopwatch.StartNew();
     private Bitmap body, sprite;
     private readonly PetSpring stretchX=new PetSpring(0.18), stretchY=new PetSpring(0.08), reveal=new PetSpring(0);
     private readonly ContextMenuStrip sizeMenu=new ContextMenuStrip();
+    private DshPetMenu dshMenu;
     private double sizeMultiplier=1;
+    private DateTime settingsStamp=DateTime.MinValue;
+    private long lastSettingsPoll;
     private int currentDpi, padding;
     private long appearedAt, previousTick, exitStarted=-1;
     private bool viewerOpening, allowClose, trimCanvas;
     private readonly List<Point> outline=new List<Point>();
     private readonly List<double> phases=new List<double>();
-    private DesktopViewer viewer;
+    private DesktopViewer viewer,cachedViewer;
     private Process capture;
     private DateTime captureStarted, lastFrame=DateTime.MinValue, retryAfter=DateTime.MinValue;
     private long lastStatus, lastRaise;
@@ -267,7 +314,7 @@ internal sealed class DesktopPet : Form {
         BuildMenu();
         Rectangle area=Screen.FromPoint(Cursor.Position).WorkingArea;
         Location=new Point(area.Right-Width-24,area.Bottom-Height-24);
-        timer.Interval=16; timer.Tick+=Tick;
+        timer=new PetFrameClock(this,delegate{Tick(this,EventArgs.Empty);});
         Shown+=delegate { appearedAt=previousTick=clock.ElapsedMilliseconds; Render(); WriteStatus(); timer.Start(); };
     }
     protected override bool ShowWithoutActivation { get { return true; } }
@@ -277,7 +324,7 @@ internal sealed class DesktopPet : Form {
 
     private void BuildBody(int dpi) {
         currentDpi=dpi;
-        int margin=Math.Max(4,dpi/24), width=Math.Max(60,(int)Math.Round(160*sizeMultiplier*dpi/96));
+        int margin=Math.Max(4,dpi/24), width=Math.Max(24,(int)Math.Round(120*sizeMultiplier*dpi/96));
         if (sprite==null) using (var original=new Bitmap(config.asset)) {
             int left=original.Width, top=original.Height, right=0, bottom=0;
             for (int y=0;y<original.Height;y++) for (int x=0;x<original.Width;x++) if (original.GetPixel(x,y).A>8) {
@@ -296,10 +343,12 @@ internal sealed class DesktopPet : Form {
         padding=(int)Math.Ceiling(Math.Max(body.Width,body.Height)*0.16);
         Size=new Size(body.Width+padding*2,body.Height+padding*2);
         outline.Clear(); phases.Clear();
+        if(painted!=null)painted.Dispose();painted=(Bitmap)body.Clone();
         var pixels=body.LockBits(new Rectangle(Point.Empty,body.Size),ImageLockMode.ReadOnly,PixelFormat.Format32bppArgb);
         byte[] data=new byte[pixels.Stride*body.Height];
         int stride=pixels.Stride;
         try { Marshal.Copy(pixels.Scan0,data,0,data.Length); } finally { body.UnlockBits(pixels); }
+        pixelStride=stride;basePixels=data;paintPixels=new byte[data.Length];
         int radius=Math.Max(2,(int)Math.Round(2.0*dpi/96));
         // Dilate the alpha silhouette, subtract its body: no rectangular border,
         // and no strokes around the eyes or other opaque internal details.
@@ -313,20 +362,20 @@ internal sealed class DesktopPet : Form {
             }
             if (nearby) { outline.Add(new Point(x,y)); phases.Add((Math.Atan2(y-body.Height/2.0,x-body.Width/2.0)+Math.PI)/(2*Math.PI)); }
         }
+        outlineCos=new double[phases.Count];outlineSin=new double[phases.Count];
+        for(int i=0;i<phases.Count;i++){outlineCos[i]=Math.Cos(4*Math.PI*phases[i]);outlineSin[i]=Math.Sin(4*Math.PI*phases[i]);}
     }
 
     private void BuildMenu() {
         sizeMenu.ShowImageMargin=false; sizeMenu.ShowCheckMargin=true;
         sizeMenu.Items.Add(new ToolStripMenuItem("NewMate · 大小倍率") { Enabled=false });
         sizeMenu.Items.Add(new ToolStripSeparator());
-        foreach (double factor in new double[] {0.5,0.75,1,1.25,1.5,2}) {
-            double chosen=factor;
-            var item=new ToolStripMenuItem((factor*100).ToString("0")+"%"+(factor==1 ? "（默认）" : ""));
-            item.Tag=factor; item.Click+=delegate { ChangeScale(chosen); }; sizeMenu.Items.Add(item);
-        }
+        var slider=new TrackBar {Minimum=300,Maximum=3000,TickStyle=TickStyle.None,SmallChange=1,LargeChange=100,Width=260,Height=35,AutoSize=false};
+        sizeMenu.Items.Add(new ToolStripControlHost(slider));
+        slider.Scroll+=delegate {ChangeScale(slider.Value/1000.0);sizeMenu.Items[0].Text="NewMate · "+(sizeMultiplier*100).ToString("0.#")+"%";};
         sizeMenu.Opening+=delegate {
-            sizeMenu.Items[0].Text=settingsError.Length==0 ? "NewMate · 大小倍率" : "NewMate · 倍率未保存，仅本次有效";
-            foreach (ToolStripItem item in sizeMenu.Items) if (item.Tag is double) ((ToolStripMenuItem)item).Checked=(double)item.Tag==sizeMultiplier;
+            slider.Value=(int)Math.Round(sizeMultiplier*1000);
+            sizeMenu.Items[0].Text="NewMate · "+(sizeMultiplier*100).ToString("0.#")+"% (30%–300%)";
         };
         sizeMenu.Opened+=delegate { WriteStatus(); };
         sizeMenu.Closed+=delegate { WriteStatus(); };
@@ -337,8 +386,10 @@ internal sealed class DesktopPet : Form {
         try {
             var saved=PetFiles.Json.Deserialize<Dictionary<string,object>>(File.ReadAllText(config.settingsPath));
             double value=Convert.ToDouble(saved["size_multiplier"]);
-            if (Double.IsNaN(value) || Double.IsInfinity(value) || value<0.5 || value>2) throw new InvalidDataException("Invalid saved pet size");
-            sizeMultiplier=value;
+            if (Double.IsNaN(value) || Double.IsInfinity(value) || value<0.3 || value>3) throw new InvalidDataException("Invalid saved pet size");
+            if (!saved.ContainsKey("version") || Convert.ToInt32(saved["version"])<2) value/=0.75;
+            if(value>3)throw new InvalidDataException("Invalid legacy size");
+            sizeMultiplier=value;settingsStamp=File.GetLastWriteTimeUtc(config.settingsPath);
         } catch (Exception ex) { settingsError=ex.Message; }
     }
     private void SaveScale() {
@@ -346,20 +397,23 @@ internal sealed class DesktopPet : Form {
         string temporary=config.settingsPath+"."+Process.GetCurrentProcess().Id+".tmp";
         try {
             Directory.CreateDirectory(Path.GetDirectoryName(config.settingsPath));
-            File.WriteAllText(temporary,PetFiles.Json.Serialize(new { version=1,size_multiplier=sizeMultiplier,updated_at=DateTime.UtcNow.ToString("o") }));
+            File.WriteAllText(temporary,PetFiles.Json.Serialize(new { version=2,size_multiplier=sizeMultiplier,updated_at=DateTime.UtcNow.ToString("o") }));
             if (File.Exists(config.settingsPath)) File.Replace(temporary,config.settingsPath,null); else File.Move(temporary,config.settingsPath);
-            settingsError="";
+            settingsStamp=File.GetLastWriteTimeUtc(config.settingsPath);settingsError="";
         } catch (Exception ex) { settingsError=ex.Message; }
         finally { try { if(File.Exists(temporary)) File.Delete(temporary); } catch(IOException) { } }
     }
-    private void ChangeScale(double factor) {
+    private void ChangeScale(double factor) {ApplyScale(factor,true);}
+    private void ApplyScale(double factor,bool persist) {
         if (exitStarted>=0) return;
-        if (factor==sizeMultiplier) { SaveScale(); WriteStatus(); return; }
+        if(Double.IsNaN(factor)||Double.IsInfinity(factor)||factor<.3||factor>3)return;
+        if (factor==sizeMultiplier) { if(persist)SaveScale(); WriteStatus(); return; }
         double anchorX=Left+Width/2.0; int anchorY=Top+Height-padding;
         int oldWidth=body.Width, oldHeight=body.Height;
         Size oldCanvas=Size;
-        sizeMultiplier=Math.Max(0.5,Math.Min(2,factor));
-        SaveScale();
+        sizeMultiplier=Math.Max(0.3,Math.Min(3,factor));
+        if(persist)SaveScale();
+        if(dshMenu!=null)dshMenu.UpdateScale(sizeMultiplier);
         BuildBody(currentDpi);
         // Retain enough transparent canvas for the old visual size while shrinking
         // (including 200% -> 50%). Trim it only after the spring has settled.
@@ -392,7 +446,13 @@ internal sealed class DesktopPet : Form {
     protected override void OnMouseUp(MouseEventArgs e) {
         base.OnMouseUp(e);
         if (exitStarted>=0) return;
-        if (e.Button==MouseButtons.Right) { sizeMenu.Show(PointToScreen(e.Location)); return; }
+        if (e.Button==MouseButtons.Right) {
+            if(!String.IsNullOrEmpty(config.menuThemePath) && File.Exists(config.menuThemePath)) {
+                if(dshMenu==null) dshMenu=new DshPetMenu(config,ChangeScale,WriteStatus,delegate(Point point){if(exitStarted<0)sizeMenu.Show(point);});
+                dshMenu.Present(PointToScreen(e.Location),sizeMultiplier,Bounds);
+            } else sizeMenu.Show(PointToScreen(e.Location));
+            return;
+        }
         if (!pressed || e.Button!=MouseButtons.Left) return;
         bool toggle=!dragged;
         if (dragged) {
@@ -423,12 +483,12 @@ internal sealed class DesktopPet : Form {
         else Expand();
     }
     private void Expand() {
-        viewer=new DesktopViewer(); viewer.Collapse=Collapse;
+        bool reused=cachedViewer!=null;viewer=cachedViewer??new DesktopViewer(config);cachedViewer=null;viewer.Collapse=Collapse;
         viewer.FullBounds=Screen.FromRectangle(Bounds).Bounds;
         viewer.Anchor=new Point(Left+Width/2,Top+Height-padding-body.Height/2);
         reveal.Value=reveal.Velocity=0; reveal.Target=1; viewerOpening=true;
         viewer.SetProgress(0);
-        viewer.FormClosing+=delegate(object sender, FormClosingEventArgs e) { if (expanded) { e.Cancel=true; Collapse(); } };
+        if(!reused)viewer.FormClosing+=delegate(object sender, FormClosingEventArgs e) { if (expanded) { e.Cancel=true; Collapse(); } };
         expanded=true; anyExpanded=true; lastFrame=DateTime.MinValue; frameCount=0; captureError="";
         // The pet is owned by the viewer, so it remains above it even on activation.
         Owner=viewer; viewer.Show(); viewer.Activate();
@@ -443,13 +503,14 @@ internal sealed class DesktopPet : Form {
     }
     private void FinishCollapse() {
         expanded=false; Owner=null; StopCapture();
-        if (viewer!=null) { var old=viewer; viewer=null; old.Dispose(); }
+        if(viewer!=null){var old=viewer;viewer=null;old.Hide();old.ClearFrame();if(old.Ready&&exitStarted<0)cachedViewer=old;else old.Dispose();}
         anyExpanded=PetNative.AnyViewer();
         Render(); WriteStatus();
     }
     private void BeginExit() {
         if (exitStarted>=0) return;
         exitStarted=clock.ElapsedMilliseconds; sizeMenu.Close(); pressed=false; Capture=false;
+        if(dshMenu!=null)dshMenu.Dismiss();
         stretchX.Target=1.08; stretchY.Target=0.88;
         Collapse(); StopCapture(); WriteStatus();
     }
@@ -478,12 +539,8 @@ internal sealed class DesktopPet : Form {
         DateTime written=File.GetLastWriteTimeUtc(frame);
         if (File.Exists(frame) && written>lastFrame) {
             try {
-                using (var stream=new FileStream(frame,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete))
-                using (var image=Image.FromStream(stream)) {
-                    Bitmap next=new Bitmap(image), old=viewer.Frame;
-                    viewer.Frame=next; if (old!=null) old.Dispose();
-                }
-                lastFrame=written; frameCount++; captureError=""; viewer.Message=""; viewer.Invalidate();
+                viewer.SetFrameFile(frame,written);
+                lastFrame=written; frameCount++; captureError=""; viewer.Message=""; viewer.SetProgress(reveal.Value);
                 try {
                     var facts=PetFiles.Json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Path.Combine(config.directory,"capture.json")));
                     if (Convert.ToInt32(facts["failed"])>0) viewer.Message="部分窗口暂时无法显示";
@@ -494,14 +551,20 @@ internal sealed class DesktopPet : Form {
         DateTime latest=lastFrame>captureStarted ? lastFrame : captureStarted;
         if (capture.HasExited || (DateTime.UtcNow-latest).TotalSeconds>3) {
             captureError="虚拟桌面画面暂不可用，正在重试";
-            if (viewer.Frame!=null) { viewer.Frame.Dispose(); viewer.Frame=null; }
+            viewer.ClearFrame();
             viewer.Message=captureError; viewer.Invalidate();
             StopCapture(); retryAfter=DateTime.UtcNow.AddSeconds(2);
         }
     }
     private void Tick(object sender, EventArgs e) {
         long nowTime=clock.ElapsedMilliseconds;
-        if (File.Exists(Path.Combine(config.directory,"stop")) || !PetFiles.Alive(config.ownerPid,ownerIdentity)) BeginExit();
+        if(nowTime-lastSettingsPoll>=200){
+            lastSettingsPoll=nowTime;
+            if (File.Exists(Path.Combine(config.directory,"stop")) || !PetFiles.Alive(config.ownerPid,ownerIdentity)) BeginExit();
+            if(!String.IsNullOrEmpty(config.settingsPath) && File.Exists(config.settingsPath) && File.GetLastWriteTimeUtc(config.settingsPath)!=settingsStamp){
+                double oldScale=sizeMultiplier;LoadScale();double next=sizeMultiplier;sizeMultiplier=oldScale;ApplyScale(next,false);
+            }
+        }
         double dt=Math.Max(0.001,Math.Min(0.064,(nowTime-previousTick)/1000.0)); previousTick=nowTime;
         if (exitStarted>=0 && nowTime-exitStarted>90) { stretchX.Target=0.04; stretchY.Target=0.02; }
         stretchX.Step(dt,23,exitStarted<0 ? 0.58 : 0.8); stretchY.Step(dt,25,exitStarted<0 ? 0.58 : 0.8);
@@ -512,48 +575,39 @@ internal sealed class DesktopPet : Form {
             trimCanvas=false; KeepVisible(); Render();
         }
         if (viewer!=null) {
-            if (reveal.Moving) { reveal.Step(dt,22,1); viewer.SetProgress(reveal.Value); }
+            if (viewer.Ready && reveal.Moving) { reveal.Step(dt,22,1); viewer.SetProgress(reveal.Value); }
             if (!viewerOpening && !reveal.Moving) FinishCollapse();
         }
         bool moving=stretchX.Moving || stretchY.Moving || (viewer!=null && reveal.Moving) || exitStarted>=0;
         if (moving || !anyExpanded) Render();
         if (exitStarted>=0 && nowTime-exitStarted>=650 && viewer==null) { allowClose=true; Close(); return; }
-        if (nowTime-lastStatus>=(moving ? 50 : 250)) {
+        if (nowTime-lastStatus>=250) {
             bool now=PetNative.AnyViewer();
             if (now!=anyExpanded) { anyExpanded=now; Render(); }
-            PollCapture(); WriteStatus(); lastStatus=clock.ElapsedMilliseconds;
+            if(!reveal.Moving)PollCapture(); WriteStatus(); lastStatus=clock.ElapsedMilliseconds;
         }
         if (clock.ElapsedMilliseconds-lastRaise>=1000) {
             if (viewer!=null) PetNative.Raise(viewer.Handle);
             PetNative.Raise(Handle); lastRaise=clock.ElapsedMilliseconds;
+            if(dshMenu!=null && dshMenu.Open)PetNative.Raise(dshMenu.Handle);
             if (!pressed) KeepVisible();
         }
     }
     private void Render() {
-        if (!IsHandleCreated || body==null) return;
-        using (var painted=(Bitmap)body.Clone())
-        using (var bitmap=new Bitmap(Width,Height,PixelFormat.Format32bppArgb)) {
-            if (!anyExpanded) for (int i=0;i<outline.Count;i++) {
-                double phase=(phases[i]-clock.Elapsed.TotalMilliseconds/3000.0)%1.0;
-                int value=(int)Math.Round(255*(0.5-0.5*Math.Cos(4*Math.PI*phase)));
-                painted.SetPixel(outline[i].X,outline[i].Y,Color.FromArgb(255,value,value,value));
-            }
-            double sx=Math.Max(0.01,stretchX.Value), sy=Math.Max(0.01,stretchY.Value);
-            float w=(float)(body.Width*sx), h=(float)(body.Height*sy);
-            using (var g=Graphics.FromImage(bitmap)) {
-                g.InterpolationMode=InterpolationMode.HighQualityBicubic;
-                g.PixelOffsetMode=PixelOffsetMode.HighQuality;
-                g.DrawImage(painted,new RectangleF((Width-w)/2,(float)(Height-padding)-h,w,h));
-            }
-            IntPtr dc=PetNative.GetDC(IntPtr.Zero), memory=PetNative.CreateCompatibleDC(dc);
-            IntPtr dib=bitmap.GetHbitmap(Color.FromArgb(0)), previous=PetNative.SelectObject(memory,dib);
-            try {
-                var location=new PetNative.Point(Left,Top); var origin=new PetNative.Point(0,0);
-                double alpha=exitStarted<0 ? Math.Min(1,(clock.ElapsedMilliseconds-appearedAt)/180.0) : Math.Max(0,1-(clock.ElapsedMilliseconds-exitStarted-90)/470.0);
-                var size=new PetNative.Size(Width,Height); var blend=new PetNative.Blend { Alpha=(byte)Math.Round(Math.Max(0,Math.Min(1,alpha))*255), Format=1 };
-                if (!PetNative.UpdateLayeredWindow(Handle,dc,ref location,ref size,memory,ref origin,0,ref blend,2)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            } finally { PetNative.SelectObject(memory,previous); PetNative.DeleteObject(dib); PetNative.DeleteDC(memory); PetNative.ReleaseDC(IntPtr.Zero,dc); }
+        if(!IsHandleCreated || body==null)return;
+        if(surface==null || surface.Bitmap.Width!=Width || surface.Bitmap.Height!=Height){if(surface!=null)surface.Dispose();surface=new PetSurface(Width,Height);}
+        Buffer.BlockCopy(basePixels,0,paintPixels,0,basePixels.Length);
+        if(!anyExpanded){double time=4*Math.PI*clock.Elapsed.TotalMilliseconds/3000,cos=Math.Cos(time),sin=Math.Sin(time);
+            for(int i=0;i<outline.Count;i++){int offset=outline[i].Y*pixelStride+outline[i].X*4;byte value=(byte)Math.Round(127.5*(1-outlineCos[i]*cos-outlineSin[i]*sin));paintPixels[offset]=paintPixels[offset+1]=paintPixels[offset+2]=value;paintPixels[offset+3]=255;}
         }
+        var bits=painted.LockBits(new Rectangle(Point.Empty,painted.Size),ImageLockMode.WriteOnly,PixelFormat.Format32bppArgb);
+        try{Marshal.Copy(paintPixels,0,bits.Scan0,paintPixels.Length);}finally{painted.UnlockBits(bits);}
+        double sx=Math.Max(.01,stretchX.Value),sy=Math.Max(.01,stretchY.Value);float w=(float)(body.Width*sx),h=(float)(body.Height*sy);
+        var g=surface.Graphics;g.Clear(Color.Transparent);g.DrawImage(painted,new RectangleF((Width-w)/2,(float)(Height-padding)-h,w,h));g.Flush(FlushIntention.Sync);
+        var location=new PetNative.Point(Left,Top);var origin=new PetNative.Point(0,0);
+        double alpha=exitStarted<0?Math.Min(1,(clock.ElapsedMilliseconds-appearedAt)/180.0):Math.Max(0,1-(clock.ElapsedMilliseconds-exitStarted-90)/470.0);
+        var size=new PetNative.Size(Width,Height);var blend=new PetNative.Blend{Alpha=(byte)Math.Round(Math.Max(0,Math.Min(1,alpha))*255),Format=1};
+        if(!PetNative.UpdateLayeredWindow(Handle,IntPtr.Zero,ref location,ref size,surface.DC,ref origin,0,ref blend,2))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     }
     private void WriteStatus() {
         try { PetFiles.WriteJson(Path.Combine(config.directory,"status.json"),new {
@@ -561,12 +615,16 @@ internal sealed class DesktopPet : Form {
             desktop=config.desktop, bounds=PetNative.Bounds(Bounds), expanded=expanded, outline_active=!anyExpanded,
             viewer_hwnd=viewer==null ? 0 : viewer.Handle.ToInt64(), viewer_bounds=viewer==null ? null : PetNative.Bounds(viewer.Bounds),
             viewer_transition=viewer==null ? "hidden" : (reveal.Moving ? (viewerOpening ? "opening" : "closing") : "open"),
+            viewer_content_bounds=viewer==null ? null : PetNative.Bounds(viewer.ContentBounds),
+            viewer_presented_frames=viewer==null ? 0 : viewer.PresentedFrames,
             viewer_progress=reveal.Value, viewer_scale=viewer==null ? 0 : viewer.Scale,
             pet_scale_x=stretchX.Value, pet_scale_y=stretchY.Value, size_multiplier=sizeMultiplier,
             paint_bounds=new { x=(Width-body.Width*stretchX.Value)/2, y=Height-padding-body.Height*stretchY.Value, width=body.Width*stretchX.Value, height=body.Height*stretchY.Value },
             settings_error=settingsError,
             pet_transition=exitStarted>=0 ? "exiting" : (clock.ElapsedMilliseconds-appearedAt<800 ? "entering" : (pressed ? "pressed" : (stretchX.Moving || stretchY.Moving ? "settling" : "idle"))),
-            menu_hwnd=sizeMenu.Visible ? sizeMenu.Handle.ToInt64() : 0,
+            menu_hwnd=dshMenu!=null && dshMenu.Open ? dshMenu.Handle.ToInt64() : (sizeMenu.Visible ? sizeMenu.Handle.ToInt64() : 0),
+            menu_renderer=dshMenu!=null && dshMenu.Open ? "dsh-css-webview2" : "native-fallback",
+            menu_theme_hash=dshMenu==null ? "" : dshMenu.ThemeHash, menu_error=dshMenu==null ? "" : dshMenu.Error,
             capture_pid=capture==null ? 0 : capture.Id, frames=frameCount, error=captureError,
             last_frame_utc=lastFrame==DateTime.MinValue ? null : lastFrame.ToString("o"), read_only=true,
             utc=DateTime.UtcNow.ToString("o")
@@ -574,11 +632,15 @@ internal sealed class DesktopPet : Form {
     }
     protected override void Dispose(bool disposing) {
         if (disposing) {
-            timer.Stop(); timer.Dispose(); StopCapture(); expanded=false; Owner=null;
+            timer.Stop(); timer.Dispose();
+            if(surface!=null){surface.Dispose();surface=null;}if(painted!=null){painted.Dispose();painted=null;}
+            StopCapture(); expanded=false; Owner=null;
             if (viewer!=null) { viewer.Dispose(); viewer=null; }
+            if(cachedViewer!=null){cachedViewer.Dispose();cachedViewer=null;}
             if (body!=null) { body.Dispose(); body=null; }
             if (sprite!=null) { sprite.Dispose(); sprite=null; }
             sizeMenu.Dispose();
+            if(dshMenu!=null) { dshMenu.Dispose();dshMenu=null; }
         }
         base.Dispose(disposing);
     }

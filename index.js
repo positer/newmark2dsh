@@ -1,3 +1,4 @@
+import { readNewMateSettings, writeNewMateSettings } from './lib/newmate-settings.js';
 /**
  * Newmark Core — the **core component**.
  *
@@ -460,6 +461,7 @@ export function apply(ctx, config) {
           };
 
           if (req.method === 'GET') {
+            if (new URL(req.url || '/', 'http://localhost').searchParams.get('view') === 'newMate') { send(200, {ok:true,newMate:readNewMateSettings(root)}); return; }
             // The preset is not a composed component, so its state is read from the
             // profile patch rather than from `composed`. Its key is the constant the POST
             // branch below compares against and the client row sends, spelled once.
@@ -472,6 +474,7 @@ export function apply(ctx, config) {
               200,
               (await safe(async () => ({
                 ok: true,
+                newMate: readNewMateSettings(root),
                 compose: config?.compose === true,
                 components: [
                   ...Object.keys(COMPONENTS).map((name) => ({
@@ -506,6 +509,11 @@ export function apply(ctx, config) {
             }
             const name = String(parsed.component || '');
             const wanted = parsed.enabled === true;
+            if (name === 'newMate') {
+              try { send(200, {ok:true,newMate:writeNewMateSettings(root,parsed.sizeMultiplier)}); }
+              catch(error) { send(400,{ok:false,error:error.message}); }
+              return;
+            }
 
             // There is no preset branch here, and its absence is the design. The plugin
             // config page switches the components this bundle COMPOSES; which preset a new

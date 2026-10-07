@@ -14,14 +14,15 @@
 
 The core loads all three components from this package. Components can be enabled independently in the plugin panel; presets are declared by the bundle patch. There are no separately installed component dependencies.
 
-## NewMate in 0.2.24
+## NewMate in 0.2.26
 
 On Windows, virtual-mode ComputerUse starts **NewMate**, a transparent, topmost, draggable mascot. A black-and-white animated border follows its silhouette while the virtual desktop is collapsed.
 
 - Click NewMate to expand a read-only virtual desktop preview over the monitor containing it. Click again or press Esc to collapse.
 - The border disappears while any Newmark preview is visible, including its closing animation.
 - Entrance, press/release and completion use spring squash/stretch. The preview smoothly scales in and out; repeated clicks reverse the current transition.
-- Right-click for 50%, 75%, 100%, 125%, 150% or 200% size. The last choice is saved and restored before the next entrance, including after a host restart.
+- Configuration is grouped into Components and Configuration, with separate model and desktop-assistant cards. Both the configuration page and the DSH-themed right-click menu offer a synchronized 30%–300% continuous size slider. The default is 100% over a base size reduced to 75% of the original; the last size is restored on startup.
+- NewMate reuses its drawing surfaces and paces coalesced frames toward 60 Hz. The read-only viewer uses GPU-composited transforms and keeps its renderer warm between expansions. Source capture cadence is independent of animation frame rate. DSH theme CSS and plugin overrides are retained by the menu.
 - Size preferences live at `<user root>/computer-use/desktop-pet.json`. The root follows explicit plugin configuration, then `NEWMARK_USER_ROOT`, then `~/.Newmark`.
 
 The preview does not forward user input to the source desktop. A lease started with `desktop: "hidden"` previews its isolated desktop; virtual mode without that option shows a composite of windows on the current desktop. Capture runs in a disposable process, clears stale frames after three seconds and retries. Real mouse mode retains the screen border indicator.
@@ -55,7 +56,7 @@ MemoryLab shares Newmark's user store. Agent API uses the models enabled in the 
 
 ## Verification and releases
 
-0.2.24 passed the development workspace's 195-check core gate, 17 native interaction checks, 18 motion/persistence checks, and five preference recovery checks. The locally installed DSH bundle completed real ComputerUse startup, status and teardown calls. Native lifecycle and multi-owner checks also passed. Validation scripts and local evidence are maintained in the development workspace, rather than being advertised as runnable files in this release repository.
+0.2.26 passed the development workspace's 195-check core gate and 12 focused GPU/native integration checks, including real hidden-desktop image decoding, reversal, warm reopen, size persistence and cleanup. A phase-separated 2560×1600 / 200% DPI fixture measured pet drawing at about 55 fps and viewer opening/closing at about 56/60 fps versus about 35 and 4/30 fps before optimization. These are local renderer measurements, not source-capture or hardware scanout guarantees. Validation scripts and local evidence are maintained in the development workspace, rather than being advertised as runnable files in this release repository.
 
 Version tags must match the package manifest. GitHub Actions validates the self-contained bundle and required NewMate files, then publishes through npm Trusted Publishing (OIDC) with provenance. Publication is confirmed by reading and downloading the exact registry version.
 
@@ -81,14 +82,15 @@ Proprietary. See [LICENSE](LICENSE). All rights reserved by Newmark AI.
 
 核心从本包内部加载三个组件，插件面板可独立启用组件；Dev/rDev 由 bundle patch 声明，无需另装子组件依赖。
 
-## 0.2.24：NewMate
+## 0.2.26：NewMate
 
 Windows 虚拟模式启动后，**NewMate** 以透明、置顶、可拖动的桌宠出现。虚拟桌面收起时，黑白渐变跑马灯沿本体轮廓运动。
 
 - 点击 NewMate，在其所在显示器全屏展开只读虚拟桌面；再次点击或按 Esc 收起。
 - 任意 Newmark 预览可见时取消描边，包括收起动画期间。
 - 出场、按压/松手和完成退出使用弹性伸缩；桌面预览平滑放大/缩小，连续点击可反向过渡。
-- 右键选择 50%、75%、100%、125%、150%、200% 大小。最后倍率持久保存，下次出场前恢复，宿主重启后同样生效。
+- 页面分为组件和配置两大板块，模型与桌面助手各有分级卡片。配置页与 DSH 主题右键菜单共用 30%–300% 连续滑杆，实时同步并自动保存。默认仍为 100%，本体基准为原尺寸的 75%，启动恢复最后大小。
+- 桌宠复用绘制缓冲并以合并帧调度趋近 60 Hz；预览用 GPU 合成缩放，再次展开复用渲染器。源桌面捕获更新频率与动画绘制帧率分别计量。菜单保留 DSH 主题及插件 CSS 覆盖。
 - 偏好文件为 `<用户根目录>/computer-use/desktop-pet.json`；依次使用显式插件配置、`NEWMARK_USER_ROOT`、`~/.Newmark`。
 
 预览不会向源桌面转发用户输入。`desktop: "hidden"` 对应租约的隔离桌面；仅虚拟鼠标模式则预览当前桌面的窗口合成画面。捕获位于可回收的独立进程中，三秒无新帧时清除旧画面并重试。真实鼠标模式继续使用屏幕边框。
@@ -113,7 +115,7 @@ MemoryLab 共用 Newmark 用户库。Agent API 使用插件配置中准用的模
 
 `index.js`/`client.js` 负责宿主组合与面板，`lib/` 提供共用配置、根目录和错误处理，`components/` 包含三个组件，`cordis.patch.yml` 声明核心与两个预设，`locale/` 为本地化，`.github/workflows/publish.yml` 为发布流程。
 
-0.2.24 已通过开发工作区核心 195 项、原生交互 17 项、动效与恢复 18 项、偏好异常处理 5 项检查。DSH 本地安装已实际完成 ComputerUse 启动、状态查询和停止清理；生命周期与多宿主检查亦通过。验收脚本及本机证据保留在开发工作区。
+0.2.26 已通过开发工作区核心 195 项和 GPU/原生专项 12 项检查，覆盖真实隐藏桌面图像解码、反向动画、复用渲染器、大小持久化和清理。单屏 2560×1600 / 200% DPI 分阶段夹具测得桌宠约 55 帧/秒，展开/收起约 56/60 帧/秒；旧版对应约 35 和 4/30 帧/秒。这是本机渲染测量，不是源画面捕获频率或显示器扫描输出保证。验收脚本及本机证据保留在开发工作区。
 
 版本标签必须与 manifest 一致。GitHub Actions 验证自包含结构和 NewMate 必需文件，通过 npm OIDC 发布并生成 provenance；以注册表确实能返回并下载指定版本作为发布完成依据。
 

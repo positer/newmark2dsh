@@ -7,3 +7,6 @@
 - Distinguish source, packed, published and installed evidence. A successful publish command is insufficient without registry retrieval and byte comparison.
 - Publish only the package and public documentation. Local profile backups, session records, private paths and development archives do not belong in Git or npm.
 - Read README/OVERVIEW/taste before work, update current documentation afterward, and retain timestamped operation records in the local archive.
+
+## 0.2.26 rendering
+Separate animation presentation from source capture and report measured frame intervals by phase. Reuse DIB/DC/Graphics, batch alpha-contour updates and coalesce UI frames; never grow an unbounded render queue. Keep native viewer bounds fixed and animate GPU transforms, preserving input isolation and explicit process cleanup. Retain DSH tokens and plugin CSS overrides in both settings surfaces.
