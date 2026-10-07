@@ -135,7 +135,7 @@ internal sealed class TransferBroker : Form {
                 int width=rect.R-rect.L,height=rect.B-rect.T;if(width<1||height<1||width>8192||height>8192)throw new InvalidOperationException("Unsupported source dimensions");
                 var next=new Bitmap(width,height,PixelFormat.Format32bppArgb);bool ok;
                 using(var g=Graphics.FromImage(next)){g.Clear(Color.FromArgb(28,28,28));IntPtr dc=g.GetHdc();try{ok=TransferNative.PrintWindow(source,dc,3);}finally{g.ReleaseHdc(dc);}}
-                if(!ok){next.Dispose();throw new InvalidOperationException("The application does not support PrintWindow presentation");}
+                if(!ok){next.Dispose();if(prepared){Thread.Sleep(100);continue;}throw new InvalidOperationException("The application does not support PrintWindow presentation");}
                 lock(frameLock){if(frame!=null)frame.Dispose();frame=next;frames++;lastFrame=DateTime.UtcNow;if(!prepared){next.Save(Path.Combine(config.directory,"frame.png"),ImageFormat.Png);prepared=true;}}
                 Thread.Sleep(33);
             }
@@ -143,7 +143,7 @@ internal sealed class TransferBroker : Form {
         finally{if(returning&&SourceAlive())TransferNative.Restore(source,config);if(previousDpi!=IntPtr.Zero)PetNative.SetThreadDpiAwarenessContext(previousDpi);if(desktop!=IntPtr.Zero)TransferNative.CloseDesktop(desktop);}
     }
     void Tick(object sender,EventArgs e){
-        if(sourceGone){allowClose=true;state="source-closed";Close();return;}
+        if(sourceGone||!SourceAlive()){allowClose=true;state="source-closed";Close();return;}
         if(!String.IsNullOrEmpty(error)){state="error";WriteStatus();if(!active){allowClose=true;Close();}return;}
         if(prepared&&state=="starting"){state="prepared";WriteStatus();if(config.resume)ActivateProxy();}
         string file=Path.Combine(config.directory,"command.json");
@@ -162,7 +162,7 @@ internal sealed class TransferBroker : Form {
     }
     void ActivateProxy(){if(!concealed){commands.Enqueue(delegate{if(SourceAlive()){TransferNative.Conceal(source,config);concealed=true;}});}active=true;state="active";Show();if(config.side=="real")Activate();WriteStatus();}
     void WriteStatus(){lastStatus=DateTime.UtcNow;TransferNative.Save(config,"status.json",new{id=config.id,state,pid=Process.GetCurrentProcess().Id,start=TransferNative.Start(Process.GetCurrentProcess().Id),hwnd=TransferNative.Hex(Handle),source_pid=config.sourcePid,source_start=config.sourceStart,source_handle=config.sourceHandle,source_desktop=config.sourceDesktop,target_desktop=config.targetDesktop,side=config.side,frames,painted,concealed,job_handle=TransferNative.Hex(job),original_process_restarted=false,window_migrated=false,interactive_mapping=true,error,last_command=lastCommand,bounds=new{x=Left,y=Top,width=Width,height=Height},utc=DateTime.UtcNow.ToString("o")});}
-    protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);lock(frameLock){if(frame!=null)e.Graphics.DrawImage(frame,ClientRectangle);}painted++;}
+    protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);lock(frameLock){if(frame!=null&&(DateTime.UtcNow-lastFrame).TotalSeconds<=5)e.Graphics.DrawImage(frame,ClientRectangle);else TextRenderer.DrawText(e.Graphics,"NewMate: waiting for the original window to render",Font,ClientRectangle,Color.White,TextFormatFlags.HorizontalCenter|TextFormatFlags.VerticalCenter);}painted++;}
     void Pointer(MouseEventArgs e,uint message,int flags){
         int x,y;lock(frameLock){if(frame==null)return;x=e.X*frame.Width/Math.Max(1,ClientSize.Width);y=e.Y*frame.Height/Math.Max(1,ClientSize.Height);}
         commands.Enqueue(delegate{

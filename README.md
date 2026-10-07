@@ -14,7 +14,7 @@
 
 The core loads all three components from this package. Components can be enabled independently in the plugin panel; presets are declared by the bundle patch. There are no separately installed component dependencies.
 
-## Process window transfers and ownership in 0.2.27
+## Process window transfers and ownership in 0.2.28
 
 On Windows, `computer_use` adds `process_push` (hidden → real) and `process_pull` (real → hidden). Select one top-level `window_handle`, an unambiguous `process_id`, or an existing `transfer_id`. NewMate responds with a spring pulse while the window smoothly flies out or contracts into it.
 
@@ -90,7 +90,7 @@ Proprietary. See [LICENSE](LICENSE). All rights reserved by Newmark AI.
 
 核心从本包内部加载三个组件，插件面板可独立启用组件；Dev/rDev 由 bundle patch 声明，无需另装子组件依赖。
 
-## 0.2.27：窗口推出、拉入与接管互斥
+## 0.2.28：窗口推出、拉入与接管互斥
 
 Windows 的 `computer_use` 新增 `process_push`（隐藏→真实）和 `process_pull`（真实→隐藏）。指定一个顶层 `window_handle`、只有一个候选窗口的 `process_id`，或已有 `transfer_id`。NewMate 弹性响应，窗口平滑飞出或收缩进入桌宠。
 
