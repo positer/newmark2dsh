@@ -1,6 +1,6 @@
 {
   "name": "newmark2dsh",
-  "version": "0.2.22",
+  "version": "0.2.24",
   "type": "module",
   "description": "Newmark Core for DeepSeek Harness：一个插件包携带 Newmark 的 MemoryLab、ComputerUse、Agent API 三个组件（可在插件页独立启用）与两个 Dev 系智能体预设——Dev（创造模式，带 DSH 内核修改权限：运行时检查 + 插件持久化管理 + 组合开发指引）与 rDev（restricted developer，同一智能体但不含该权限），共用 ~/.Newmark 用户库。默认预设由 patch 层声明，不由插件页调控。",
   "meta": {
@@ -21,6 +21,8 @@
     "components/*/*.js",
     "components/*/package.json",
     "components/*/lib/*.js",
+    "components/*/lib/*.cs",
+    "components/*/assets/*.png",
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",

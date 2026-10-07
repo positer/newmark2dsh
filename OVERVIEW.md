@@ -1,0 +1,22 @@
+# Newmark2DSH release repository
+
+This repository holds the self-contained package published as `newmark2dsh`. Development and Windows acceptance evidence live in the parent development workspace. The product includes MemoryLab, ComputerUse with NewMate, Agent API, and Dev/rDev presets.
+
+| Path | Structure and purpose |
+|---|---|
+| `package.json` | Version, exports, package files and DSH bundle metadata |
+| `index.js`, `client.js` | Host composition, component switches and client panel |
+| `lib/` | Shared root resolution, configuration, model selection and error helpers |
+| `components/memorylab/` | Component entry, tools, storage and client renderer |
+| `components/computeruse/` | Component entry, platform backends, native helper source and mascot asset |
+| `components/computeruse/lib/desktop-pet.js` | Hash-addressed helper compilation, lifetime and preference location |
+| `components/computeruse/lib/desktop-pet.cs` | Transparent mascot, animation, scale menu/persistence and read-only preview |
+| `components/computeruse/assets/desktop-pet.png` | NewMate image |
+| `components/agent-api/` | Component entry, API tools and execution modules |
+| `locale/` | Interface localization |
+| `cordis.patch.yml` | Core, Dev and rDev loader rows |
+| `.github/workflows/publish.yml` | Tag/version validation, package checks and OIDC npm publication |
+| `README.md`, `taste.md`, `LICENSE` | Product introduction, engineering rules and usage rights |
+| `archive/` | Local operation records, excluded from Git and npm |
+
+0.2.24 adds the NewMate desktop indicator, motion and remembered size. All 45 runtime/package files are synchronized from the locally validated development package. Publication and installation receipts are retained in the development workspace's timestamped release archive.

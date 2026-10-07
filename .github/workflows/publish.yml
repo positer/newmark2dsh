@@ -132,11 +132,23 @@ jobs:
           #    the core row itself needs. `agent-api`'s entry is its seam, because a bundle that
           #    ships the Agent API's tools but not the module that drives the model call installs
           #    cleanly and then fails at the first run.
-          for f in index.js client.js cordis.patch.yml components/memorylab/lib/memory-store.js components/computeruse/lib/win32.js components/computeruse/lib/overlay-win32.js components/agent-api/lib/llm-seam.js; do
+          for f in index.js client.js cordis.patch.yml components/memorylab/lib/memory-store.js components/computeruse/lib/win32.js components/computeruse/lib/overlay-win32.js components/computeruse/lib/desktop-pet.js components/computeruse/lib/desktop-pet.cs components/computeruse/assets/desktop-pet.png components/agent-api/lib/llm-seam.js; do
             [ -f "$f" ] || { echo "::error::missing $f"; fail=1; }
           done
 
           exit $fail
+
+      - name: NewMate must be present in the npm artifact
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/newmark-pack.json"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const [pack] = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/newmark-pack.json", "utf8"));
+            const files = new Set(pack.files.map(file => file.path));
+            for (const required of ["components/computeruse/lib/desktop-pet.js", "components/computeruse/lib/desktop-pet.cs", "components/computeruse/assets/desktop-pet.png"]) {
+              if (!files.has(required)) throw new Error("Missing from npm artifact: " + required);
+            }
+          '
 
       # A tag that reaches here publishes. `npm stage publish` is the alternative
       # when a human approval step is wanted instead: it needs no 2FA and leaves

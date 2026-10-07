@@ -28,7 +28,8 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-import { overlayContractReport, overlayState, releaseOverlay, startOverlay } from './overlay-win32.js';
+import { overlayContractReport, overlayState as realOverlayState, releaseOverlay, startOverlay, stopOverlay } from './overlay-win32.js';
+import { desktopPetContract, desktopPetState, releaseDesktopPet, startDesktopPet, stopDesktopPet } from './desktop-pet.js';
 
 /* ------------------------------------------------------------------ *
  * 1. constants, lanes, mode inventory, action tables
@@ -4985,24 +4986,43 @@ const lease = {
 };
 
 /**
- * The visible half of the takeover: a native, screen-wide WinForms overlay
- * (./overlay-win32.js) whose lifecycle is bound to this lease.
+ * The visible half of the takeover: a native screen-edge ring in real mode,
+ * or a draggable desktop pet and read-only viewer in virtual mode.
  *
  * It is started without being awaited. The lease is the contract and the window is a
  * side effect, so a desktop that cannot draw one must not fail `takeover_start`; the
  * outcome is observable instead - `mode_report` reports `overlay.running` and the reason
  * it is not running.
  */
-function startTakeoverOverlay(ownerId) {
+let indicatorGeneration = 0;
+function overlayState() {
+  return lease.mouseMode === 'virtual' ? desktopPetState() : realOverlayState();
+}
+
+function startTakeoverOverlay(ownerId, options = {}) {
+  const epoch = ++indicatorGeneration;
+  const mode = lease.mouseMode;
+  const desktop = hiddenRouteFor(ownerId)?.desktopName || 'Default';
   try {
-    const started = startOverlay({ ownerId, ownerPid: process.pid, durationMs: 0, action: 'takeover_start' });
-    if (started && typeof started.catch === 'function') started.catch(() => undefined);
+    const started = (async () => {
+      if (mode === 'virtual') {
+        await stopOverlay({ reason: 'virtual_pet', action: 'takeover_overlay_replace' });
+        if (epoch !== indicatorGeneration) return;
+        return await startDesktopPet({ ownerPid: process.pid, desktop, userRoot: options.userRoot });
+      }
+      releaseDesktopPet('real_mode');
+      if (epoch !== indicatorGeneration) return;
+      return await startOverlay({ ownerId, ownerPid: process.pid, durationMs: 0, action: 'takeover_start' });
+    })();
+    started.then((result) => { if (epoch === indicatorGeneration && result?.ok === false) lease.lastOverlayError = result.error || 'indicator_start_failed'; }).catch((error) => { lease.lastOverlayError = error.message; });
   } catch (error) {
     lease.lastOverlayError = error instanceof Error ? error.message : String(error);
   }
 }
 
 function releaseLease(reason) {
+  indicatorGeneration++;
+  releaseDesktopPet(reason);
   lease.lastReleaseReason = reason;
   lease.ownerId = null;
   lease.acquiredAt = 0;
@@ -5119,7 +5139,7 @@ async function takeoverStartArmed(action, ownerId, requested, desktopRequest, op
   // There is no timer to arm: the lease has no time limit and only `takeover_stop`
   // (or the owning process dying) releases it.
   // The takeover is only real once the screen itself carries the effect.
-  startTakeoverOverlay(ownerId);
+  startTakeoverOverlay(ownerId, options);
   const overlaySnapshot = overlayState();
   return {
     ok: true,
@@ -5184,6 +5204,9 @@ async function takeoverStop(options) {
     });
   }
   const previousOwner = existing ? existing.owner_id : null;
+  // Release the viewer's capture handles before auditing hidden-desktop teardown.
+  indicatorGeneration++;
+  await stopDesktopPet('takeover_stop');
   /* The hidden desktop is ended BEFORE the lease is released: the teardown needs the route the
    * lease is holding, and the lease must not be reported as free while an agent still holds a
    * desktop open. */
@@ -5913,7 +5936,7 @@ function modeReport(action, options) {
     // The takeover effect is a native window covering the whole screen, not the DSH
     // page's CSS ring: `running` is what is on screen, `reason` is why it is not.
     overlay: overlayState(),
-    overlay_contract: overlayContractReport(),
+    overlay_contract: lease.mouseMode === 'virtual' ? desktopPetContract() : overlayContractReport(),
     overlay_last_error: lease.lastOverlayError || undefined,
     lanes: laneDiagnostics(),
     live_lane_count: liveLaneCount(),

@@ -262,7 +262,7 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
   async function runBackend(backend, options) {
     let raw;
     try {
-      raw = await backend.runComputerUse(options);
+      raw = await backend.runComputerUse({ ...options, userRoot: root });
     } catch (error) {
       failures.record({
         where: 'computeruse/backend',
