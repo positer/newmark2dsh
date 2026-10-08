@@ -49,6 +49,7 @@ import { schema } from './lib/schema.js';
 import { defaultRoot, resolveRoot } from './lib/root.js';
 import { embedJson } from './lib/embed.js';
 import { latestCore } from './lib/core-update.js';
+import { createRestartController } from './lib/core-restart.js';
 import { causeChain, createErrorLog, describeError } from './lib/errors.js';
 import {
   MODEL_ID_FIELD,
@@ -212,14 +213,30 @@ const COMPONENT_GLOBALS = {
 
 export function apply(ctx, config) {
   const root = resolveRoot(config);
+  const restart = createRestartController(root);
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: '/newmark-core/update',
     handler: async (req, res) => {
       let status = 200, body;
       try {
-        if (req.method !== 'GET') { status = 405; body = { ok: false, error: 'method_not_allowed' }; }
-        else body = await latestCore();
+        if (req.method === 'GET') body = await latestCore();
+        else if (req.method === 'POST') {
+          if (req.headers['x-newmark-restart'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site') throw Error('重启请求来源无效');
+          let raw = '';
+          for await (const chunk of req) {
+            raw += chunk;
+            if (raw.length > 2048) throw Error('重启请求过大');
+          }
+          const input = JSON.parse(raw);
+          if (input.action === 'prepare') body = await restart.prepare(input.version);
+          else if (input.action === 'restart') {
+            const helper = await restart.restart(input.ticket);
+            res.once('finish', helper.commit);
+            res.once('close', () => { if (!res.writableFinished) helper.cancel(); });
+            body = { ok: true, restarting: true };
+          } else throw Error('未知重启操作');
+        } else { status = 405; body = { ok: false, error: 'method_not_allowed' }; }
       } catch (error) { status = 502; body = { ok: false, error: String(error?.message || error) }; }
       res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
       res.end(JSON.stringify(body));

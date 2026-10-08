@@ -72,9 +72,11 @@ window.__ModuleLoader__.load({
      * cards render through (`dsh-client-ui-tool/lib/client.js:9`, `:1362`). The package's
      * `exports` map is `"." -> ./lib/index.js`, so a bare require is the supported way in.
      */
-    let MarkdownText = null;
+    let MarkdownText = null, UpdateModal = null, UpdateButton = null;
     try {
       const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+      UpdateModal = primitives?.Modal;
+      UpdateButton = primitives?.Button;
       if (primitives && typeof primitives.MarkdownText === 'function') MarkdownText = primitives.MarkdownText;
     } catch (error) {
       MarkdownText = null;
@@ -2298,6 +2300,18 @@ function readPageGlobals() {
           const [updateMessage, setUpdateMessage] = React.useState('所有组件随 Newmark Core 统一更新。');
           const [updateBusy, setUpdateBusy] = React.useState(false);
           const updateLock = React.useRef(false);
+          const [updatePrompt, setUpdatePrompt] = React.useState(null);
+          const updateDecision = React.useRef(null);
+          const decideUpdate = (confirmed) => {
+            const resolve = updateDecision.current;
+            updateDecision.current = null;
+            setUpdatePrompt(null);
+            resolve?.(confirmed);
+          };
+          React.useEffect(() => () => {
+            updateDecision.current?.(false);
+            updateDecision.current = null;
+          }, []);
           const updateCore = async () => {
             if (updateLock.current) return;
             updateLock.current = true; setUpdateBusy(true);
@@ -2328,6 +2342,26 @@ function readPageGlobals() {
               if (currentVersion === latest.latest) {
                 setUpdateMessage(`已安装最新版本 ${latest.latest}；若刚完成更新，请完全重启 DSH。`); return;
               }
+              if (!UpdateModal || !UpdateButton) throw new Error('当前宿主的确认弹窗组件不可用');
+              setUpdateMessage(`发现新版本 ${latest.latest}，等待确认。`);
+              const confirmed = await new Promise(resolve => {
+                updateDecision.current = resolve;
+                setUpdatePrompt({ current: currentVersion || latest.current, latest: latest.latest });
+              });
+              if (!confirmed) { setUpdateMessage('已取消更新。'); return; }
+              const restartRequest = async input => {
+                const response = await fetch('/newmark-core/update', {
+                  method: 'POST', credentials: 'same-origin',
+                  headers: { 'content-type': 'application/json', 'x-newmark-restart': '1' },
+                  body: JSON.stringify(input),
+                });
+                const text = await response.text();
+                let result;
+                try { result = JSON.parse(text); } catch { throw new Error('重启辅助宿主返回无效响应'); }
+                if (!response.ok || !result.ok) throw new Error(result.error || '重启辅助宿主未就绪');
+                return result;
+              };
+              const restart = await restartRequest({ action: 'prepare', version: latest.latest });
               setUpdateMessage(`正在更新 Newmark Core 至 ${latest.latest}…`);
               requested = true;
               // The authoritative tarball names exactly the selected release. It avoids
@@ -2344,7 +2378,8 @@ function readPageGlobals() {
               if (!after.ok || after.value.find(bundle => bundle.name === 'newmark2dsh')?.version !== latest.latest) {
                 throw new Error('安装后的版本核验未通过，请查看 DSH 插件管理记录');
               }
-              setUpdateMessage(`已安装 ${latest.latest}。请完全退出并重启 DSH，以加载所有组件。`);
+              setUpdateMessage(`已安装 ${latest.latest}，正在完整重启 DSH…`);
+              await restartRequest({ action: 'restart', ticket: restart.ticket });
             } catch (error) {
               setUpdateMessage(`${requested ? '更新未确认' : '更新失败'}：${error.message || error}。未回退旧版本。`);
             } finally { updateLock.current = false; setUpdateBusy(false); }
@@ -2578,6 +2613,14 @@ function readPageGlobals() {
             'section',
             { className: 'nmc-config' },
             h('style', null, CONFIG_CSS+NEWMATE_SLIDER_CSS),
+            updatePrompt && h(UpdateModal, {
+              open: true, title: '更新 Newmark Core', closeLabel: '取消',
+              onClose: () => decideUpdate(false),
+              description: `当前 ${updatePrompt.current} → 最新 ${updatePrompt.latest}。所有组件将一并更新；安装成功后会结束当前 DSH 及其任务进程并重新启动。`,
+              footer: h(React.Fragment, null,
+                h(UpdateButton, { variant: 'outline', onClick: () => decideUpdate(false) }, '取消'),
+                h(UpdateButton, { variant: 'primary', onClick: () => decideUpdate(true) }, '更新并重启')),
+            }),
             h('section',{className:'nmc-config-section','aria-label':'组件'},
             h('h3', { className: 'nmc-config-head' }, '组件'),
             h(
@@ -2817,7 +2860,7 @@ function readPageGlobals() {
                   h('span', { className: 'nmc-config-category' }, '版本管理'),
                   h('h4', { className: 'nmc-config-subhead' }, 'Newmark Core'),
                   h('p', { className: 'nmc-config-description' }, '统一更新 MemoryLab、ComputerUse 与 Agent API。')),
-                h('button', { type: 'button', className: 'nmc-config-switch nmc-update-button', disabled: updateBusy, onClick: updateCore }, updateBusy ? '正在更新…' : '更新到最新版本')),
+                h('button', { type: 'button', className: 'nmc-config-switch nmc-update-button', disabled: updateBusy, onClick: updateCore }, updateBusy ? '处理中…' : '检查更新')),
               h('p', { className: 'nmc-config-footnote nmc-update-status', role: 'status', 'aria-live': 'polite', 'aria-busy': updateBusy }, updateMessage)),
             ),
           );
