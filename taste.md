@@ -13,3 +13,7 @@ Separate animation presentation from source capture and report measured frame in
 
 ## Process-preserving presentation transfers
 Never claim HWND-thread migration: receipts expose original identity and presentation identity separately. Reserve both desktop modes during crossing. Bind ownership to the trusted DSH session. Preserve exported application jobs, clean only unexported job members using retained process handles, restore imports, and test abrupt host/broker death independently from normal stop. GPU callback cadence is distinct from source capture cadence.
+
+## Process transfer presentation
+
+Process push/pull flights follow source-window z-order and the live expanded-preview layer without forcing a collapse or unconditional topmost activation. Native animation receipts expose layer, preview_expanded and topmost. Empty virtual desktops use pure black; no fixture application is launched by default.

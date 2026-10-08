@@ -28,3 +28,7 @@ Configuration cards group model and NewMate controls. ComputerUse desktop-pet.cs
 `components/computeruse/lib/desktop-transfer.cs` owns the capture/control proxy, job retention/cleanup, crash guardian and WebView2 flight. Its `.js` partner compiles native code and coordinates identity-checked receipts. `takeover-lock.cs/js` hold one kernel mutex per mode across hosts. `lib/cu-caller.js` preserves DSH session identity through asynchronous Agent API dispatch. `hidden-agent.js` watches the owner lifetime. Acceptance sources and raw source/installed receipts remain in the development archive `20261007-cu-transfer`.
 
 0.2.28 closes presentations independently when source windows disappear, retries temporary capture failures and clears stale frames. Native transfer acceptance now independently checks the presentation process has exited.
+
+## Process transfer presentation
+
+Process push/pull flights follow source-window z-order and the live expanded-preview layer without forcing a collapse or unconditional topmost activation. Native animation receipts expose layer, preview_expanded and topmost. Empty virtual desktops use pure black; no fixture application is launched by default.

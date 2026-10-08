@@ -24,6 +24,7 @@ internal sealed class TransferConfig {
     public int jobSourcePid {get;set;} public string jobSourceStart {get;set;} public string jobHandle {get;set;}
     public int brokerPid {get;set;} public string brokerStart {get;set;} public bool resume {get;set;}
     public string animation {get;set;} public string image {get;set;}
+    public string animationDesktop {get;set;} public string animationPrevious {get;set;} public bool animationTopmost {get;set;}
     public int sourceX {get;set;} public int sourceY {get;set;} public long sourceStyle {get;set;}
 }
 internal static class TransferNative {
@@ -41,6 +42,8 @@ internal static class TransferNative {
     [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr hwnd,int command);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] internal static extern IntPtr GetWindow(IntPtr hwnd,uint command);
+    [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll",EntryPoint="GetWindowLongPtrW")] internal static extern IntPtr GetWindowLongPtr(IntPtr hwnd,int index);
     [DllImport("user32.dll",EntryPoint="SetWindowLongPtrW",SetLastError=true)] static extern IntPtr SetWindowLongPtr(IntPtr hwnd,int index,IntPtr value);
     [DllImport("user32.dll",SetLastError=true)] static extern bool SetWindowPos(IntPtr hwnd,IntPtr after,int x,int y,int width,int height,uint flags);
@@ -222,17 +225,47 @@ internal static class TransferGuardian {
 
 internal sealed class TransferAnimation : Form {
     readonly TransferConfig config;readonly WebView2 web=new WebView2();readonly System.Windows.Forms.Timer timeout=new System.Windows.Forms.Timer{Interval=12000};
-    internal TransferAnimation(TransferConfig c){config=c;AutoScaleMode=AutoScaleMode.None;FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;TopMost=true;StartPosition=FormStartPosition.Manual;Bounds=Screen.FromPoint(new Point(c.anchorX,c.anchorY)).Bounds;BackColor=Color.Magenta;TransparencyKey=Color.Magenta;web.DefaultBackgroundColor=Color.Transparent;web.Dock=DockStyle.Fill;web.CreationProperties=new CoreWebView2CreationProperties{UserDataFolder=Path.Combine(c.directory,"animation-cache")};Controls.Add(web);Shown+=Initialize;timeout.Tick+=delegate{TransferNative.Save(config,"animation-error.json",new{error="animation_timeout"});Close();};timeout.Start();}
+    readonly System.Windows.Forms.Timer layerTimer=new System.Windows.Forms.Timer{Interval=30};
+    string layerName="real-window";bool previewExpanded;
+    protected override bool ShowWithoutActivation {get{return true;}}
+    protected override CreateParams CreateParams {get{var p=base.CreateParams;p.ExStyle|=0x08000000|0x20|0x80;return p;}}
+    // Follow the visible side of the transfer. Never elevate a covered real
+    // source above its covering windows, or collapse a preview to make room.
+    internal void ApplyLayer(){
+        if(!IsHandleCreated||IsDisposed)return;
+        IntPtr viewer=IntPtr.Zero;
+        PetNative.EnumWindows(delegate(IntPtr h,IntPtr data){
+            if(PetNative.IsWindowVisible(h)&&PetNative.GetProp(h,"Newmark.ComputerUse.ReadOnlyViewer")!=IntPtr.Zero){viewer=h;return false;}return true;
+        },IntPtr.Zero);
+        previewExpanded=viewer!=IntPtr.Zero;
+        bool virtualSource=!String.Equals(config.animationDesktop,"Default",StringComparison.OrdinalIgnoreCase);
+        bool top=config.animationTopmost;IntPtr previous=IntPtr.Zero;
+        if(virtualSource&&previewExpanded){
+            layerName="virtual-preview";top=(TransferNative.GetWindowLongPtr(viewer,-20).ToInt64()&8)!=0;
+            previous=TransferNative.GetWindow(viewer,3);
+            if(previous==Handle)previous=TransferNative.GetWindow(Handle,3);
+        }else{
+            layerName=virtualSource?"real-desktop":"real-window";
+            // A hidden desktop's z-order handles cannot be used on Default.
+            if(!virtualSource&&!String.IsNullOrEmpty(config.animationPrevious))previous=TransferNative.Handle(config.animationPrevious);
+            if(virtualSource)top=false;
+        }
+        if(previous==Handle||!TransferNative.IsWindow(previous))previous=IntPtr.Zero;
+        if(previous!=IntPtr.Zero&&((TransferNative.GetWindowLongPtr(previous,-20).ToInt64()&8)!=0)!=top)previous=IntPtr.Zero;
+        if(TopMost!=top)TopMost=top;
+        PetNative.SetWindowPos(Handle,previous!=IntPtr.Zero?previous:new IntPtr(top?-1:-2),0,0,0,0,0x13);
+    }
+    internal TransferAnimation(TransferConfig c){config=c;AutoScaleMode=AutoScaleMode.None;FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;StartPosition=FormStartPosition.Manual;Bounds=SystemInformation.VirtualScreen;BackColor=Color.Magenta;TransparencyKey=Color.Magenta;web.DefaultBackgroundColor=Color.Transparent;web.Dock=DockStyle.Fill;web.CreationProperties=new CoreWebView2CreationProperties{UserDataFolder=Path.Combine(c.directory,"animation-cache")};Controls.Add(web);Shown+=Initialize;layerTimer.Tick+=delegate{ApplyLayer();};layerTimer.Start();timeout.Tick+=delegate{TransferNative.Save(config,"animation-error.json",new{error="animation_timeout"});Close();};timeout.Start();}
     async void Initialize(object sender,EventArgs e){try{
         await web.EnsureCoreWebView2Async(null);var core=web.CoreWebView2;core.Settings.AreDefaultContextMenusEnabled=false;core.Settings.AreDevToolsEnabled=false;core.Settings.AreBrowserAcceleratorKeysEnabled=false;
         core.PermissionRequested+=delegate(object s,Microsoft.Web.WebView2.Core.CoreWebView2PermissionRequestedEventArgs a){a.State=Microsoft.Web.WebView2.Core.CoreWebView2PermissionState.Deny;};core.NewWindowRequested+=delegate(object s,Microsoft.Web.WebView2.Core.CoreWebView2NewWindowRequestedEventArgs a){a.Handled=true;};
-        core.WebMessageReceived+=delegate(object s,Microsoft.Web.WebView2.Core.CoreWebView2WebMessageReceivedEventArgs a){PetFiles.Write(Path.Combine(config.directory,"animation-result.json"),a.WebMessageAsJson);timeout.Stop();Close();};
+        core.WebMessageReceived+=delegate(object s,Microsoft.Web.WebView2.Core.CoreWebView2WebMessageReceivedEventArgs a){var receipt=PetFiles.Json.Deserialize<Dictionary<string,object>>(a.WebMessageAsJson);receipt["layer"]=layerName;receipt["preview_expanded"]=previewExpanded;receipt["topmost"]=TopMost;PetFiles.WriteJson(Path.Combine(config.directory,"animation-result.json"),receipt);timeout.Stop();Close();};
         string data=Convert.ToBase64String(File.ReadAllBytes(config.image));
         var geometry=new{from=new{x=config.anchorX-Left,y=config.anchorY-Top,scale=.06},to=new{x=config.x-Left+config.width/2,y=config.y-Top+config.height/2,scale=1},w=config.width,h=config.height,reverse=config.animation=="in"};
         string html="<!doctype html><meta http-equiv='Content-Security-Policy' content=\"default-src 'none';img-src data:;style-src 'unsafe-inline';script-src 'unsafe-inline'\"><style>html,body{margin:0;background:transparent;overflow:hidden}img{position:absolute;left:0;top:0;transform-origin:center;will-change:transform,opacity;border-radius:10px;box-shadow:0 16px 45px #0007}</style><img id='frame' src='data:image/png;base64,"+data+"'><script>const g="+PetFiles.Json.Serialize(geometry)+";const d=devicePixelRatio||1;g.w/=d;g.h/=d;for(const p of [g.from,g.to]){p.x/=d;p.y/=d}const el=document.getElementById('frame');el.style.width=g.w+'px';el.style.height=g.h+'px';let stamps=[];function css(p){let q=1-Math.pow(1-p,3);if(g.reverse)q=1-q;let scale=Math.exp(Math.log(.06)*(1-q));let x=g.from.x+(g.to.x-g.from.x)*q-g.w/2,y=g.from.y+(g.to.y-g.from.y)*q-g.h/2;el.style.transform=`translate3d(${x}px,${y}px,0) scale(${scale})`;el.style.opacity=Math.min(1,q*4+.05)}css(0);const play=()=>{let start;function tick(t){if(start===undefined)start=t;stamps.push(t);let p=Math.min(1,(t-start)/560);css(p);if(p<1)requestAnimationFrame(tick);else{let dt=stamps.slice(1).map((t,i)=>t-stamps[i]).sort((a,b)=>a-b);chrome.webview.postMessage({completed:true,frames:stamps.length,elapsed_ms:t-start,p95_ms:dt[Math.floor(dt.length*.95)]||0,direction:g.reverse?'in':'out'})}}requestAnimationFrame(tick)};if(el.complete)play();else el.onload=play;</script>";
         string file=Path.Combine(config.directory,"animation.html");File.WriteAllText(file,html);string uri=new Uri(file).AbsoluteUri;core.NavigationStarting+=delegate(object s,Microsoft.Web.WebView2.Core.CoreWebView2NavigationStartingEventArgs a){if(a.Uri!=uri)a.Cancel=true;};core.Navigate(uri);
     }catch(Exception ex){TransferNative.Save(config,"animation-error.json",new{error=ex.Message});Close();}}
-    protected override void Dispose(bool disposing){if(disposing){timeout.Dispose();web.Dispose();}base.Dispose(disposing);}
+    protected override void Dispose(bool disposing){if(disposing){timeout.Dispose();layerTimer.Dispose();web.Dispose();}base.Dispose(disposing);}
 }
 
 internal static class TransferProgram {
@@ -244,7 +277,7 @@ internal static class TransferProgram {
                 IntPtr d=TransferNative.Enter(c.sourceDesktop);
                 try{uint pid;IntPtr h=TransferNative.Handle(c.sourceHandle);if(TransferNative.GetWindowThreadProcessId(h,out pid)==0)throw new InvalidOperationException("Window no longer exists");
                     PetNative.Rect rect;PetNative.GetWindowRect(h,out rect);
-                    TransferNative.Save(c,"inspection.json",new{pid,start=TransferNative.Start((int)pid),job_start=c.jobSourcePid>0?TransferNative.Start(c.jobSourcePid):"",visible=TransferNative.IsWindowVisible(h),minimized=TransferNative.IsIconic(h),x=rect.Left,y=rect.Top,width=rect.Right-rect.Left,height=rect.Bottom-rect.Top,style=TransferNative.GetWindowLongPtr(h,-20).ToInt64()});
+                    TransferNative.Save(c,"inspection.json",new{pid,start=TransferNative.Start((int)pid),job_start=c.jobSourcePid>0?TransferNative.Start(c.jobSourcePid):"",visible=TransferNative.IsWindowVisible(h),minimized=TransferNative.IsIconic(h),x=rect.Left,y=rect.Top,width=rect.Right-rect.Left,height=rect.Bottom-rect.Top,style=TransferNative.GetWindowLongPtr(h,-20).ToInt64(),topmost=(TransferNative.GetWindowLongPtr(h,-20).ToInt64()&8)!=0,previous=TransferNative.Hex(TransferNative.GetWindow(h,3))});
                 }finally{TransferNative.CloseDesktop(d);}return 0;
             }
             if(args[0]=="--guardian"){TransferGuardian.Run(c);return 0;}

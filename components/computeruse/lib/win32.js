@@ -5954,6 +5954,11 @@ async function processTransferAction(action,options){
   }
   if(options.dryRun)return {ok:true,action,dry_run:true,original_process_restarted:false,native_window_migrated:false,interactive_mapping:true,target_desktop:config.targetDesktop};
   const anchor=await prepareDesktopPetTransfer(push?'out':'in');
+  // Inspect the currently presented window before parking it, not the original
+  // (which may already be off-screen on another desktop).
+  const presentation=existing?{sourceDesktop:existing.status.target_desktop,sourceHandle:existing.status.hwnd}:config;
+  const layer=await inspectTransferSource(presentation);
+  anchor.layer={desktop:presentation.sourceDesktop,previous:layer.previous,topmost:layer.topmost};
   if(existing&&config.targetDesktop===config.sourceDesktop){
     const returned=await returnDesktopTransfer(existing,{anchor});return {ok:true,action,...returned};
   }

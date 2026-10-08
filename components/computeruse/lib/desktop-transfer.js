@@ -56,7 +56,7 @@ export async function transferCommand(record,op){
 }
 export async function animateDesktopTransfer(record,direction,anchor,bounds){
   const exe=await compileDesktopTransfer();const directory=path.join(record.directory,'animation-'+crypto.randomUUID());fs.mkdirSync(directory,{recursive:true});
-  const config={...record.config,directory,anchorX:Math.round(anchor.x),anchorY:Math.round(anchor.y),...bounds,animation:direction,image:path.join(record.directory,'frame.png')};
+  const config={...record.config,directory,anchorX:Math.round(anchor.x),anchorY:Math.round(anchor.y),animationDesktop:anchor.layer?.desktop||record.config.sourceDesktop,animationPrevious:anchor.layer?.previous||'0x0',animationTopmost:!!anchor.layer?.topmost,...bounds,animation:direction,image:path.join(record.directory,'frame.png')};
   const file=path.join(directory,'config.json');write(file,config);const child=launch(exe,'--animate',file);
   const start=Date.now();while(Date.now()-start<16000){const result=read(path.join(directory,'animation-result.json'));if(result?.completed)return result;const error=read(path.join(directory,'animation-error.json'))||read(path.join(directory,'fatal.json'));if(error)throw Error(error.error);if(child.exitCode!==null)throw Error('Transfer animation exited before completing');await sleep(40);}child.kill();throw Error('Transfer animation timed out');
 }

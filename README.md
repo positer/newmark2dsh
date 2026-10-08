@@ -138,3 +138,7 @@ MemoryLab 共用 Newmark 用户库。Agent API 使用插件配置中准用的模
 ## 许可
 
 专有软件，Newmark AI 保留所有权利，见 [LICENSE](LICENSE)。
+
+## Process transfer presentation
+
+Process push/pull flights follow source-window z-order and the live expanded-preview layer without forcing a collapse or unconditional topmost activation. Native animation receipts expose layer, preview_expanded and topmost. Empty virtual desktops use pure black; no fixture application is launched by default.

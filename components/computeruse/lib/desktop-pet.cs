@@ -37,7 +37,8 @@ internal static class PetNative {
     [DllImport("user32.dll", SetLastError=true)] internal static extern bool UpdateLayeredWindow(IntPtr w, IntPtr dest, ref Point p, ref Size size, IntPtr source, ref Point origin, int key, ref Blend blend, int flags);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] internal static extern IntPtr OpenDesktop(string name, int flags, bool inherit, uint access);
     [DllImport("user32.dll")] internal static extern bool CloseDesktop(IntPtr desktop);
-    [DllImport("user32.dll")] internal static extern bool EnumDesktopWindows(IntPtr desktop, EnumWindow callback, IntPtr data);
+    [DllImport("user32.dll",SetLastError=true)] internal static extern bool EnumDesktopWindows(IntPtr desktop, EnumWindow callback, IntPtr data);
+    [DllImport("kernel32.dll")] internal static extern void SetLastError(uint error);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr w);
     [DllImport("user32.dll")] internal static extern bool IsIconic(IntPtr w);
     [DllImport("user32.dll")] internal static extern bool GetWindowRect(IntPtr w, out Rect r);
@@ -141,6 +142,7 @@ internal static class DesktopCapture {
         if (desktop==IntPtr.Zero) throw new InvalidOperationException("Cannot open virtual desktop ("+Marshal.GetLastWin32Error()+").");
         try {
             var windows=new List<IntPtr>();
+            PetNative.SetLastError(0);
             if (!PetNative.EnumDesktopWindows(desktop, delegate(IntPtr w, IntPtr data) {
                 uint pid; PetNative.GetWindowThreadProcessId(w,out pid);
                 if (PetNative.IsIndicator(w) || PetNative.GetProp(w,"Newmark2DSH.TransferSource")!=IntPtr.Zero) return true;
@@ -151,11 +153,11 @@ internal static class DesktopCapture {
                 if (cls=="IME" || cls=="MSCTFIME UI") return true;
                 if (pid!=parentPid && pid!=Process.GetCurrentProcess().Id && PetNative.IsWindowVisible(w) && !PetNative.IsIconic(w)) windows.Add(w);
                 return true;
-            }, IntPtr.Zero)) throw new InvalidOperationException("Cannot enumerate virtual desktop.");
+            }, IntPtr.Zero) && Marshal.GetLastWin32Error()!=0) throw new InvalidOperationException("Cannot enumerate virtual desktop ("+Marshal.GetLastWin32Error()+").");
             Rectangle screen=SystemInformation.VirtualScreen;
             using (var composed=new Bitmap(screen.Width,screen.Height,PixelFormat.Format32bppRgb))
             using (var g=Graphics.FromImage(composed)) {
-                g.Clear(Color.FromArgb(25,27,31));
+                g.Clear(Color.Black);
                 int captured=0, failed=0;
                 // EnumDesktopWindows is top-to-bottom; paint back-to-front.
                 windows.Reverse();
@@ -261,10 +263,10 @@ internal sealed class DesktopViewer : Form {
         catch(Exception ex){if(!closed)Message=ex.Message;}finally{busy=false;}
     }
     private const string ViewerHtml=@"<!doctype html><meta charset='utf-8'><meta http-equiv='Content-Security-Policy' content=""default-src 'none'; img-src data: file:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'""><style>
-    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;user-select:none}#surface{position:absolute;inset:0;background:#191b1f;transform-origin:0 0;will-change:transform,opacity;overflow:hidden}img{position:absolute;width:100%;height:100%;object-fit:contain}#caption{position:absolute;top:12px;left:12px;padding:8px 12px;background:#191b1fe1;color:white;font:14px 'Microsoft YaHei UI',sans-serif;border-radius:8px}
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;user-select:none}#surface{position:absolute;inset:0;background:#000;transform-origin:0 0;will-change:transform,opacity;overflow:hidden}img{position:absolute;width:100%;height:100%;object-fit:contain}#caption{position:absolute;top:12px;left:12px;padding:8px 12px;background:#000e;color:white;font:14px 'Microsoft YaHei UI',sans-serif;border-radius:8px}#caption:empty{display:none}
     </style><div id='surface'><img id='frame'><div id='caption'></div></div><script>
     const surface=document.getElementById('surface'),picture=document.getElementById('frame'),caption=document.getElementById('caption');let latest,scheduled=false,src='';
-    window.updateNewMate=state=>{latest=state;if(scheduled)return;scheduled=true;requestAnimationFrame(()=>{scheduled=false;const s=latest,p=s.progress,k=Math.exp(Math.log(.08)*(1-p)),x=s.x*innerWidth/s.width,y=s.y*innerHeight/s.height,cx=x+(innerWidth/2-x)*p,cy=y+(innerHeight/2-y)*p;surface.style.transform='translate3d('+(cx-innerWidth*k/2)+'px,'+(cy-innerHeight*k/2)+'px,0) scale('+k+')';surface.style.opacity=Math.min(1,p*1.6);caption.textContent=(s.message||'NewMate · 虚拟桌面只读预览')+'   |   Esc 或点击 NewMate 收起';if(s.src!==src){src=s.src;picture.src=src;picture.style.display=src?'block':'none';}window.chrome.webview.postMessage('frame');});};
+    window.updateNewMate=state=>{latest=state;if(scheduled)return;scheduled=true;requestAnimationFrame(()=>{scheduled=false;const s=latest,p=s.progress,k=Math.exp(Math.log(.08)*(1-p)),x=s.x*innerWidth/s.width,y=s.y*innerHeight/s.height,cx=x+(innerWidth/2-x)*p,cy=y+(innerHeight/2-y)*p;surface.style.transform='translate3d('+(cx-innerWidth*k/2)+'px,'+(cy-innerHeight*k/2)+'px,0) scale('+k+')';surface.style.opacity=Math.min(1,p*1.6);caption.textContent=s.message||'';if(s.src!==src){src=s.src;picture.src=src;picture.style.display=src?'block':'none';}window.chrome.webview.postMessage('frame');});};
     document.addEventListener('keydown',e=>{e.preventDefault();e.stopPropagation();if(e.key==='Escape'||(e.altKey&&e.key==='F4'))window.chrome.webview.postMessage('close');},true);document.addEventListener('contextmenu',e=>e.preventDefault());window.chrome.webview.postMessage('ready');
     </script>";
     protected override void Dispose(bool disposing){closed=true;if(disposing){if(frame!=null)frame.Dispose();web.Dispose();}base.Dispose(disposing);}
@@ -544,7 +546,6 @@ internal sealed class DesktopPet : Form {
                 try {
                     var facts=PetFiles.Json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Path.Combine(config.directory,"capture.json")));
                     if (Convert.ToInt32(facts["failed"])>0) viewer.Message="部分窗口暂时无法显示";
-                    else if (Convert.ToInt32(facts["captured"])==0) viewer.Message="虚拟桌面暂无可显示窗口";
                 } catch (IOException) { } catch (ArgumentException) { }
             } catch (IOException) { } catch (ArgumentException) { }
         }
@@ -561,7 +562,7 @@ internal sealed class DesktopPet : Form {
         if(nowTime-lastSettingsPoll>=200){
             lastSettingsPoll=nowTime;
             string transferMotion=Path.Combine(config.directory,"transfer-motion");
-            if(exitStarted<0&&File.Exists(transferMotion))try{string direction=File.ReadAllText(transferMotion);File.Delete(transferMotion);if(viewer!=null)Collapse();stretchX.Target=stretchY.Target=1;stretchX.Velocity+=direction=="in"?-4:4;stretchY.Velocity+=direction=="in"?4:-4;}catch(IOException){}
+            if(exitStarted<0&&File.Exists(transferMotion))try{string direction=File.ReadAllText(transferMotion);File.Delete(transferMotion);stretchX.Target=stretchY.Target=1;stretchX.Velocity+=direction=="in"?-4:4;stretchY.Velocity+=direction=="in"?4:-4;}catch(IOException){}
             if (File.Exists(Path.Combine(config.directory,"stop")) || !PetFiles.Alive(config.ownerPid,ownerIdentity)) BeginExit();
             if(!String.IsNullOrEmpty(config.settingsPath) && File.Exists(config.settingsPath) && File.GetLastWriteTimeUtc(config.settingsPath)!=settingsStamp){
                 double oldScale=sizeMultiplier;LoadScale();double next=sizeMultiplier;sizeMultiplier=oldScale;ApplyScale(next,false);
