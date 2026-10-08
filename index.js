@@ -48,6 +48,7 @@ import { readNewMateSettings, writeNewMateSettings } from './lib/newmate-setting
 import { schema } from './lib/schema.js';
 import { defaultRoot, resolveRoot } from './lib/root.js';
 import { embedJson } from './lib/embed.js';
+import { latestCore } from './lib/core-update.js';
 import { causeChain, createErrorLog, describeError } from './lib/errors.js';
 import {
   MODEL_ID_FIELD,
@@ -211,6 +212,19 @@ const COMPONENT_GLOBALS = {
 
 export function apply(ctx, config) {
   const root = resolveRoot(config);
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact', path: '/newmark-core/update',
+    handler: async (req, res) => {
+      let status = 200, body;
+      try {
+        if (req.method !== 'GET') { status = 405; body = { ok: false, error: 'method_not_allowed' }; }
+        else body = await latestCore();
+      } catch (error) { status = 502; body = { ok: false, error: String(error?.message || error) }; }
+      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(body));
+    },
+  }), 'newmark-core-update-discovery');
 
   /**
    * The bundle's failure log, from the SAME resolved root as the store.

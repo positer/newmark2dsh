@@ -2093,6 +2093,16 @@ function readPageGlobals() {
       // remote service at all.
       inject: ['slots'],
       apply(ctx) {
+        // Keep the optional management dependency off MemoryLab's own activation path.
+        let coreUpdateManager = null;
+        if (typeof ctx.plugin === 'function') ctx.plugin({
+          name: 'newmark-core-update-client',
+          inject: ['remote', 'remote.pluginManager'],
+          apply(child) {
+            coreUpdateManager = child.remote.pluginManager;
+            child.effect(() => () => { coreUpdateManager = null; }, 'newmark-core-update-manager');
+          },
+        });
         ctx.effect(() => {
           if(typeof document==='undefined' || typeof document.createElement!=='function' || window.__NEWMARK_CORE__?.platform!=='win32') return ()=>{};
           let disposed=false, stop=()=>{}, activeToken='', polling=false;
@@ -2279,6 +2289,46 @@ function readPageGlobals() {
           const [applied, setApplied] = React.useState({});
           const [loaded, setLoaded] = React.useState(false);
           const [hostCompose, setHostCompose] = React.useState(null);
+          const [updateMessage, setUpdateMessage] = React.useState('所有组件随 Newmark Core 统一更新。');
+          const [updateBusy, setUpdateBusy] = React.useState(false);
+          const updateLock = React.useRef(false);
+          const updateCore = async () => {
+            if (updateLock.current) return;
+            updateLock.current = true; setUpdateBusy(true);
+            let requested = false;
+            try {
+              const manager = coreUpdateManager;
+              if (!manager) throw new Error('当前宿主的插件管理服务尚未就绪');
+              setUpdateMessage('正在查询 npm 官方最新版本…');
+              const response = await fetch('/newmark-core/update', { cache: 'no-store', credentials: 'same-origin' });
+              const latest = await response.json();
+              if (!response.ok || !latest.ok) throw new Error(latest.error || '无法查询最新版');
+              const installed = await manager.listBundles();
+              if (!installed.ok) throw new Error(installed.error?.message || '无法读取已安装版本');
+              if (installed.value.find(bundle => bundle.name === 'newmark2dsh')?.version === latest.latest) {
+                setUpdateMessage(`已安装最新版本 ${latest.latest}；若刚完成更新，请完全重启 DSH。`); return;
+              }
+              setUpdateMessage(`正在更新 Newmark Core 至 ${latest.latest}…`);
+              requested = true;
+              // The authoritative tarball names exactly the selected release. It avoids
+              // pnpm's bare-name age fallback without changing the user's pnpm policies.
+              const answer = await manager.installBundle(latest.tarball, {
+                enabled: true, registry: latest.registry, requestId: crypto.randomUUID(),
+              });
+              if (!answer.ok) throw new Error(answer.error?.message || '安装结果不可用，请查看 DSH 插件管理记录');
+              const receipt = answer.value;
+              if (!['applied', 'restart-required'].includes(receipt.application)) {
+                throw new Error(receipt.error?.diagnostic || `安装返回状态：${receipt.application}`);
+              }
+              const after = await manager.listBundles();
+              if (!after.ok || after.value.find(bundle => bundle.name === 'newmark2dsh')?.version !== latest.latest) {
+                throw new Error('安装后的版本核验未通过，请查看 DSH 插件管理记录');
+              }
+              setUpdateMessage(`已安装 ${latest.latest}。请完全退出并重启 DSH，以加载所有组件。`);
+            } catch (error) {
+              setUpdateMessage(`${requested ? '更新未确认' : '更新失败'}：${error.message || error}。未回退旧版本。`);
+            } finally { updateLock.current = false; setUpdateBusy(false); }
+          };
 
           // The authorised model, read from the same route and shown in its own block below
           // the component rows. It is deliberately NOT a row in `rows`: a row is a switch, and
@@ -2510,6 +2560,11 @@ function readPageGlobals() {
             h('style', null, CONFIG_CSS+NEWMATE_SLIDER_CSS),
             h('section',{className:'nmc-config-section','aria-label':'组件'},
             h('h3', { className: 'nmc-config-head' }, '组件'),
+            h('div', { className: 'nmc-config-card', 'data-newmark-core-update': '' },
+              h('h4', { className: 'nmc-config-subhead' }, 'Newmark Core 更新'),
+              h('p', { className: 'nmc-config-description' }, 'MemoryLab、ComputerUse 和 Agent API 依托 Core 安装，无需分别更新。'),
+              h('button', { type: 'button', className: 'nmc-config-switch', disabled: updateBusy, onClick: updateCore }, updateBusy ? '正在更新…' : '更新到最新版本'),
+              h('p', { className: 'nmc-config-description', role: 'status', 'aria-live': 'polite' }, updateMessage)),
             h(
               'ul',
               { className: 'nmc-config-list' },
