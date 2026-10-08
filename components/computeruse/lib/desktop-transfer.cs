@@ -114,15 +114,23 @@ internal sealed class TransferBroker : Form {
     readonly TransferConfig config;readonly IntPtr source,job;
     readonly object frameLock=new object();readonly ConcurrentQueue<Action> commands=new ConcurrentQueue<Action>();
     readonly PetFrameClock timer;
+    readonly System.Threading.Timer controlTimer;int controlPending;
     IntPtr outputMonitor;
     Bitmap frame;Thread worker;volatile bool stopping,prepared,concealed;bool active,returning,sourceGone,allowClose;
     IntPtr focused;string state="starting",error="",lastCommand="";long frames,painted;DateTime lastFrame,lastStatus;
     internal TransferBroker(TransferConfig c,IntPtr job){
         config=c;this.job=job;source=TransferNative.Handle(c.sourceHandle);focused=source;
-        timer=new PetFrameClock(this,delegate{outputMonitor=PetNative.MonitorFromWindow(Handle,2);Tick(null,EventArgs.Empty);});
+        timer=new PetFrameClock(this,delegate{outputMonitor=PetNative.MonitorFromWindow(Handle,2);if(active)Invalidate();});
+        // Commands and liveness must progress even when display vblank is suspended.
+        // WM_TIMER is low priority and can starve behind high-refresh WM_PAINT.
+        controlTimer=new System.Threading.Timer(delegate{
+            if(stopping||IsDisposed||!IsHandleCreated||Interlocked.CompareExchange(ref controlPending,1,0)!=0)return;
+            try{BeginInvoke(new Action(delegate{try{if(!stopping&&!IsDisposed)Tick(null,EventArgs.Empty);}finally{Interlocked.Exchange(ref controlPending,0);}}));}
+            catch(InvalidOperationException){Interlocked.Exchange(ref controlPending,0);}
+        },null,Timeout.Infinite,Timeout.Infinite);
         Text=(c.title??"Application")+" · NewMate";StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;
         Bounds=new Rectangle(c.x,c.y,Math.Max(160,c.width),Math.Max(100,c.height));KeyPreview=true;DoubleBuffered=true;BackColor=Color.FromArgb(28,28,28);
-        Shown+=delegate{Hide();worker=new Thread(CaptureLoop);worker.IsBackground=true;worker.SetApartmentState(ApartmentState.MTA);worker.Start();timer.Start();};
+        Shown+=delegate{Hide();worker=new Thread(CaptureLoop);worker.IsBackground=true;worker.SetApartmentState(ApartmentState.MTA);worker.Start();timer.Start();controlTimer.Change(0,100);};
     }
     bool SourceAlive(){uint pid;return TransferNative.GetWindowThreadProcessId(source,out pid)!=0&&pid==config.sourcePid&&TransferNative.Alive(config.sourcePid,config.sourceStart);}
     void CaptureLoop(){
@@ -162,7 +170,7 @@ internal sealed class TransferBroker : Form {
             }
         }catch(IOException){}catch(Exception ex){error=ex.Message;}
         if(state=="concealing"&&concealed)state="concealed";
-        if(active){Invalidate();if((DateTime.UtcNow-lastFrame).TotalSeconds>5)Text=(config.title??"Application")+" · NewMate（画面更新等待中）";}
+        if(active&&(DateTime.UtcNow-lastFrame).TotalSeconds>5)Text=(config.title??"Application")+" · NewMate（画面更新等待中）";
         if((DateTime.UtcNow-lastStatus).TotalMilliseconds>=200)WriteStatus();
     }
     void ActivateProxy(){if(!concealed){commands.Enqueue(delegate{if(SourceAlive()){TransferNative.Conceal(source,config);concealed=true;}});}active=true;state="active";Show();if(config.side=="real")Activate();WriteStatus();}
@@ -187,10 +195,10 @@ internal sealed class TransferBroker : Form {
     protected override void OnKeyPress(KeyPressEventArgs e){base.OnKeyPress(e);char value=e.KeyChar;commands.Enqueue(delegate{if(SourceAlive())TransferNative.PostMessage(focused,0x102,new IntPtr(value),new IntPtr(1));});e.Handled=true;}
     protected override void OnFormClosing(FormClosingEventArgs e){
         if(!allowClose){e.Cancel=true;commands.Enqueue(delegate{if(SourceAlive())TransferNative.PostMessage(source,0x10,IntPtr.Zero,IntPtr.Zero);});return;}
-        timer.Stop();stopping=true;worker.Join(800);if(returning&&concealed){var restore=new Thread(new ThreadStart(delegate{IntPtr d=IntPtr.Zero;try{d=TransferNative.Enter(config.sourceDesktop);if(SourceAlive())TransferNative.Restore(source,config);}finally{if(d!=IntPtr.Zero)TransferNative.CloseDesktop(d);}}));restore.Start();restore.Join(1000);}
+        controlTimer.Change(Timeout.Infinite,Timeout.Infinite);timer.Stop();stopping=true;worker.Join(800);if(returning&&concealed){var restore=new Thread(new ThreadStart(delegate{IntPtr d=IntPtr.Zero;try{d=TransferNative.Enter(config.sourceDesktop);if(SourceAlive())TransferNative.Restore(source,config);}finally{if(d!=IntPtr.Zero)TransferNative.CloseDesktop(d);}}));restore.Start();restore.Join(1000);}
         WriteStatus();base.OnFormClosing(e);
     }
-    protected override void Dispose(bool disposing){if(disposing){timer.Dispose();lock(frameLock){if(frame!=null)frame.Dispose();}}base.Dispose(disposing);}
+    protected override void Dispose(bool disposing){if(disposing){controlTimer.Dispose();timer.Dispose();lock(frameLock){if(frame!=null)frame.Dispose();}}base.Dispose(disposing);}
 }
 
 internal static class TransferGuardian {

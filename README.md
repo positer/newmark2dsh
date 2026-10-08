@@ -2,9 +2,9 @@
 
 **Newmark capabilities inside DeepSeek Harness.** One self-contained plugin bundle provides persistent memory, desktop automation, an Agent API, and Dev/rDev presets over the shared `~/.Newmark` user store.
 
-## Current release: 0.2.30
+## Current release: 0.2.31
 
-Display-paced NewMate rendering on Windows; GPU-accelerated read-only previews and authenticated isolated X11 desktops on Linux/WSLg. Original processes survive supported window mappings. See [release details and platform limits](CHANGELOG-0.2.30.md).
+Display-paced NewMate rendering on Windows; GPU-accelerated read-only previews and authenticated isolated X11 desktops on Linux/WSLg. Original processes survive supported window mappings. See [release details and platform limits](CHANGELOG-0.2.31.md).
 
 Linux dependencies: `xvfb xauth openbox xdotool wmctrl python3-xlib python3-pil python3-pyqt5`. Native Wayland control, DSH CSS menus on Linux, and Windows-equivalent Linux flight effects are not supported.
 

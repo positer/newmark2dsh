@@ -36,3 +36,5 @@ Process push/pull flights follow source-window z-order and the live expanded-pre
 ## 0.2.30 display pacing and Linux
 
 `components/computeruse/lib/linux-desktop.js` launches the isolated X11 host; `linux-desktop.py` owns leases, authenticated Xvfb, mappings, GPU presentation and independent capture. `linux-process-guard.py` guards virtual process lifetime. Windows `desktop-pet.cs` and `desktop-transfer.cs` use output vblank pacing with bounded pending frames. Preserve input isolation and original process identity; distinguish render callbacks from physical scanout.
+
+0.2.31 separates TransferBroker controlTimer (commands/status) from its PetFrameClock (presentation).
