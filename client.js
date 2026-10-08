@@ -546,6 +546,9 @@ function readPageGlobals() {
           try {
             const fresh = await readFromHost({ rebuild });
             if (token !== generation) return; // superseded: a newer snapshot owns the panel
+            // Hot installation can start the client after the shell HTML was served.
+            // Recover the host snapshot without asking the user to reload the application.
+            if (typeof window !== 'undefined') window[MEMORYLAB_GLOBAL] = fresh;
             rebuildResult = fresh.result || null;
             emit({
               phase: 'ready',
@@ -1900,7 +1903,7 @@ function readPageGlobals() {
 
       // ONE snapshot, on open. Every later interaction reads it.
       React.useEffect(() => {
-        loadVisualization({ reason: 'open' });
+        loadVisualization({ reason: 'open', source: 'host' });
       }, []);
 
       const tagCount = tagNames(state.tags).length;
