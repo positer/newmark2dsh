@@ -1,9 +1,10 @@
 /**
  * Newmark ComputerUse - Linux desktop automation layer.
  *
- * A pure Node ESM module (node:child_process / node:fs / node:os / node:path / node:crypto
- * only, no DSH import, no TypeScript, no build step) that executes genuine Linux desktop
- * automation by driving the system tools the session actually has:
+ * The Linux action entry point uses linux-desktop.js / linux-desktop.py for authenticated
+ * Xvfb, Qt NewMate, window mapping and per-UID kernel leases. Native Wayland is refused.
+ * Real actions retain the Node ESM command backends below after native lease validation.
+ * Low-level lane and pure helper exports remain available without importing DSH:
  *
  *   input     xdotool (preferred) -> xte from xautomation -> ydotool (kernel-level, Wayland-friendly)
  *   windows   wmctrl -lGpx (preferred) -> xdotool search, with xprop for the active window,
@@ -39,8 +40,8 @@
  * structured: an absent tool, a missing display, an unverifiable window or a vanished window
  * is reported with its own code instead of being papered over with a plausible-looking
  * success. Retired experimental work from the local Computer Use laboratory, and every
- * learned or on-device model runtime, is intentionally absent: this module only ever drives
- * the shipped X11/Wayland command-line tools listed above.
+ * learned or on-device model runtime, is intentionally absent. See docs/06-linux-desktop.md
+ * for the current X11 bridge, WSLg scope, native dependencies and verification limits.
  *
  * Layout of this file
  *   1. constants, lanes, mode inventory, action tables
@@ -50,11 +51,12 @@
  *   5. window enumeration, target resolution, ownership verification, containment
  *   6. capture, the 32x18 grayscale digest, full and sparse observation
  *   7. real input delivery, behind one shared click/drag reservation queue
- *   8. the virtual-mode region: refusal only, delimited by the @virtual-mode markers
- *   9. wait_for, sequence, the single-owner takeover lease, and the action dispatcher
+ *   8. legacy virtual refusal helpers, retained for portable pure-helper callers
+ *   9. legacy dispatch helpers and the Linux native bridge entry point
  */
 
 import { spawn } from 'node:child_process';
+import { linuxDesktop, stopLinuxDesktop } from './linux-desktop.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1028,6 +1030,7 @@ export function stopLane(lane) {
 
 /** Terminate every child the lanes own. Idempotent, and safe to call from an exit handler. */
 export function stopAll() {
+  stopLinuxDesktop();
   for (const lane of LANES) laneFor(lane).stop();
   for (const child of [...liveChildren]) killChild(child, true);
   liveChildren.clear();
@@ -3875,9 +3878,22 @@ async function appPhysicalAction(action, options, mode, header) {
 
 /* --- the dispatcher ---------------------------------------------- */
 
+let linuxRequestQueue = Promise.resolve();
+
+async function dispatchLinuxDesktop(action, options) {
+  const native = await linuxDesktop({ ...options, action });
+  if (!native.legacy_real_dispatch) return native;
+  return await dispatchComputerUse(action, options);
+}
+
 export async function runComputerUse(options = {}) {
   const action = String((options && options.action) || 'observe').toLowerCase();
   try {
+    if (IS_LINUX) {
+      const task = linuxRequestQueue.then(() => dispatchLinuxDesktop(action, options));
+      linuxRequestQueue = task.catch(() => {});
+      return stringifyResult(await task);
+    }
     const result = await dispatchComputerUse(action, options || {});
     return stringifyResult(result);
   } catch (error) {

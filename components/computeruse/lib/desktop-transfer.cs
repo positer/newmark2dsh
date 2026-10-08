@@ -113,14 +113,16 @@ internal static class TransferNative {
 internal sealed class TransferBroker : Form {
     readonly TransferConfig config;readonly IntPtr source,job;
     readonly object frameLock=new object();readonly ConcurrentQueue<Action> commands=new ConcurrentQueue<Action>();
-    readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer{Interval=33};
+    readonly PetFrameClock timer;
+    IntPtr outputMonitor;
     Bitmap frame;Thread worker;volatile bool stopping,prepared,concealed;bool active,returning,sourceGone,allowClose;
     IntPtr focused;string state="starting",error="",lastCommand="";long frames,painted;DateTime lastFrame,lastStatus;
     internal TransferBroker(TransferConfig c,IntPtr job){
         config=c;this.job=job;source=TransferNative.Handle(c.sourceHandle);focused=source;
+        timer=new PetFrameClock(this,delegate{outputMonitor=PetNative.MonitorFromWindow(Handle,2);Tick(null,EventArgs.Empty);});
         Text=(c.title??"Application")+" · NewMate";StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;
         Bounds=new Rectangle(c.x,c.y,Math.Max(160,c.width),Math.Max(100,c.height));KeyPreview=true;DoubleBuffered=true;BackColor=Color.FromArgb(28,28,28);
-        Shown+=delegate{Hide();worker=new Thread(CaptureLoop);worker.IsBackground=true;worker.SetApartmentState(ApartmentState.MTA);worker.Start();timer.Tick+=Tick;timer.Start();};
+        Shown+=delegate{Hide();worker=new Thread(CaptureLoop);worker.IsBackground=true;worker.SetApartmentState(ApartmentState.MTA);worker.Start();timer.Start();};
     }
     bool SourceAlive(){uint pid;return TransferNative.GetWindowThreadProcessId(source,out pid)!=0&&pid==config.sourcePid&&TransferNative.Alive(config.sourcePid,config.sourceStart);}
     void CaptureLoop(){
@@ -131,7 +133,7 @@ internal sealed class TransferBroker : Form {
             previousDpi=PetNative.SetThreadDpiAwarenessContext(PetNative.GetWindowDpiAwarenessContext(source));
             if(TransferNative.IsIconic(source))throw new InvalidOperationException("Restore the minimized source window before transferring it");
             TransferNative.EnumChildWindows(source,delegate(IntPtr hwnd,IntPtr data){var cls=new StringBuilder(128);TransferNative.GetClassName(hwnd,cls,128);if(cls.ToString().IndexOf("edit",StringComparison.OrdinalIgnoreCase)>=0)focused=hwnd;return true;},IntPtr.Zero);
-            while(!stopping){
+            using(var sync=new PetVBlank())while(!stopping){
                 Action action;while(commands.TryDequeue(out action))action();
                 if(!SourceAlive()){sourceGone=true;break;}
                 TransferNative.Rect rect;if(!TransferNative.GetClientRect(source,out rect))throw new InvalidOperationException("Cannot read original client bounds");
@@ -140,7 +142,7 @@ internal sealed class TransferBroker : Form {
                 using(var g=Graphics.FromImage(next)){g.Clear(Color.FromArgb(28,28,28));IntPtr dc=g.GetHdc();try{ok=TransferNative.PrintWindow(source,dc,3);}finally{g.ReleaseHdc(dc);}}
                 if(!ok){next.Dispose();if(prepared){Thread.Sleep(100);continue;}throw new InvalidOperationException("The application does not support PrintWindow presentation");}
                 lock(frameLock){if(frame!=null)frame.Dispose();frame=next;frames++;lastFrame=DateTime.UtcNow;if(!prepared){next.Save(Path.Combine(config.directory,"frame.png"),ImageFormat.Png);prepared=true;}}
-                Thread.Sleep(33);
+                sync.Wait(outputMonitor);
             }
         }catch(Exception ex){error=ex.Message;}
         finally{if(returning&&SourceAlive())TransferNative.Restore(source,config);if(previousDpi!=IntPtr.Zero)PetNative.SetThreadDpiAwarenessContext(previousDpi);if(desktop!=IntPtr.Zero)TransferNative.CloseDesktop(desktop);}

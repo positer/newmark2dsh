@@ -22,6 +22,8 @@ internal static class PetNative {
     [DllImport("gdi32.dll")] internal static extern IntPtr CreateDIBSection(IntPtr dc,ref BitmapInfo info,uint usage,out IntPtr bits,IntPtr section,uint offset);
     [DllImport("winmm.dll")] internal static extern uint timeBeginPeriod(uint period);
     [DllImport("winmm.dll")] internal static extern uint timeEndPeriod(uint period);
+    [DllImport("user32.dll")] internal static extern IntPtr MonitorFromWindow(IntPtr window,uint flags);
+    [DllImport("dwmapi.dll")] internal static extern int DwmFlush();
     internal delegate bool EnumWindow(IntPtr window, IntPtr data);
     [DllImport("user32.dll")] internal static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] internal static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
@@ -68,18 +70,61 @@ internal static class PetNative {
     internal static object Bounds(Rectangle r) { return new { x=r.X, y=r.Y, width=r.Width, height=r.Height }; }
 }
 
-// A single pending UI frame, paced by a monotonic deadline instead of WM_TIMER quantization.
+// DXGI waits on the output containing the window, including mixed-refresh monitors.
+// No producer queue: callers own at most one ready frame and skip missed vblanks.
+internal sealed class PetVBlank : IDisposable {
+    [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct OutputDesc {
+        [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string Name;
+        public PetNative.Rect Bounds;public int Attached,Rotation;public IntPtr Monitor;
+    }
+    [DllImport("dxgi.dll")] static extern int CreateDXGIFactory1(ref Guid iid,out IntPtr factory);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int Enumerate(IntPtr self,uint index,out IntPtr value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int Describe(IntPtr self,out OutputDesc value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int WaitBlank(IntPtr self);
+    IntPtr output,monitor;WaitBlank wait;DateTime retry;
+    internal string Mode="initializing";
+    static Delegate Method(IntPtr value,int slot,Type type){return Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(Marshal.ReadIntPtr(value),slot*IntPtr.Size),type);}
+    void Bind(IntPtr target){
+        Dispose();monitor=target;IntPtr factory=IntPtr.Zero;
+        try{var iid=new Guid("770aae78-f26f-4dba-a829-253c83d1b387");if(CreateDXGIFactory1(ref iid,out factory)<0)return;
+            var adapters=(Enumerate)Method(factory,12,typeof(Enumerate));
+            for(uint a=0;;a++){IntPtr adapter;if(adapters(factory,a,out adapter)<0)break;
+                try{var outputs=(Enumerate)Method(adapter,7,typeof(Enumerate));
+                    for(uint b=0;;b++){IntPtr item;if(outputs(adapter,b,out item)<0)break;bool keep=false;
+                        try{OutputDesc desc;if(((Describe)Method(item,7,typeof(Describe)))(item,out desc)>=0 && desc.Attached!=0 && desc.Monitor==target){output=item;wait=(WaitBlank)Method(item,10,typeof(WaitBlank));keep=true;return;}}
+                        finally{if(!keep)Marshal.Release(item);}
+                    }
+                }finally{Marshal.Release(adapter);}
+            }
+        }finally{if(factory!=IntPtr.Zero)Marshal.Release(factory);}
+    }
+    internal void Wait(IntPtr target){
+        if(target==IntPtr.Zero)target=PetNative.MonitorFromWindow(IntPtr.Zero,1);
+        if(target!=monitor || (output==IntPtr.Zero && DateTime.UtcNow>=retry)){Bind(target);retry=DateTime.UtcNow.AddSeconds(2);}
+        if(output!=IntPtr.Zero && wait(output)>=0){Mode="dxgi-output-vblank";return;}
+        if(output!=IntPtr.Zero){Dispose();retry=DateTime.UtcNow.AddSeconds(2);}
+        var elapsed=Stopwatch.StartNew();int result=PetNative.DwmFlush();Mode=result>=0?"dwm-compositor":"unavailable";
+        // Failure/headless fallback only; successful display pacing has no fixed FPS cap.
+        if(result<0 || elapsed.Elapsed.TotalMilliseconds<1)Thread.Sleep(1);
+    }
+    public void Dispose(){if(output!=IntPtr.Zero){Marshal.Release(output);output=IntPtr.Zero;}wait=null;}
+}
+
+// A single pending UI callback, paced by the target display rather than a 60 Hz timer.
 internal sealed class PetFrameClock : IDisposable {
-    private readonly Control owner;private readonly Action frame;private readonly Stopwatch clock=Stopwatch.StartNew();
-    private System.Threading.Timer timer;private int pending;private double deadline;private volatile bool stopped=true;private bool resolution;
+    private readonly Control owner;private readonly Action frame;
+    private Thread worker;private int pending;private volatile bool stopped=true;private IntPtr monitor;
+    internal long Frames,Skipped;internal string SyncMode="initializing";
     internal PetFrameClock(Control owner,Action frame){this.owner=owner;this.frame=frame;}
-    internal void Start(){if(!stopped)return;stopped=false;deadline=clock.Elapsed.TotalMilliseconds;resolution=PetNative.timeBeginPeriod(1)==0;timer=new System.Threading.Timer(Pulse,null,0,4);}
-    private void Pulse(object state){if(stopped)return;double now=clock.Elapsed.TotalMilliseconds;if(now<deadline || Interlocked.CompareExchange(ref pending,1,0)!=0)return;
-        deadline=Math.Max(deadline+1000.0/60,now);
-        try{owner.BeginInvoke(new Action(delegate{try{if(!stopped&&!owner.IsDisposed)frame();}finally{Interlocked.Exchange(ref pending,0);}}));}
+    internal void Start(){if(!stopped)return;stopped=false;monitor=PetNative.MonitorFromWindow(owner.Handle,2);worker=new Thread(Pulse);worker.IsBackground=true;worker.Name="NewMate display sync";worker.Start();}
+    private void Pulse(){using(var sync=new PetVBlank())while(!stopped){
+        try{sync.Wait(monitor);SyncMode=sync.Mode;}catch(Exception){SyncMode="unavailable";Thread.Sleep(1);}
+        if(stopped)break;if(Interlocked.CompareExchange(ref pending,1,0)!=0){Interlocked.Increment(ref Skipped);continue;}
+        try{owner.BeginInvoke(new Action(delegate{try{if(!stopped&&!owner.IsDisposed){monitor=PetNative.MonitorFromWindow(owner.Handle,2);frame();Frames++;}}finally{Interlocked.Exchange(ref pending,0);}}));}
         catch(InvalidOperationException){Interlocked.Exchange(ref pending,0);}
     }
-    internal void Stop(){if(stopped)return;stopped=true;if(timer!=null){timer.Dispose();timer=null;}if(resolution){PetNative.timeEndPeriod(1);resolution=false;}}
+    }
+    internal void Stop(){stopped=true;if(worker!=null){worker.Join(100);worker=null;}}
     public void Dispose(){Stop();}
 }
 // Reuse the memory DC, premultiplied DIB and Graphics until the canvas dimensions change.
@@ -130,10 +175,10 @@ internal static class DesktopCapture {
         using (var watchdog=new System.Threading.Timer(delegate {
             if (!PetFiles.Alive(parentPid,identity)) Environment.Exit(0);
         }, null, 0, 500)) {
-            while (PetFiles.Alive(parentPid,identity)) {
+            using(var sync=new PetVBlank())while (PetFiles.Alive(parentPid,identity)) {
                 try { Capture(config, parentPid); }
                 catch (Exception ex) { PetFiles.WriteJson(Path.Combine(config.directory,"capture-error.json"), new { error=ex.Message }); }
-                Thread.Sleep(400);
+                sync.Wait(IntPtr.Zero);
             }
         }
     }
@@ -587,8 +632,9 @@ internal sealed class DesktopPet : Form {
         if (nowTime-lastStatus>=250) {
             bool now=PetNative.AnyViewer();
             if (now!=anyExpanded) { anyExpanded=now; Render(); }
-            if(!reveal.Moving)PollCapture(); WriteStatus(); lastStatus=clock.ElapsedMilliseconds;
+            WriteStatus(); lastStatus=clock.ElapsedMilliseconds;
         }
+        PollCapture();
         if (clock.ElapsedMilliseconds-lastRaise>=1000) {
             if (viewer!=null) PetNative.Raise(viewer.Handle);
             PetNative.Raise(Handle); lastRaise=clock.ElapsedMilliseconds;
@@ -620,6 +666,7 @@ internal sealed class DesktopPet : Form {
             viewer_transition=viewer==null ? "hidden" : (reveal.Moving ? (viewerOpening ? "opening" : "closing") : "open"),
             viewer_content_bounds=viewer==null ? null : PetNative.Bounds(viewer.ContentBounds),
             viewer_presented_frames=viewer==null ? 0 : viewer.PresentedFrames,
+            display_sync=timer.SyncMode, animation_ticks=timer.Frames, skipped_vblanks=timer.Skipped,
             viewer_progress=reveal.Value, viewer_scale=viewer==null ? 0 : viewer.Scale,
             pet_scale_x=stretchX.Value, pet_scale_y=stretchY.Value, size_multiplier=sizeMultiplier,
             paint_bounds=new { x=(Width-body.Width*stretchX.Value)/2, y=Height-padding-body.Height*stretchY.Value, width=body.Width*stretchX.Value, height=body.Height*stretchY.Value },

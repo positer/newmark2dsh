@@ -17,3 +17,7 @@ Never claim HWND-thread migration: receipts expose original identity and present
 ## Process transfer presentation
 
 Process push/pull flights follow source-window z-order and the live expanded-preview layer without forcing a collapse or unconditional topmost activation. Native animation receipts expose layer, preview_expanded and topmost. Empty virtual desktops use pure black; no fixture application is launched by default.
+
+## 0.2.30 display pacing and Linux
+
+`components/computeruse/lib/linux-desktop.js` launches the isolated X11 host; `linux-desktop.py` owns leases, authenticated Xvfb, mappings, GPU presentation and independent capture. `linux-process-guard.py` guards virtual process lifetime. Windows `desktop-pet.cs` and `desktop-transfer.cs` use output vblank pacing with bounded pending frames. Preserve input isolation and original process identity; distinguish render callbacks from physical scanout.
