@@ -5935,8 +5935,8 @@ async function processTransferAction(action,options){
   const existing=findDesktopTransfer(options);
   if(existing&&existing.status.side===side)return failure(action,'already_on_target_desktop','The selected presentation is already on the requested side.',{transfer:transferReport(existing)});
   if(existing&&existing.status.side==='virtual'&&existing.config.ownerId!==ownerId)return failure(action,'transfer_owned_by_another_session','The virtual presentation belongs to another session.');
-  if(!existing&&!options.windowHandle&&!options.processId&&!options.appTarget)return failure(action,'transfer_target_required','Specify window_handle, process_id, app_target or an existing transfer_id.');
   if(options.transferId&&!existing)return failure(action,'transfer_not_found','No live presentation matches transfer_id.');
+  if(!existing&&!options.windowHandle&&!options.processId&&!options.appTarget)return failure(action,'transfer_target_required','Specify window_handle, process_id, app_target or an existing transfer_id.');
   let config;
   if(existing){
     config={...existing.config,ownerId,side,targetDesktop:push?'Default':route.desktopName,jobSourcePid:existing.status.job_handle!=='0x0'?existing.status.pid:0,jobSourceStart:existing.status.start,jobHandle:existing.status.job_handle};

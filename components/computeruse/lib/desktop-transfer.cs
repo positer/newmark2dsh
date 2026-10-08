@@ -48,18 +48,47 @@ internal static class TransferNative {
     [DllImport("user32.dll",EntryPoint="SetWindowLongPtrW",SetLastError=true)] static extern IntPtr SetWindowLongPtr(IntPtr hwnd,int index,IntPtr value);
     [DllImport("user32.dll",SetLastError=true)] static extern bool SetWindowPos(IntPtr hwnd,IntPtr after,int x,int y,int width,int height,uint flags);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr RemoveProp(IntPtr hwnd,string key);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr GetProp(IntPtr hwnd,string key);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool SetLayeredWindowAttributes(IntPtr hwnd,uint key,byte alpha,uint flags);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool GetLayeredWindowAttributes(IntPtr hwnd,out uint key,out byte alpha,out uint flags);
     internal static void Conceal(IntPtr hwnd,TransferConfig c){
         if(c.sourceDesktop=="Default"){
             IntPtr dpi=PetNative.SetThreadDpiAwarenessContext(new IntPtr(-4));
-            try{SetWindowLongPtr(hwnd,-20,new IntPtr((c.sourceStyle|0x80)&~0x40000L));if(!SetWindowPos(hwnd,IntPtr.Zero,-16000,-16000,0,0,0x35))throw new InvalidOperationException("Cannot park original window: "+Marshal.GetLastWin32Error());}
+            try{
+                // Parking a Chromium window off-screen suspends its compositor;
+                // PrintWindow can then succeed while returning the old page.
+                // Keep its geometry on the display with zero alpha and no input
+                // hit target. A transparent topmost source does not occlude the
+                // user's desktop, but remains renderable without restarting it.
+                if((c.sourceStyle&0x80000)!=0 && GetProp(hwnd,"Newmark2DSH.TransferLayerFlags")==IntPtr.Zero){
+                    uint key,flags;byte alpha;
+                    if(!GetLayeredWindowAttributes(hwnd,out key,out alpha,out flags))throw new InvalidOperationException("Cannot preserve the source window transparency");
+                    PetNative.SetProp(hwnd,"Newmark2DSH.TransferLayerKey",new IntPtr((long)key+1));
+                    PetNative.SetProp(hwnd,"Newmark2DSH.TransferLayerAlpha",new IntPtr(alpha+1));
+                    PetNative.SetProp(hwnd,"Newmark2DSH.TransferLayerFlags",new IntPtr(flags+1));
+                }
+                SetWindowLongPtr(hwnd,-20,new IntPtr((c.sourceStyle|0x80000|0x20|0x80|0x8000000)&~0x40000L));
+                if(!SetLayeredWindowAttributes(hwnd,0,0,2)||!SetWindowPos(hwnd,new IntPtr(-1),c.sourceX,c.sourceY,0,0,0x31))throw new InvalidOperationException("Cannot conceal original window: "+Marshal.GetLastWin32Error());
+            }
             finally{PetNative.SetThreadDpiAwarenessContext(dpi);}
         }
         if(!PetNative.SetProp(hwnd,"Newmark2DSH.TransferSource",new IntPtr(1)))throw new InvalidOperationException("Cannot mark original window for presentation");
     }
     internal static void Restore(IntPtr hwnd,TransferConfig c){
         RemoveProp(hwnd,"Newmark2DSH.TransferSource");
-        if(c.sourceDesktop=="Default"){IntPtr dpi=PetNative.SetThreadDpiAwarenessContext(new IntPtr(-4));try{SetWindowLongPtr(hwnd,-20,new IntPtr(c.sourceStyle));SetWindowPos(hwnd,IntPtr.Zero,c.sourceX,c.sourceY,0,0,0x35);}finally{PetNative.SetThreadDpiAwarenessContext(dpi);}}
+        if(c.sourceDesktop=="Default"){IntPtr dpi=PetNative.SetThreadDpiAwarenessContext(new IntPtr(-4));try{
+            SetWindowLongPtr(hwnd,-20,new IntPtr(c.sourceStyle));
+            IntPtr flags=RemoveProp(hwnd,"Newmark2DSH.TransferLayerFlags"),key=RemoveProp(hwnd,"Newmark2DSH.TransferLayerKey"),alpha=RemoveProp(hwnd,"Newmark2DSH.TransferLayerAlpha");
+            if(flags!=IntPtr.Zero)SetLayeredWindowAttributes(hwnd,(uint)(key.ToInt64()-1),(byte)(alpha.ToInt64()-1),(uint)(flags.ToInt64()-1));
+            SetWindowPos(hwnd,new IntPtr((c.sourceStyle&8)!=0?-1:-2),c.sourceX,c.sourceY,0,0,0x31);
+        }finally{PetNative.SetThreadDpiAwarenessContext(dpi);}}
         ShowWindow(hwnd,4);
+    }
+    internal static void KeepSourceRendering(IntPtr hwnd){
+        // A newly opened preview (or another topmost window) must not occlude
+        // the invisible source and throttle Chromium again. No activation,
+        // geometry change, or visible surface is involved.
+        if(GetWindow(hwnd,3)!=IntPtr.Zero)SetWindowPos(hwnd,new IntPtr(-1),0,0,0,0,0x13);
     }
     [DllImport("user32.dll")] internal static extern bool PostMessage(IntPtr hwnd,uint message,IntPtr wp,IntPtr lp);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] internal static extern int GetClassName(IntPtr hwnd,StringBuilder text,int length);
@@ -117,7 +146,7 @@ internal sealed class TransferBroker : Form {
     readonly System.Threading.Timer controlTimer;int controlPending;
     IntPtr outputMonitor;
     Bitmap frame;Thread worker;volatile bool stopping,prepared,concealed;bool active,returning,sourceGone,allowClose;
-    IntPtr focused;string state="starting",error="",lastCommand="";long frames,painted;DateTime lastFrame,lastStatus;
+    IntPtr focused;string state="starting",error="",lastCommand="";long frames,painted;DateTime lastFrame,lastStatus,lastVisibility;
     internal TransferBroker(TransferConfig c,IntPtr job){
         config=c;this.job=job;source=TransferNative.Handle(c.sourceHandle);focused=source;
         timer=new PetFrameClock(this,delegate{outputMonitor=PetNative.MonitorFromWindow(Handle,2);if(active)Invalidate();});
@@ -144,6 +173,7 @@ internal sealed class TransferBroker : Form {
             using(var sync=new PetVBlank())while(!stopping){
                 Action action;while(commands.TryDequeue(out action))action();
                 if(!SourceAlive()){sourceGone=true;break;}
+                if(concealed&&!returning&&config.sourceDesktop=="Default"&&(DateTime.UtcNow-lastVisibility).TotalMilliseconds>=100){TransferNative.KeepSourceRendering(source);lastVisibility=DateTime.UtcNow;}
                 TransferNative.Rect rect;if(!TransferNative.GetClientRect(source,out rect))throw new InvalidOperationException("Cannot read original client bounds");
                 int width=rect.R-rect.L,height=rect.B-rect.T;if(width<1||height<1||width>8192||height>8192)throw new InvalidOperationException("Unsupported source dimensions");
                 var next=new Bitmap(width,height,PixelFormat.Format32bppArgb);bool ok;
@@ -280,6 +310,7 @@ internal sealed class TransferAnimation : Form {
 
 internal static class TransferProgram {
     [MTAThread] static int Main(string[] args){
+        if(args.Length==2&&args[0]=="--identity"){try{Console.Write(TransferNative.Start(Int32.Parse(args[1])));return 0;}catch{return 1;}}
         if(args.Length!=2)return 2;var c=PetFiles.Json.Deserialize<TransferConfig>(File.ReadAllText(args[1]));
         try{
             PetNative.SetProcessDpiAwarenessContext(new IntPtr(-4));

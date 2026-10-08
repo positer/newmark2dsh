@@ -263,7 +263,8 @@ internal sealed class DesktopViewer : Form {
     private readonly PetConfig config;
     private readonly Microsoft.Web.WebView2.WinForms.WebView2 web=new Microsoft.Web.WebView2.WinForms.WebView2();
     private bool closed,busy,dirty;private double progress;private string frameSource="";private Bitmap frame;
-    internal bool Ready;internal long PresentedFrames;internal bool HasFrame;
+    internal bool Ready,Primed;private int presentation;internal long PresentedFrames;internal bool HasFrame;
+    internal double InitialScale=.08;
     internal string Message="正在加载虚拟桌面…";
     internal Action Collapse;
     internal Rectangle FullBounds,ContentBounds;
@@ -287,7 +288,7 @@ internal sealed class DesktopViewer : Form {
             core.Settings.AreDefaultContextMenusEnabled=false;core.Settings.AreDevToolsEnabled=false;core.Settings.AreBrowserAcceleratorKeysEnabled=false;core.Settings.IsZoomControlEnabled=false;core.Settings.IsStatusBarEnabled=false;
             core.PermissionRequested+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2PermissionRequestedEventArgs e){e.State=Microsoft.Web.WebView2.Core.CoreWebView2PermissionState.Deny;};
             core.NewWindowRequested+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2NewWindowRequestedEventArgs e){e.Handled=true;};
-            core.WebMessageReceived+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2WebMessageReceivedEventArgs e){string value=e.TryGetWebMessageAsString();if(value=="ready"){Ready=true;Submit();web.Focus();}else if(value=="close")Collapse();else if(value=="frame")PresentedFrames++;};
+            core.WebMessageReceived+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2WebMessageReceivedEventArgs e){string value=e.TryGetWebMessageAsString();if(value=="ready"){Ready=true;Submit();web.Focus();}else if(value=="close")Collapse();else if(value.StartsWith("frame:")){PresentedFrames++;if(value=="frame:"+presentation+":0"){Primed=true;Opacity=1;}}};
             string file=Path.Combine(config.directory,"viewer.html");File.WriteAllText(file,ViewerHtml,Encoding.UTF8);string uri=new Uri(file).AbsoluteUri;
             core.NavigationStarting+=delegate(object sender,Microsoft.Web.WebView2.Core.CoreWebView2NavigationStartingEventArgs e){if(e.Uri!=uri)e.Cancel=true;};
             core.Navigate(uri);
@@ -295,23 +296,25 @@ internal sealed class DesktopViewer : Form {
     }
     internal void SetFrameFile(string file,DateTime stamp){HasFrame=true;frameSource=new Uri(file).AbsoluteUri+"?v="+stamp.Ticks;Submit();}
     internal void ClearFrame(){HasFrame=false;frameSource="";Submit();}
+    internal void BeginPresentation(){presentation++;Primed=false;Opacity=0;SetProgress(0);}
     internal void SetProgress(double value){
-        progress=Math.Max(0,Math.Min(1,value));Scale=Math.Exp(Math.Log(.08)*(1-progress));
+        progress=Math.Max(0,Math.Min(1,value));Scale=Math.Exp(Math.Log(InitialScale)*(1-progress));
         int w=Math.Max(1,(int)Math.Round(FullBounds.Width*Scale)),h=Math.Max(1,(int)Math.Round(FullBounds.Height*Scale));
-        double cx=Anchor.X+(FullBounds.Left+FullBounds.Width/2.0-Anchor.X)*progress,cy=Anchor.Y+(FullBounds.Top+FullBounds.Height/2.0-Anchor.Y)*progress;
+        double travel=(Scale-InitialScale)/(1-InitialScale);
+        double cx=Anchor.X+(FullBounds.Left+FullBounds.Width/2.0-Anchor.X)*travel,cy=Anchor.Y+(FullBounds.Top+FullBounds.Height/2.0-Anchor.Y)*travel;
         ContentBounds=progress>=1?FullBounds:new Rectangle((int)Math.Round(cx-w/2),(int)Math.Round(cy-h/2),w,h);
         if(Bounds!=FullBounds)Bounds=FullBounds;Submit();
     }
     private async void Submit(){
         dirty=true;if(!Ready||busy||closed)return;busy=true;
-        try{while(dirty&&!closed){dirty=false;var state=new{progress=progress,x=Anchor.X-FullBounds.Left,y=Anchor.Y-FullBounds.Top,width=FullBounds.Width,height=FullBounds.Height,src=frameSource,message=Message};await web.CoreWebView2.ExecuteScriptAsync("window.updateNewMate("+PetFiles.Json.Serialize(state)+")");}}
+        try{while(dirty&&!closed){dirty=false;var state=new{progress=progress,initialScale=InitialScale,presentation=presentation,x=Anchor.X-FullBounds.Left,y=Anchor.Y-FullBounds.Top,width=FullBounds.Width,height=FullBounds.Height,src=frameSource,message=Message};await web.CoreWebView2.ExecuteScriptAsync("window.updateNewMate("+PetFiles.Json.Serialize(state)+")");}}
         catch(Exception ex){if(!closed)Message=ex.Message;}finally{busy=false;}
     }
     private const string ViewerHtml=@"<!doctype html><meta charset='utf-8'><meta http-equiv='Content-Security-Policy' content=""default-src 'none'; img-src data: file:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'""><style>
-    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;user-select:none}#surface{position:absolute;inset:0;background:#000;transform-origin:0 0;will-change:transform,opacity;overflow:hidden}img{position:absolute;width:100%;height:100%;object-fit:contain}#caption{position:absolute;top:12px;left:12px;padding:8px 12px;background:#000e;color:white;font:14px 'Microsoft YaHei UI',sans-serif;border-radius:8px}#caption:empty{display:none}
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;user-select:none}#surface{position:absolute;inset:0;opacity:0;background:#000;transform-origin:0 0;will-change:transform,opacity;overflow:hidden}img{position:absolute;width:100%;height:100%;object-fit:contain}#caption{position:absolute;top:12px;left:12px;padding:8px 12px;background:#000e;color:white;font:14px 'Microsoft YaHei UI',sans-serif;border-radius:8px}#caption:empty{display:none}
     </style><div id='surface'><img id='frame'><div id='caption'></div></div><script>
     const surface=document.getElementById('surface'),picture=document.getElementById('frame'),caption=document.getElementById('caption');let latest,scheduled=false,src='';
-    window.updateNewMate=state=>{latest=state;if(scheduled)return;scheduled=true;requestAnimationFrame(()=>{scheduled=false;const s=latest,p=s.progress,k=Math.exp(Math.log(.08)*(1-p)),x=s.x*innerWidth/s.width,y=s.y*innerHeight/s.height,cx=x+(innerWidth/2-x)*p,cy=y+(innerHeight/2-y)*p;surface.style.transform='translate3d('+(cx-innerWidth*k/2)+'px,'+(cy-innerHeight*k/2)+'px,0) scale('+k+')';surface.style.opacity=Math.min(1,p*1.6);caption.textContent=s.message||'';if(s.src!==src){src=s.src;picture.src=src;picture.style.display=src?'block':'none';}window.chrome.webview.postMessage('frame');});};
+    window.updateNewMate=state=>{latest=state;if(scheduled)return;scheduled=true;requestAnimationFrame(()=>{scheduled=false;const s=latest,p=s.progress,k=Math.exp(Math.log(s.initialScale)*(1-p)),t=(k-s.initialScale)/(1-s.initialScale),x=s.x*innerWidth/s.width,y=s.y*innerHeight/s.height,cx=x+(innerWidth/2-x)*t,cy=y+(innerHeight/2-y)*t;surface.style.transform='translate3d('+(cx-innerWidth*k/2)+'px,'+(cy-innerHeight*k/2)+'px,0) scale('+k+')';surface.style.opacity=Math.min(1,p*8);caption.textContent=s.message||'';if(s.src!==src){src=s.src;picture.src=src;picture.style.display=src?'block':'none';}window.chrome.webview.postMessage('frame:'+s.presentation+':'+p);});};
     document.addEventListener('keydown',e=>{e.preventDefault();e.stopPropagation();if(e.key==='Escape'||(e.altKey&&e.key==='F4'))window.chrome.webview.postMessage('close');},true);document.addEventListener('contextmenu',e=>e.preventDefault());window.chrome.webview.postMessage('ready');
     </script>";
     protected override void Dispose(bool disposing){closed=true;if(disposing){if(frame!=null)frame.Dispose();web.Dispose();}base.Dispose(disposing);}
@@ -534,7 +537,8 @@ internal sealed class DesktopPet : Form {
         viewer.FullBounds=Screen.FromRectangle(Bounds).Bounds;
         viewer.Anchor=new Point(Left+Width/2,Top+Height-padding-body.Height/2);
         reveal.Value=reveal.Velocity=0; reveal.Target=1; viewerOpening=true;
-        viewer.SetProgress(0);
+        viewer.InitialScale=Math.Max(.01,Math.Min(.8,body.Width/(double)viewer.FullBounds.Width));
+        viewer.BeginPresentation();
         if(!reused)viewer.FormClosing+=delegate(object sender, FormClosingEventArgs e) { if (expanded) { e.Cancel=true; Collapse(); } };
         expanded=true; anyExpanded=true; lastFrame=DateTime.MinValue; frameCount=0; captureError="";
         // The pet is owned by the viewer, so it remains above it even on activation.
@@ -623,7 +627,7 @@ internal sealed class DesktopPet : Form {
             trimCanvas=false; KeepVisible(); Render();
         }
         if (viewer!=null) {
-            if (viewer.Ready && reveal.Moving) { reveal.Step(dt,22,1); viewer.SetProgress(reveal.Value); }
+            if (viewer.Ready && viewer.Primed && reveal.Moving) { reveal.Step(dt,22,1); viewer.SetProgress(reveal.Value); }
             if (!viewerOpening && !reveal.Moving) FinishCollapse();
         }
         bool moving=stretchX.Moving || stretchY.Moving || (viewer!=null && reveal.Moving) || exitStarted>=0;

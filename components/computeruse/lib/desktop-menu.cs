@@ -31,7 +31,10 @@ internal sealed class DshPetMenu : Form {
     internal DshPetMenu(PetConfig config,Action<double> choose,Action changed,Action<Point> failed) {
         this.config=config; this.choose=choose; this.changed=changed;this.failed=failed;
         Text="NewMate · DSH 菜单"; FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false; TopMost=true;
-        StartPosition=FormStartPosition.Manual; BackColor=Color.Magenta; TransparencyKey=Color.Magenta;
+        // A color-keyed parent makes WebView2's separately composed pixels
+        // click-through. The rounded native Region clips the menu; its interior
+        // must remain an ordinary hit-testable HWND, including the slider track.
+        StartPosition=FormStartPosition.Manual; BackColor=SystemColors.Window;
         Size=new Size(420,420); Opacity=0;
         web.Dock=DockStyle.Fill; web.DefaultBackgroundColor=Color.Transparent;
         web.CreationProperties=new CoreWebView2CreationProperties { UserDataFolder=config.menuCachePath };
@@ -119,7 +122,7 @@ internal sealed class DshPetMenu : Form {
         try { await web.CoreWebView2.ExecuteScriptAsync("window.newmateSetScale("+value.ToString(System.Globalization.CultureInfo.InvariantCulture)+")"); }
         catch(Exception ex){Error=ex.Message;}
     }
-    internal void Dismiss() {loading=false;Hide();changed();}
+    internal void Dismiss() {if(closed)return;loading=false;Hide();changed();}
     protected override void Dispose(bool disposing) {
         closed=true;
         if(disposing){timer.Stop();timer.Dispose();web.Dispose();}

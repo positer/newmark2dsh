@@ -74,8 +74,14 @@ export function desktopPetContract() {
 }
 
 export async function prepareDesktopPetTransfer(direction) {
+  // takeover_start returns while the indicator is being created. An immediate
+  // pull/push must wait for that same startup, not race its first position file.
+  if(starting)await starting.promise;
   if(!record)throw new Error('Virtual takeover must start NewMate before transferring a window');
-  const state=desktopPetState();
+  const current=record;
+  let state=desktopPetState();
+  for(let i=0;i<20&&!state.window&&record===current;i++){await sleep(25);state=desktopPetState();}
+  if(record!==current)throw new Error('Virtual takeover ended before transfer animation');
   if(!state.window)throw new Error('NewMate has not published its position');
   fs.writeFileSync(path.join(record.directory,'transfer-motion'),direction==='in'?'in':'out');
   const b=state.window.bounds,p=state.window.paint_bounds;
