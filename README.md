@@ -2,13 +2,13 @@
 
 **Newmark capabilities inside DeepSeek Harness.** One self-contained plugin bundle provides persistent memory, desktop automation, an Agent API, and Dev/rDev presets over the shared `~/.Newmark` user store.
 
-## Current release: 0.2.35
+## Current release: 0.2.36
 
-The Newmark Core configuration page includes an **Update to latest** button. It discovers official npm latest and asks the official DSH manager to install that exact archive, verifies the installed bundle version, and prompts a full restart. MemoryLab, ComputerUse, and Agent API update together through Core.
+The bottom of the configuration section includes a responsive Newmark Core **Update to latest** card. It discovers official npm latest and asks the official DSH manager to install that exact archive, verifies the installed bundle version, and prompts a full restart. MemoryLab, ComputerUse, and Agent API update together through Core.
 
 MemoryLab reads a current, read-only host snapshot on first open, including after hot installation into an already-open shell. The release workflow verifies the official npm latest tag and rejects backwards publication. Official DSH pnpm release-age selection can still install an older version from a bare package name; this host-side limitation is not fixed by this release.
 
-Display-paced NewMate rendering on Windows; GPU-accelerated read-only previews and authenticated isolated X11 desktops on Linux/WSLg. Original processes survive supported window mappings. See [release details and platform limits](CHANGELOG-0.2.35.md).
+Display-paced NewMate rendering on Windows; GPU-accelerated read-only previews and authenticated isolated X11 desktops on Linux/WSLg. Original processes survive supported window mappings. See [release details and platform limits](CHANGELOG-0.2.36.md).
 
 Linux dependencies: `xvfb xauth openbox xdotool wmctrl python3-xlib python3-pil python3-pyqt5`. Native Wayland control, DSH CSS menus on Linux, and Windows-equivalent Linux flight effects are not supported.
 

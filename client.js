@@ -2166,6 +2166,12 @@ function readPageGlobals() {
     .nmc-config-category { font-size:11px; color:var(--dsw-alias-label-tertiary); letter-spacing:.06em; }
     .nmc-config-card .nmc-config-subhead { margin:0; font-size:16px; font-weight:600; line-height:1.5; color:var(--dsw-alias-label-primary); }
     .nmc-config-description { margin:0; font-size:12px; line-height:1.7; color:var(--dsw-alias-label-secondary); }
+    .nmc-update-card { margin-top:4px; }
+    .nmc-update-header { display:flex; align-items:center; justify-content:space-between; gap:24px; flex-wrap:wrap; }
+    .nmc-update-title { display:grid; gap:7px; min-width:0; flex:1 1 230px; }
+    .nmc-update-button { min-height:38px; padding:8px 18px; border-radius:10px; white-space:nowrap; flex:0 0 auto; }
+    .nmc-update-status { margin:0; overflow-wrap:anywhere; }
+    @media(max-width:480px) { .nmc-update-button { width:100%; } .nmc-update-header { gap:16px; } }
     .nmc-config-section-heading { display:grid; gap:6px; margin-bottom:4px; }
     .nmc-config-section-heading .nmc-config-head { margin:0; font-size:16px; }
     .nmc-config-card .nmc-config-model { padding:0; border:0; background:transparent; gap:12px; }
@@ -2301,11 +2307,25 @@ function readPageGlobals() {
               if (!manager) throw new Error('当前宿主的插件管理服务尚未就绪');
               setUpdateMessage('正在查询 npm 官方最新版本…');
               const response = await fetch('/newmark-core/update', { cache: 'no-store', credentials: 'same-origin' });
-              const latest = await response.json();
+              if (response.status === 404 || response.status === 405) throw new Error('当前宿主尚未加载更新接口，请完全退出并重启 DSH');
+              if (response.status === 401 || response.status === 403) throw new Error('当前页面认证已失效，请重新打开 DSH 插件配置页');
+              const body = await response.text();
+              if (!body.trim()) throw new Error(`更新接口返回空响应（HTTP ${response.status}），请完全重启 DSH 后重试`);
+              let latest;
+              try { latest = JSON.parse(body); }
+              catch { throw new Error(`更新接口返回非 JSON 响应（HTTP ${response.status}），请完全重启 DSH 后重试`); }
               if (!response.ok || !latest.ok) throw new Error(latest.error || '无法查询最新版');
               const installed = await manager.listBundles();
               if (!installed.ok) throw new Error(installed.error?.message || '无法读取已安装版本');
-              if (installed.value.find(bundle => bundle.name === 'newmark2dsh')?.version === latest.latest) {
+              const currentVersion = installed.value.find(bundle => bundle.name === 'newmark2dsh')?.version;
+              if (/^\d+\.\d+\.\d+$/.test(currentVersion || '')) {
+                const currentParts = currentVersion.split('.').map(Number), nextParts = latest.latest.split('.').map(Number);
+                const different = currentParts.findIndex((part, index) => part !== nextParts[index]);
+                if (different >= 0 && currentParts[different] > nextParts[different]) {
+                  setUpdateMessage(`已安装 ${currentVersion}，官方 latest 暂为 ${latest.latest}；未执行降级。`); return;
+                }
+              }
+              if (currentVersion === latest.latest) {
                 setUpdateMessage(`已安装最新版本 ${latest.latest}；若刚完成更新，请完全重启 DSH。`); return;
               }
               setUpdateMessage(`正在更新 Newmark Core 至 ${latest.latest}…`);
@@ -2560,11 +2580,6 @@ function readPageGlobals() {
             h('style', null, CONFIG_CSS+NEWMATE_SLIDER_CSS),
             h('section',{className:'nmc-config-section','aria-label':'组件'},
             h('h3', { className: 'nmc-config-head' }, '组件'),
-            h('div', { className: 'nmc-config-card', 'data-newmark-core-update': '' },
-              h('h4', { className: 'nmc-config-subhead' }, 'Newmark Core 更新'),
-              h('p', { className: 'nmc-config-description' }, 'MemoryLab、ComputerUse 和 Agent API 依托 Core 安装，无需分别更新。'),
-              h('button', { type: 'button', className: 'nmc-config-switch', disabled: updateBusy, onClick: updateCore }, updateBusy ? '正在更新…' : '更新到最新版本'),
-              h('p', { className: 'nmc-config-description', role: 'status', 'aria-live': 'polite' }, updateMessage)),
             h(
               'ul',
               { className: 'nmc-config-list' },
@@ -2796,6 +2811,14 @@ function readPageGlobals() {
             h('div',{className:petError?'nmc-config-model-warn':'nmc-config-footnote',role:petError?'alert':undefined},petError || '默认 100% · 自动保存，启动时恢复上次大小'),
             ),
             ),
+            h('section', { className: 'nmc-config-card nmc-update-card', 'data-newmark-core-update': '', 'aria-label': '插件更新' },
+              h('div', { className: 'nmc-update-header' },
+                h('div', { className: 'nmc-update-title' },
+                  h('span', { className: 'nmc-config-category' }, '版本管理'),
+                  h('h4', { className: 'nmc-config-subhead' }, 'Newmark Core'),
+                  h('p', { className: 'nmc-config-description' }, '统一更新 MemoryLab、ComputerUse 与 Agent API。')),
+                h('button', { type: 'button', className: 'nmc-config-switch nmc-update-button', disabled: updateBusy, onClick: updateCore }, updateBusy ? '正在更新…' : '更新到最新版本')),
+              h('p', { className: 'nmc-config-footnote nmc-update-status', role: 'status', 'aria-live': 'polite', 'aria-busy': updateBusy }, updateMessage)),
             ),
           );
         }
