@@ -2166,11 +2166,11 @@ function readPageGlobals() {
     .nmc-config-category { font-size:11px; color:var(--dsw-alias-label-tertiary); letter-spacing:.06em; }
     .nmc-config-card .nmc-config-subhead { margin:0; font-size:16px; font-weight:600; line-height:1.5; color:var(--dsw-alias-label-primary); }
     .nmc-config-description { margin:0; font-size:12px; line-height:1.7; color:var(--dsw-alias-label-secondary); }
-    .nmc-update-card { margin-top:4px; }
+    .nmc-config-card.nmc-update-card { margin-top:4px; padding:20px 0 0; border:0; border-radius:0; background:transparent; }
     .nmc-update-header { display:flex; align-items:center; justify-content:space-between; gap:24px; flex-wrap:wrap; }
     .nmc-update-title { display:grid; gap:7px; min-width:0; flex:1 1 230px; }
     .nmc-update-button { min-height:38px; padding:8px 18px; border-radius:10px; white-space:nowrap; flex:0 0 auto; }
-    .nmc-update-status { margin:0; overflow-wrap:anywhere; }
+    .nmc-config-footnote.nmc-update-status { margin:0; padding-top:4px; border:0; overflow-wrap:anywhere; }
     @media(max-width:480px) { .nmc-update-button { width:100%; } .nmc-update-header { gap:16px; } }
     .nmc-config-section-heading { display:grid; gap:6px; margin-bottom:4px; }
     .nmc-config-section-heading .nmc-config-head { margin:0; font-size:16px; }
