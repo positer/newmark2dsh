@@ -2108,20 +2108,30 @@ function readPageGlobals() {
         ctx.effect(() => {
           if(typeof document==='undefined' || typeof document.createElement!=='function' || window.__NEWMARK_CORE__?.platform!=='win32') return ()=>{};
           let disposed=false, stop=()=>{}, activeToken='', polling=false;
-          const connect=async()=>{
+          const connect=async(initial)=>{
             if(disposed||polling) return;polling=true;
             try {
-              const response=await fetch('/newmark-computeruse/menu-theme',{credentials:'same-origin'});
-              if(!response.ok){stop();stop=()=>{};activeToken='';return;}
-              const connection=await response.json();if(disposed||connection.token===activeToken)return;
+              let connection=initial;
+              if(!connection){
+                const response=await fetch('/newmark-computeruse/menu-theme',{credentials:'same-origin'});
+                if(!response.ok){stop();stop=()=>{};activeToken='';return;}
+                connection=await response.json();
+              }
+              if(disposed||connection.token===activeToken)return;
               const module=await import(connection.client);if(disposed)return;
               stop();stop=module.startDshMenuThemeBridge({React,createRoot:require('react-dom/client').createRoot,
                 Menu:require('@deepseek-ai/dsh-client-ui-primitives').Menu,connection,renderSlider:NewMateSizeControl,sliderCss:NEWMATE_SLIDER_CSS});activeToken=connection.token;
             } catch(error) { if(!disposed) console.warn('NewMate menu bridge:',error.message); }
             finally {polling=false;}
           };
-          const timer=setInterval(connect,5000);connect();
-          return ()=>{disposed=true;clearInterval(timer);stop();};
+          // Give the DSH shell its first paint before mounting the hidden menu.
+          // The injected connection is already authenticated by the served page.
+          const initial=window.__NEWMARK_COMPUTERUSE__?.menuTheme;
+          const idle=typeof window.requestIdleCallback==='function'
+            ? window.requestIdleCallback(()=>connect(initial),{timeout:1500})
+            : setTimeout(()=>connect(initial),250);
+          const timer=setInterval(()=>connect(),5000);
+          return ()=>{disposed=true;clearInterval(timer);if(typeof window.cancelIdleCallback==='function')window.cancelIdleCallback(idle);else clearTimeout(idle);stop();};
         }, 'newmate-dsh-menu-theme');
         // The two component switches, read from the same injected snapshot the
         // panel reads. The injection lands in <head> before the plugin loader

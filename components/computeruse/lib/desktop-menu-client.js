@@ -5,6 +5,8 @@ export function startDshMenuThemeBridge({React, createRoot, Menu, connection, re
   if (!connection || !Menu) return () => {};
   let disposed=false, busy=false, timer, last='', captured=null;
   const resources=new Map();
+  const processedSheets=new WeakMap();
+  const yieldToShell=()=>new Promise(resolve=>setTimeout(resolve,0));
   const sliderStyle=document.createElement('style');sliderStyle.textContent=sliderCss;document.head.append(sliderStyle);
   const attrs = element => Object.fromEntries([...element.attributes].filter(a => /^(class|style|lang|dir|data-[a-z0-9_-]+)$/.test(a.name)).map(a=>[a.name,a.value]));
   const tick = () => new Promise(resolve => setTimeout(resolve,30));
@@ -53,14 +55,26 @@ export function startDshMenuThemeBridge({React, createRoot, Menu, connection, re
       }
       else parts.push(rule.cssText);
     }
-    return inlineUrls(parts.join('\n'),sheet.href||document.baseURI);
+    const raw=parts.join('\n'), base=sheet.href||document.baseURI;
+    const cached=processedSheets.get(sheet);
+    if(cached?.raw===raw && cached.base===base) return cached.text;
+    const text=await inlineUrls(raw,base);
+    processedSheets.set(sheet,{raw,base,text});
+    return text;
   }
   async function sync() {
     if(disposed||busy) return; busy=true;
     try {
       if(!captured) captured=await captureMenu();
       const sheets=[...document.styleSheets,...(document.adoptedStyleSheets||[])];
-      const css=(await Promise.all(sheets.map(sheetText))).join('\n');
+      const chunks=[];
+      let sliceStart=performance.now();
+      for(const sheet of sheets) {
+        if(disposed)return;
+        chunks.push(await sheetText(sheet));
+        if(performance.now()-sliceStart>=4){await yieldToShell();sliceStart=performance.now();}
+      }
+      const css=chunks.join('\n');
       const bodyAttributes=attrs(document.body);
       // Include inherited resolved custom properties, including plugins' CSSOM token changes.
       const computed=getComputedStyle(document.body); let inherited='';

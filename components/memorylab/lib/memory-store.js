@@ -846,9 +846,15 @@ export class MemoryLabStore {
       };
     }
     try {
+      // Read the disk every time: external edits (even same-size/timestamp edits)
+      // must be visible. Only reuse normalization of exactly the same document.
+      if (this.normalizedReadCache?.raw === raw) return structuredClone(this.normalizedReadCache.result);
       const parsed = JSON.parse(raw);
       const { index, warnings: normalizeWarnings } = this.normalizeIndex(parsed);
-      return { ok: true, status: 'ok', index, warnings: [...warnings, ...normalizeWarnings] };
+      const result = { ok: true, status: 'ok', index, warnings: [...warnings, ...normalizeWarnings] };
+      // Never expose the cached mutable graph to callers or write operations.
+      this.normalizedReadCache = { raw, result: structuredClone(result) };
+      return result;
     } catch (error) {
       warnings.push(`index-unreadable:${error && error.code ? error.code : 'MALFORMED_JSON'}`);
     }
