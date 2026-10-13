@@ -1,3 +1,4 @@
+import ImageIO
 @MainActor final class ScaleProbeWindow:NSWindow {
     var probeScale:CGFloat=1
     override var backingScaleFactor:CGFloat{probeScale}
