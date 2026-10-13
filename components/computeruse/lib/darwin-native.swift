@@ -9,7 +9,17 @@ import Darwin
 struct CuFailure: Error { let code: String; let message: String }
 final class CuBorder: NSView {
     var phase=0.0
-    override func draw(_ dirtyRect: NSRect) { for band in 0..<4{NSColor(white:(1-cos(phase+Double(band)*Double.pi/2))/2,alpha:1).setStroke();let line=NSBezierPath(rect:bounds.insetBy(dx:Double(band)+0.5,dy:Double(band)+0.5));line.lineWidth=1;line.stroke()} }
+    override func draw(_ dirtyRect: NSRect) {
+        let w=bounds.width,h=bounds.height,perimeter=max(1,2*w+2*h),thick:CGFloat=2,step:CGFloat=4
+        // Same four-stop, 256-brush clockwise marquee as the Windows reference.
+        for distance in stride(from:CGFloat(0),to:perimeter,by:step){let segment=min(step,perimeter-distance);var fraction=((distance+segment/2)/perimeter-CGFloat(phase/(2*Double.pi))).truncatingRemainder(dividingBy:1);if fraction<0{fraction+=1};let brush=floor(fraction*256)/256*4,stop=Int(floor(brush)),mix=brush-floor(brush),gray=stop%2==0 ? mix:1-mix
+            NSColor(white:(gray*255).rounded()/255,alpha:1).setFill()
+            if distance<w{NSRect(x:distance,y:h-thick,width:min(segment,w-distance),height:thick).fill()}
+            else if distance<w+h{let y=distance-w;NSRect(x:w-thick,y:h-y-min(segment,h-y),width:thick,height:min(segment,h-y)).fill()}
+            else if distance<2*w+h{let x=w-(distance-w-h),width=min(segment,max(1,x));NSRect(x:max(0,x-width),y:0,width:width,height:thick).fill()}
+            else{let y=distance-2*w-h;NSRect(x:0,y:y,width:thick,height:min(segment,max(1,h-y))).fill()}
+        }
+    }
 }
 @main @MainActor struct NativeCU {
     static var owner="", lockFD:Int32 = -1
