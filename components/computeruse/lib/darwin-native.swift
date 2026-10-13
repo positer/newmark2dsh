@@ -130,13 +130,15 @@ final class CuBorder: NSView {
         visit(window,0);return["available":true,"window_handle":handle,"elements":elements,"truncated":truncated,"target_lifetime_seconds":30,"values_omitted":true]
     }
     static func observeAccessible(_ row:[String:Any]?,_ request:[String:Any])async throws->[String:Any] {
-        if request["previewOnly"] as? Bool==true{var answer=try await capture(row,sparseOnly:request["sparseOnly"] as? Bool ?? false);answer["capture_available"]=true;return answer}
+        let channel=request["observationChannel"] as? String ?? "both"
+        guard ["both","visual","accessibility"].contains(channel) else{try fail("invalid_observation_channel","Choose both, visual or accessibility")}
+        if request["previewOnly"] as? Bool==true || channel=="visual"{var answer=try await capture(row,sparseOnly:request["sparseOnly"] as? Bool ?? false);answer["capture_available"]=true;answer["channels"]=["visual":["available":true,"included":true],"accessibility":["available":AXIsProcessTrusted(),"included":false]];answer["cross_validation_required"]=false;return answer}
         var accessibility:[String:Any]=["available":false,"error_code":"no_frontmost_window"]
         if let row=row {do{accessibility=try accessibilitySnapshot(row,request)}catch let failure as CuFailure{accessibility=["available":false,"error_code":failure.code,"error":failure.message]}catch{accessibility=["available":false,"error_code":"accessibility_failed"]}}
-        var captureAvailable=CGPreflightScreenCaptureAccess();var answer:[String:Any]
+        let visualAvailable=CGPreflightScreenCaptureAccess();var captureAvailable=visualAvailable && channel != "accessibility";var answer:[String:Any]
         if captureAvailable {do {answer=try await capture(request["action"] as? String=="observe" ? nil:row,sparseOnly:request["sparseOnly"] as? Bool ?? false)}catch {guard accessibility["available"] as? Bool==true else{throw error};captureAvailable=false;answer=["ok":true,"observation_route":"accessibility_only","capture_error":"Native pixel capture failed; AX observation retained"]}}
         else {guard accessibility["available"] as? Bool==true else{try fail("macos_permissions_required","Accessibility or Screen Recording permission is needed for observation")};answer=["ok":true,"observation_route":"accessibility_only"]}
-        answer["accessibility"]=accessibility;answer["capture_available"]=captureAvailable;answer["channels"]=["visual":["available":captureAvailable],"accessibility":["available":accessibility["available"] as? Bool ?? false]];answer["cross_validation_required"]=false;answer["permissions"]=permissions();return answer
+        answer["accessibility"]=accessibility;answer["capture_available"]=captureAvailable;answer["channels"]=["visual":["available":visualAvailable,"included":captureAvailable],"accessibility":["available":accessibility["available"] as? Bool ?? false,"included":true]];answer["cross_validation_required"]=false;answer["permissions"]=permissions();return answer
     }
     static func selectedAX(_ row:[String:Any],_ request:[String:Any],_ point:CGPoint?=nil)throws->AXUIElement? {
         let window=try axWindow(row),pid=pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0)

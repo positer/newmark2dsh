@@ -5,6 +5,8 @@ function check(name,value){assert(value,name);console.log('ok '+(++count)+' - '+
 check('visual scoped coordinates need no AX target or cross-check',validateDarwinRequest({...base,inputChannel:'visual'})===null);
 check('explicit AX target needs no visual geometry check',validateDarwinRequest({...base,inputChannel:'accessibility',targetId:id})===null);
 check('default route remains independently usable',validateDarwinRequest(base)===null);
+for(const observationChannel of ['both','visual','accessibility'])check('observation selector '+observationChannel+' is independently accepted',validateDarwinRequest({action:'app_observe',windowHandle:'mac:1:2',observationChannel})===null);
+check('invalid observation route is rejected',validateDarwinRequest({action:'app_observe',observationChannel:'unknown'})?.error_code==='invalid_observation_channel');
 check('optional visual/AX geometry verification accepts both references',validateDarwinRequest({...base,inputChannel:'visual',targetId:id,crossCheck:true})===null);
 check('optional AX geometry verification is supported',validateDarwinRequest({...base,inputChannel:'accessibility',targetId:id,crossCheck:true})===null);
 check('visual target ambiguity is explicitly rejected',validateDarwinRequest({...base,inputChannel:'visual',targetId:id})?.error_code==='ambiguous_visual_target');
