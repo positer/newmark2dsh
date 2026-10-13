@@ -7,6 +7,8 @@ import AppKit
         guard CommandLine.arguments.count==3 else{NSApplication.shared.terminate(nil);return};title=CommandLine.arguments[1];folder=CommandLine.arguments[2]
         let rect=NSRect(x:title.contains("User") ? 80:460,y:240,width:320,height:200),w=NSWindow(contentRect:rect,styleMask:[.titled,.closable],backing:.buffered,defer:false);w.title=title;w.isReleasedWhenClosed=false
         let root=NSView(frame:NSRect(origin:.zero,size:rect.size)),text=NSTextField(string:"fixture");text.frame=NSRect(x:20,y:110,width:260,height:32);text.isEditable=true;root.addSubview(text);field=text
+        text.setAccessibilityLabel("Fixture input")
+        let secure=NSSecureTextField(string:"fixture-secret");secure.frame=NSRect(x:180,y:30,width:120,height:30);secure.setAccessibilityLabel("Secure fixture");root.addSubview(secure)
         let press=NSButton(title:"Increment",target:self,action:#selector(increment));press.frame=NSRect(x:20,y:30,width:150,height:40);root.addSubview(press);button=press;w.contentView=root;window=w;w.makeKeyAndOrderFront(nil);NSApplication.shared.activate(ignoringOtherApps:true);w.makeFirstResponder(text)
         timer=Timer.scheduledTimer(withTimeInterval:0.1,repeats:true){[weak self] _ in MainActor.assumeIsolated{self?.publish()}};publish()
     }

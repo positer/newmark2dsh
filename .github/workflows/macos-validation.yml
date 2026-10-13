@@ -41,3 +41,16 @@ jobs:
         env:
           NEWMARK_NATIVE_BINARY: ${{ runner.temp }}/newmark-cu
         run: node scripts/verify-darwin-native-fixture.mjs
+      - name: Full owned render and operation pipeline
+        env:
+          NEWMARK_NATIVE_BINARY: ${{ runner.temp }}/newmark-cu
+          NEWMARK_EVIDENCE_DIR: ${{ runner.temp }}/newmark-evidence
+        run: node scripts/verify-darwin-render-pipeline.mjs
+      - name: Preserve owned window render evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-pipeline-${{ matrix.os }}
+          path: ${{ runner.temp }}/newmark-evidence
+          retention-days: 3
+          if-no-files-found: warn
