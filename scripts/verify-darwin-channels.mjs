@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import {validateDarwinRequest,MODE_INVENTORY} from '../components/computeruse/lib/darwin.js';
+const base={action:'app_click',mouseMode:'virtual',windowHandle:'mac:1:2',x:50,y:60},id='ax:12345678-1234-1234-1234-123456789abc:1';let count=0;
+function check(name,value){assert(value,name);console.log('ok '+(++count)+' - '+name);}
+check('visual scoped coordinates need no AX target or cross-check',validateDarwinRequest({...base,inputChannel:'visual'})===null);
+check('explicit AX target needs no visual geometry check',validateDarwinRequest({...base,inputChannel:'accessibility',targetId:id})===null);
+check('default route remains independently usable',validateDarwinRequest(base)===null);
+check('optional visual/AX geometry verification accepts both references',validateDarwinRequest({...base,inputChannel:'visual',targetId:id,crossCheck:true})===null);
+check('optional AX geometry verification is supported',validateDarwinRequest({...base,inputChannel:'accessibility',targetId:id,crossCheck:true})===null);
+check('visual target ambiguity is explicitly rejected',validateDarwinRequest({...base,inputChannel:'visual',targetId:id})?.error_code==='ambiguous_visual_target');
+check('invalid channel never reaches native input',validateDarwinRequest({...base,inputChannel:'unknown'})?.error_code==='invalid_input_channel');
+check('visual click requires coordinates',validateDarwinRequest({...base,inputChannel:'visual',x:undefined})?.error_code==='visual_coordinates_required');
+check('verification requires a fresh AX target',validateDarwinRequest({...base,crossCheck:true})?.error_code==='invalid_cross_check');
+check('verification does not accept an unscoped action',validateDarwinRequest({...base,action:'click',mouseMode:'real',targetId:id,crossCheck:true})?.error_code==='invalid_cross_check');
+check('explicit AX route does not silently emit scroll events',validateDarwinRequest({...base,action:'app_scroll',inputChannel:'accessibility'})?.error_code==='unsupported_accessibility_action');
+check('normal and Space inventories expose both routes without required verification',Object.values(MODE_INVENTORY).every(v=>v.inputChannels.includes('visual')&&v.inputChannels.includes('accessibility')&&v.crossValidationRequired===false));
+console.log('PASS '+count+' independent channel and optional geometry verification contracts');

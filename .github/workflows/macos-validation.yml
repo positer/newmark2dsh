@@ -32,6 +32,7 @@ jobs:
           node scripts/verify-darwin-accessibility.mjs
           node scripts/verify-darwin-space-input.mjs
           node scripts/verify-darwin-pet-border.mjs
+          node scripts/verify-darwin-channels.mjs
       - name: Compile native CU and pet with macOS SDK
         run: |
           xcrun swiftc -parse-as-library components/computeruse/lib/darwin-native.swift -o "$RUNNER_TEMP/newmark-cu" -framework AppKit -framework ScreenCaptureKit

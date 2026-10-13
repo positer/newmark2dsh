@@ -16,7 +16,7 @@ import CoreGraphics
             let url=URL(fileURLWithPath:input["path"] as! String),source=CGImageSourceCreateWithURL(url as CFURL,nil)!,image=CGImageSourceCreateImageAtIndex(source,0,nil)!
             var pixels=[UInt8](repeating:0,count:32*32*4)
             let ctx=CGContext(data:&pixels,width:32,height:32,bitsPerComponent:8,bytesPerRow:128,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue)!
-            ctx.draw(image,in:CGRect(x:0,y:0,width:32,height:32));let colors=Set(stride(from:0,to:pixels.count,by:4).map{Int(pixels[$0])<<16|Int(pixels[$0+1])<<8|Int(pixels[$0+2])})
+            ctx.draw(image,in:CGRect(x:0,y:0,width:32,height:32));var colors=Set<Int>();for i in stride(from:0,to:pixels.count,by:4){let red=Int(pixels[i]),green=Int(pixels[i+1]),blue=Int(pixels[i+2]);colors.insert(red*65536+green*256+blue)}
             result=["width":image.width,"height":image.height,"sample_colors":colors.count,"visible_samples":stride(from:3,to:pixels.count,by:4).filter{pixels[$0]>0}.count]
         }else{
             let pid=input["pid"] as! Int;guard allowed.contains(pid) else{throw NSError(domain:"unowned_pid",code:1)}
