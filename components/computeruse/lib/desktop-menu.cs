@@ -15,6 +15,7 @@ internal sealed class DshPetMenu : Form {
     private readonly Action<double> choose;
     private readonly Action changed;
     private readonly Action<Point> failed;
+    private readonly Action<string> action;
     private readonly WebView2 web=new WebView2();
     private readonly Timer timer=new Timer();
     private Task initialize;
@@ -22,14 +23,16 @@ internal sealed class DshPetMenu : Form {
     private Rectangle petBounds;
     private double scale;
     private DateTime revision=DateTime.MinValue;
+    private DateTime attemptedRevision=DateTime.MinValue;
     private string documentUri;
-    private bool loading,closed;
+    private bool loading,closed,documentReady;
     internal string Error="";
     internal string ThemeHash="";
     internal bool Open { get { return Visible && Opacity>0; } }
+    internal bool Ready { get { return documentReady && !loading; } }
 
-    internal DshPetMenu(PetConfig config,Action<double> choose,Action changed,Action<Point> failed) {
-        this.config=config; this.choose=choose; this.changed=changed;this.failed=failed;
+    internal DshPetMenu(PetConfig config,Action<double> choose,Action changed,Action<Point> failed,Action<string> action=null) {
+        this.config=config; this.choose=choose; this.changed=changed;this.failed=failed;this.action=action;
         Text="NewMate · DSH 菜单"; FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false; TopMost=true;
         // A color-keyed parent makes WebView2's separately composed pixels
         // click-through. The rounded native Region clips the menu; its interior
@@ -39,7 +42,7 @@ internal sealed class DshPetMenu : Form {
         web.Dock=DockStyle.Fill; web.DefaultBackgroundColor=Color.Transparent;
         web.CreationProperties=new CoreWebView2CreationProperties { UserDataFolder=config.menuCachePath };
         Controls.Add(web);
-        timer.Interval=300; timer.Tick+=delegate { if(Open && !loading) Reload(false); };timer.Start();
+        timer.Interval=300; timer.Tick+=delegate { if(!loading && web.CoreWebView2!=null) Reload(false); };timer.Start();
         Deactivate+=delegate { if(!loading) Dismiss(); };
         FormClosing+=delegate(object sender,FormClosingEventArgs e) { if(!closed) {e.Cancel=true;Dismiss();} };
     }
@@ -67,6 +70,7 @@ internal sealed class DshPetMenu : Form {
                 var message=PetFiles.Json.Deserialize<Dictionary<string,object>>(e.WebMessageAsJson);
                 string kind=Convert.ToString(message["kind"]);
                 if(kind=="close") {Dismiss();return;}
+                if(kind=="action"){string value=Convert.ToString(message["value"]);if(value!="stop-companion"&&value!="settings")return;Dismiss();if(action!=null)action(value);return;}
                 if(kind=="scale") {
                     double value=Convert.ToDouble(message["value"]);
                     if(Double.IsNaN(value)||Double.IsInfinity(value)||value<.3||value>3)return;
@@ -89,32 +93,43 @@ internal sealed class DshPetMenu : Form {
                         Region=new Region(path);
                     }
                     if(old!=null)old.Dispose();
-                    bool first=loading;loading=false;if(!Visible)return;Opacity=1;if(first){Activate();web.Focus();}Error="";changed();
+                    bool first=loading;loading=false;documentReady=true;Error="";changed();if(!Visible)return;Opacity=1;if(first){Activate();web.Focus();}
                 }
             } catch(Exception ex) { Error=ex.Message;loading=false;changed(); }
         };
+    }
+    internal async void Warm() {
+        try { var handle=Handle; if(initialize==null)initialize=Initialize();await initialize;if(!closed)Reload(false); }
+        catch(Exception ex){Error=ex.Message;loading=false;changed();}
     }
     internal async void Present(Point point,double selected,Rectangle bounds) {
         anchor=point;petBounds=bounds;scale=selected;loading=true;Opacity=0;Location=point;
         try {
             Show();if(initialize==null)initialize=Initialize();await initialize;
-            if(!closed)Reload(true);
+            if(closed)return;
+            if(documentReady && File.GetLastWriteTimeUtc(config.menuThemePath)==revision){
+                var screen=Screen.FromPoint(anchor).WorkingArea;
+                Location=new Point(Math.Max(screen.Left,Math.Min(petBounds.Right+8+Width<=screen.Right?petBounds.Right+8:petBounds.Left-Width-8,screen.Right-Width)),Math.Max(screen.Top,Math.Min(anchor.Y,screen.Bottom-Height)));
+                loading=false;Opacity=1;Activate();web.Focus();changed();
+            }else Reload(!documentReady);
         } catch(Exception ex) { Error=ex.Message;loading=false;Hide();changed();failed(anchor); }
     }
     private void Reload(bool force) {
         try {
             var stamp=File.GetLastWriteTimeUtc(config.menuThemePath);
-            if(!force && stamp==revision)return;
+            if(!force && (stamp==revision || (!documentReady && stamp==attemptedRevision)))return;
+            attemptedRevision=stamp;
             var snapshot=PetFiles.Json.Deserialize<Dictionary<string,object>>(File.ReadAllText(config.menuThemePath));
+            if(!Convert.ToString(snapshot["html"]).Contains("data-newmate-action"))throw new InvalidDataException("Menu snapshot requires configuration actions");
             snapshot["currentScale"]=scale;
             string json=PetFiles.Json.Serialize(snapshot).Replace("<","\\u003c").Replace("\u2028","\\u2028").Replace("\u2029","\\u2029");
             string nonce=Guid.NewGuid().ToString("N");
             string html=File.ReadAllText(config.menuShellPath).Replace("__NEWMATE_NONCE__",nonce).Replace("__NEWMATE_SNAPSHOT__",json);
             string file=Path.Combine(config.directory,"menu.html");File.WriteAllText(file,html,Encoding.UTF8);
-            documentUri=new Uri(file).AbsoluteUri;loading=true;revision=stamp;
+            documentUri=new Uri(file).AbsoluteUri;loading=true;documentReady=false;revision=stamp;
             ThemeHash=snapshot.ContainsKey("hash") ? Convert.ToString(snapshot["hash"]) : "";
             web.CoreWebView2.Navigate(documentUri+"?revision="+DateTime.UtcNow.Ticks);
-        } catch(Exception ex) {Error=ex.Message;loading=false;Hide();changed();failed(anchor);}
+        } catch(Exception ex) {bool presented=Visible;Error=ex.Message;loading=false;Hide();changed();if(presented)failed(anchor);}
     }
     internal async void UpdateScale(double value) {
         scale=value;

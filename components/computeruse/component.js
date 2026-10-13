@@ -192,11 +192,11 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
 
   function loadBackend() {
     backendPromise ??= (async () => {
-      const wanted = process.platform === 'win32' ? './lib/win32.js' : process.platform === 'linux' ? './lib/linux.js' : '';
+      const wanted = process.platform === 'win32' ? './lib/win32.js' : process.platform === 'linux' ? './lib/linux.js' : process.platform === 'darwin' ? './lib/darwin.js' : '';
       if (!wanted) {
         backendFailure = {
           code: 'unsupported_platform',
-          error: `Computer Use has no backend for ${process.platform}. Windows and Linux are supported.`,
+          error: `Computer Use has no backend for ${process.platform}. Windows, Linux and the macOS native prototype are supported.`,
         };
         failures.record({
           where: 'computeruse/backend',

@@ -13,6 +13,7 @@
  */
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { createShortMemory } from './lib/short-memory.js';
 import { MemoryLabStore, MemoryLabStoreError, TAG_DECISION_KINDS, DEFAULT_ROOT_LIMIT, MAX_ROOT_LIMIT, DEFAULT_TREE_MAX_TAGS, MAX_TREE_MAX_TAGS, DEFAULT_TREE_MAX_COMPONENTS, MAX_TREE_MAX_COMPONENTS } from './lib/memory-store.js';
 // The presence probe belongs to the component that owns the tool being probed, and it works
 // whether or not that component is mounted — which is the whole reason it can answer "is a judge
@@ -275,6 +276,7 @@ function toolText(value) {
 export function createMemoryLab({ root, language = 'auto', reindexOnRender = true, logger, tools } = {}) {
   const labDir = memoryLabDir(root);
   const store = new MemoryLabStore(labDir, { language });
+  const shortMemory = createShortMemory(root);
   store.ensureLayout();
   logger?.info?.(`newmark-core/memorylab: store ready at ${labDir}`);
 
@@ -1042,6 +1044,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
     /** The nine model-facing tools, bundled with this component. */
     tools() {
       return [
+        ...shortMemory.tools(),
         {
           name: 'memory_lab_read',
           description:

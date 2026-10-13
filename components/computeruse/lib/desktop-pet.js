@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveRoot } from '../../../lib/root.js';
+import { bubbleSummary } from '../../newmate/lib/presentation.js';
 import { menuThemePath } from './desktop-menu-theme.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -14,6 +15,31 @@ let record = null;
 let generation = 0;
 let starting = null;
 let lastError = '';
+const users = new Map();
+let shellExe = '';
+let readerUntil = 0;
+let bubbleDark = true;
+export function updateDesktopPetTheme(dark){if(typeof dark!=='boolean')throw Error('主题无效');if(bubbleDark!==dark){bubbleDark=dark;syncMode();}return{ok:true,dark};}
+let openChat = {id:''};
+const notices = [];
+export const petPresentation = ({companion=false,cu=false}={}) => ({visible:companion||cu,companion,cu,outline:cu});
+function mode() {return {...petPresentation({companion:users.has('companion'),cu:users.has('cu')}),dshExe:shellExe,readerUntil,bubbleDark};}
+function syncMode() {if(record)fs.writeFileSync(path.join(record.directory,'mode.json'),JSON.stringify(mode()));}
+export function updateDesktopPetFocus(until) {readerUntil=Number.isFinite(until)?until:0;syncMode();}
+export function companionPetEvents() {
+  if(record)try {const value=JSON.parse(fs.readFileSync(path.join(record.directory,'open-chat.json'),'utf8'));if(value.id)openChat=value;}catch{}
+  let command=null;if(record)try{command=JSON.parse(fs.readFileSync(path.join(record.directory,'companion-command.json'),'utf8'));}catch{}
+  return{openChat,command,notifications:[],...desktopPetState(),users:[...users.keys()]};
+}
+// Kept for old clients; NewMate has no OS notification outbox.
+export function claimDesktopPetNotice(){return{ok:true,notice:null};}
+export function notifyDesktopPet(message) {
+  if(!record||!users.has('companion'))throw Error('陪伴桌宠未运行');
+  if(notices.some(n=>n.id===message.id))return{ok:true,duplicate:true};
+  notices.push({id:message.id,threadId:message.threadId,title:'NewMate',text:bubbleSummary(message.text,message.summary),bubble:bubbleSummary(message.text,message.summary),system:false,silent:message.autonomous===true});while(notices.length>50)notices.shift();
+  fs.writeFileSync(path.join(record.directory,'notifications.json'),JSON.stringify(notices));
+  return{ok:true,queued:true};
+}
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function run(file, args) {
@@ -55,10 +81,11 @@ export async function compileDesktopPet() {
 export function desktopPetState() {
   let window = null;
   if (record) {
-    try { window = JSON.parse(fs.readFileSync(path.join(record.directory, 'status.json'), 'utf8')); } catch { /* not ready yet */ }
+    try { window = JSON.parse(fs.readFileSync(path.join(record.directory, 'status.json'), 'utf8'));record.lastWindow=window; }
+    catch { if(record.lastWindow&&Date.now()-Date.parse(record.lastWindow.utc)<1000)window=record.lastWindow; }
   }
   const alive = !!record && record.child.exitCode === null && record.child.signalCode === null;
-  return { kind: 'virtual-desktop-pet', running: alive && !!window, starting: !!starting, pid: alive ? record.child.pid : null, window, error: lastError || null };
+  return { kind: 'virtual-desktop-pet', running: alive && !!window, starting: !!starting, pid: alive ? record.child.pid : null, window,statusAgeMs:window?Math.max(0,Date.now()-Date.parse(window.utc)):null, error: lastError || null };
 }
 
 export function desktopPetContract() {
@@ -66,10 +93,11 @@ export function desktopPetContract() {
     kind: 'virtual-desktop-pet', name: 'NewMate', platform: 'win32', click_through: 'transparent-pixels-only',
     bounds_source: 'pet-monitor', draggable: true, topmost: true,
     motion: { pet: 'damped-spring-squash-stretch', entrance: true, click: true, exit: true, viewer: 'reversible-smooth-proportional-zoom' },
-    size_menu: { trigger: 'right-click', min:0.3, max:3, continuous:true, default:1, base_size_ratio:0.75, scope: 'shared-user-root', persistent: true, initial_size: 'last-selected-multiplier', renderer:'WebView2', appearance:'DSH Menu DOM and live ordered CSS', plugin_css_overrides:true, fallback:'native menu when DSH theme is unavailable' },
+    size_menu: { trigger: 'plugin-settings', min:0.3, max:3, continuous:true, default:1, base_size_ratio:0.75, scope: 'shared-user-root', persistent: true, initial_size: 'last-selected-multiplier', renderer:'WebView2', appearance:'DSH Menu DOM and live ordered CSS', plugin_css_overrides:true, fallback:'native menu when DSH theme is unavailable' },
     outline: { source: 'image-alpha-silhouette', colors: ['#000000', '#ffffff', '#000000', '#ffffff'], cycle_ms: 3000, hidden_while_any_viewer_expanded: true },
     viewer: { read_only: true, input_forwarding: false, full_screen: 'monitor-containing-pet', close: ['pet-click', 'Escape'], capture: 'isolated-process/EnumDesktopWindows/PrintWindow', stale_frame_timeout_ms: 3000 },
     implicit_stop_paths: ['owner-process-exit'],
+    companion: { shared_with_cu:true, outline:false, open_chat:'double-click', notifications:'desktop-bubble-only', tray:false },
   };
 }
 
@@ -88,14 +116,18 @@ export async function prepareDesktopPetTransfer(direction) {
   return {x:b.x+p.x+p.width/2,y:b.y+p.y+p.height/2,petHandle:state.window.hwnd};
 }
 
-export async function stopDesktopPet(reason = 'lease_released') {
+export async function stopDesktopPet(reason = 'lease_released', usage = 'cu') {
   const previous = record;
-  releaseDesktopPet(reason);
+  const released=releaseDesktopPet(reason,usage);
+  if(released.retained)return released;
   if (previous) for (let i = 0; i < 30 && previous.child.exitCode === null && previous.child.signalCode === null; i++) await sleep(100);
   return { ok: !previous || previous.child.exitCode !== null || previous.child.signalCode !== null };
 }
 
-export function releaseDesktopPet(reason = 'lease_released') {
+export function releaseDesktopPet(reason = 'lease_released', usage = 'cu') {
+  users.delete(usage);
+  if(reason==='process_exit'){users.clear();}
+  if(users.size&&reason!=='mode_changed'&&reason!=='startup_failed'){syncMode();return{ok:true,retained:true,users:[...users.keys()]};}
   generation++;
   const previous = record;
   record = null;
@@ -110,11 +142,16 @@ export function releaseDesktopPet(reason = 'lease_released') {
   return { ok: true, stopping: !!previous, reason };
 }
 
-export async function startDesktopPet({ ownerPid = process.pid, desktop = 'Default', userRoot } = {}) {
+export async function startDesktopPet({ ownerPid = process.pid, desktop = 'Default', userRoot, usage = 'cu', dshExe = '' } = {}) {
   if (process.platform !== 'win32') return { ok: false, error: 'unsupported_platform' };
+  if(dshExe)shellExe=dshExe;
+  users.set(usage,true);syncMode();
   if (record && record.desktop === desktop && desktopPetState().running) return { ok: true, already_running: true, ...desktopPetState() };
   if (starting && starting.desktop === desktop) return starting.promise;
-  releaseDesktopPet('mode_changed');
+  // A single native window belongs jointly to CU and the companion. Replacing
+  // its physical mode must not discard either owner's reservation.
+  generation++;const previous=record;record=null;
+  if(previous){try{fs.writeFileSync(path.join(previous.directory,'stop'),'mode_changed');}catch{previous.child.kill();}}
   const epoch = generation;
   const pending = { desktop, promise: null };
   starting = pending;
@@ -125,14 +162,20 @@ export async function startDesktopPet({ ownerPid = process.pid, desktop = 'Defau
       const executable = await compileDesktopPet();
       if (epoch !== generation) return { ok: true, skipped: true };
       const directory = fs.mkdtempSync(path.join(root, 'session-'));
+      // Already presented notices belong to the previous physical helper; a
+      // mode replacement must not replay them when the next message arrives.
+      notices.length=0;
+
       const configPath = path.join(directory, 'config.json');
       const settingsPath = path.join(resolveRoot({ root: userRoot }), 'computer-use', 'desktop-pet.json');
-      fs.writeFileSync(configPath, JSON.stringify({ ownerPid, desktop, directory, settingsPath,
+      fs.writeFileSync(configPath, JSON.stringify({ ownerPid, desktop, directory, settingsPath, dshExe,
         menuThemePath:menuThemePath(resolveRoot({root:userRoot})),menuShellPath:path.join(here,'desktop-menu.html'),menuCachePath:path.join(root,'webview2-cache'),
         asset: path.resolve(here, '../assets/desktop-pet.png') }));
+      fs.writeFileSync(path.join(directory,'mode.json'),JSON.stringify(mode()));
       const child = spawn(executable, [configPath], { windowsHide: true, stdio: 'ignore' });
       current = { child, directory, desktop };
       record = current;
+      syncMode();
       child.once('error', (error) => { if (epoch === generation) lastError = error.message; });
       child.once('exit', (code) => {
         if (record === current) {
@@ -140,7 +183,7 @@ export async function startDesktopPet({ ownerPid = process.pid, desktop = 'Defau
           if (code) { try { lastError = fs.readFileSync(path.join(directory, 'error.json'), 'utf8'); } catch { lastError = `Pet exited ${code}`; } }
         }
         // These are only files created for this exact session, never user files.
-        for (const name of ['config.json', 'status.json', 'status.json.tmp', 'menu.html', 'viewer.html', 'frame.png', 'frame.png.tmp', 'capture.json', 'capture.json.tmp', 'capture-error.json', 'capture-error.json.tmp', 'error.json', 'error.json.tmp', 'stop']) {
+        for (const name of ['config.json', 'status.json', 'status.json.tmp', 'mode.json', 'notifications.json', 'notification-ack.json', 'notification-ack.json.tmp', 'open-chat.json', 'open-chat.json.tmp','companion-command.json','companion-command.json.tmp', 'menu.html', 'viewer.html', 'frame.png', 'frame.png.tmp', 'capture.json', 'capture.json.tmp', 'capture-error.json', 'capture-error.json.tmp', 'error.json', 'error.json.tmp', 'stop']) {
           try { fs.unlinkSync(path.join(directory, name)); } catch { }
         }
         try { fs.rmdirSync(directory); } catch { }
@@ -153,7 +196,7 @@ export async function startDesktopPet({ ownerPid = process.pid, desktop = 'Defau
       }
       throw new Error('Desktop pet did not publish a window within 10 seconds');
     } catch (error) {
-      if (epoch === generation) { lastError = error.message; releaseDesktopPet('startup_failed'); }
+      if (epoch === generation) { lastError = error.message; users.delete(usage); releaseDesktopPet('startup_failed',usage); }
       return { ok: false, error: error.message };
     } finally { if (starting === pending) starting = null; }
   })();

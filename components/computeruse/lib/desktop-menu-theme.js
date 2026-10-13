@@ -11,7 +11,7 @@ const maxBytes = 8 * 1024 * 1024;
 
 export function validateMenuTheme(value) {
   if (value?.version !== 1 || typeof value.html !== 'string' || typeof value.css !== 'string') throw Error('Invalid menu snapshot');
-  if (!value.html.includes('data-newmate-slider') || !value.html.includes('type="range"')) throw Error('Missing size slider');
+  if (!value.html.includes('data-newmate-action="stop-companion"') || !value.html.includes('data-newmate-action="settings"')) throw Error('Missing configuration actions');
   // Rendering accepts inert menu markup, never plugin JavaScript, documents or frames.
   if (/<\s*(?:script|iframe|object|embed|meta|base|link|form)\b|\son[a-z]+\s*=/i.test(value.html)) throw Error('Non-menu markup');
   for (const attrs of [value.htmlAttributes, value.bodyAttributes]) {

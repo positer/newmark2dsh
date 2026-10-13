@@ -66,6 +66,9 @@ jobs:
       # brought up to date. The point of the check is unchanged: if a component's
       # manifest or any of its libraries is missing, the published tarball installs and
       # then does nothing, so it is caught here rather than by a user.
+      - name: Validate all five component entries
+        run: node scripts/check-release-bundle.mjs .
+
       - name: The bundle must be self-contained
         run: |
           set -eu
@@ -78,7 +81,7 @@ jobs:
           #    loop kept checking two, so a tarball that had lost the Agent API half entirely
           #    would still have passed this step. A roster that silently under-covers is worse
           #    than no roster, because it reads as a guarantee.
-          for component in memorylab computeruse agent-api; do
+          for component in memorylab computeruse agent-api newmate heartbeat; do
             manifest="components/$component/package.json"
             [ -f "$manifest" ] || { echo "::error::missing $manifest"; fail=1; continue; }
             node -e "
@@ -149,7 +152,7 @@ jobs:
             import fs from "node:fs";
             const [pack] = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/newmark-pack.json", "utf8"));
             const files = new Set(pack.files.map(file => file.path));
-            for (const required of ["components/computeruse/lib/linux-desktop.js", "components/computeruse/lib/linux-desktop.py", "components/computeruse/lib/linux-process-guard.py", "components/computeruse/lib/desktop-transfer.cs", "components/computeruse/lib/desktop-transfer.js", "components/computeruse/lib/takeover-lock.cs", "components/computeruse/lib/takeover-lock.js", "lib/cu-caller.js", "components/computeruse/lib/desktop-pet.js", "components/computeruse/lib/desktop-pet.cs", "components/computeruse/assets/desktop-pet.png", "components/computeruse/lib/desktop-menu.cs", "components/computeruse/lib/desktop-menu.html", "components/computeruse/lib/desktop-menu-client.js", "components/computeruse/lib/desktop-menu-theme.js", "lib/newmate-settings.js", "components/computeruse/vendor/webview2/Microsoft.Web.WebView2.Core.dll", "components/computeruse/vendor/webview2/Microsoft.Web.WebView2.WinForms.dll", "components/computeruse/vendor/webview2/WebView2Loader.dll", "components/computeruse/vendor/webview2/LICENSE.txt"]) {
+            for (const required of ["components/newmate/index.js", "components/newmate/component.js", "components/newmate/lib/file-navigation.js", "components/heartbeat/index.js", "components/heartbeat/component.js", "components/agent-api/lib/llm-seam.js", "components/computeruse/lib/darwin.js", "components/computeruse/lib/darwin-native.swift", "components/computeruse/lib/darwin-vm.swift", "components/computeruse/lib/darwin-vm.entitlements.plist", "components/computeruse/lib/linux-desktop.js", "components/computeruse/lib/linux-desktop.py", "components/computeruse/lib/linux-process-guard.py", "components/computeruse/lib/desktop-transfer.cs", "components/computeruse/lib/desktop-transfer.js", "components/computeruse/lib/takeover-lock.cs", "components/computeruse/lib/takeover-lock.js", "lib/cu-caller.js", "components/computeruse/lib/desktop-pet.js", "components/computeruse/lib/desktop-pet.cs", "components/computeruse/assets/desktop-pet.png", "components/computeruse/lib/desktop-menu.cs", "components/computeruse/lib/desktop-menu.html", "components/computeruse/lib/desktop-menu-client.js", "components/computeruse/lib/desktop-menu-theme.js", "lib/newmate-settings.js", "components/computeruse/vendor/webview2/Microsoft.Web.WebView2.Core.dll", "components/computeruse/vendor/webview2/Microsoft.Web.WebView2.WinForms.dll", "components/computeruse/vendor/webview2/WebView2Loader.dll", "components/computeruse/vendor/webview2/LICENSE.txt"]) {
               if (!files.has(required)) throw new Error("Missing from npm artifact: " + required);
             }
           '

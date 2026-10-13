@@ -1,40 +1,23 @@
-# Newmark2DSH release repository
+# Package overview
 
-This repository holds the self-contained package published as `newmark2dsh`. Development and Windows acceptance evidence live in the parent development workspace. The product includes MemoryLab, ComputerUse with NewMate, Agent API, and Dev/rDev presets.
+0.3.10 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
 
-| Path | Structure and purpose |
+| Path | Purpose |
 |---|---|
-| `package.json` | Version, exports, package files and DSH bundle metadata |
-| `index.js`, `client.js` | Host composition, component switches and client panel |
-| `lib/` | Shared root resolution, configuration, model selection and error helpers |
-| `components/memorylab/` | Component entry, tools, storage and client renderer |
-| `components/computeruse/` | Component entry, platform backends, native helper source and mascot asset |
-| `components/computeruse/lib/desktop-pet.js` | Hash-addressed helper compilation, lifetime and preference location |
-| `components/computeruse/lib/desktop-pet.cs` | Transparent mascot, animation, scale menu/persistence and read-only preview |
-| `components/computeruse/assets/desktop-pet.png` | NewMate image |
-| `components/agent-api/` | Component entry, API tools and execution modules |
-| `locale/` | Interface localization |
-| `cordis.patch.yml` | Core, Dev and rDev loader rows |
-| `.github/workflows/publish.yml` | Tag/version validation, package checks and OIDC npm publication |
-| `README.md`, `taste.md`, `LICENSE` | Product introduction, engineering rules and usage rights |
-| `archive/` | Local operation records, excluded from Git and npm |
+| index.js / client.js | Host composition, configuration, MemoryLab/NewMate panels and native navigation |
+| cordis.patch.yml | Core and Dev/rDev loader rows |
+| lib/ | User-root resolution, model selection, state, delivery, restart and error handling |
+| components/memorylab/ | Tagged memory, relations, short memory and tools |
+| components/agent-api/ | Agent execution, DSH model seam, vision metadata and isolation |
+| components/newmate/ | Companion state, attention/proactive policy, memory context, MCP and file-reference validation |
+| components/heartbeat/ | Scoped restart task creation, delivery and permanent receipts |
+| components/computeruse/ | Platform automation, native indicators, shared pet and menu sources/assets |
+| components/computeruse/lib/darwin.js | Lazy Mac dispatch and bounded sparse measurement |
+| darwin-native.swift / darwin-vm.swift | Unvalidated Mac native CU and isolated Linux VM boot/view prototypes |
+| darwin-vm.entitlements.plist | Virtualization entitlement for the manual VM prototype |
+| docs/native-model-and-macos.md | Public model boundary and Mac assessment/acceptance limits |
+| scripts/check-release-bundle.mjs | Five-component self-contained release guard |
+| .github/workflows/publish.yml | Tag/manifest validation, package inventory and npm trusted publishing |
+| CHANGELOG-*.md | Public version records |
 
-0.2.24 adds the NewMate desktop indicator, motion and remembered size. All 45 runtime/package files are synchronized from the locally validated development package. Publication and installation receipts are retained in the development workspace's timestamped release archive.
-
-## 0.2.26
-Configuration cards group model and NewMate controls. ComputerUse desktop-pet.cs owns persistent DIB drawing, deadline frame pacing and a GPU WebView2 read-only viewer with warm reuse. desktop-menu.cs/html and desktop-menu-client/theme.js share live DSH Menu appearance. lib/newmate-settings.js owns versioned continuous preferences. vendor/webview2 includes pinned SDK binaries, provenance and license.
-
-## 0.2.27
-`components/computeruse/lib/desktop-transfer.cs` owns the capture/control proxy, job retention/cleanup, crash guardian and WebView2 flight. Its `.js` partner compiles native code and coordinates identity-checked receipts. `takeover-lock.cs/js` hold one kernel mutex per mode across hosts. `lib/cu-caller.js` preserves DSH session identity through asynchronous Agent API dispatch. `hidden-agent.js` watches the owner lifetime. Acceptance sources and raw source/installed receipts remain in the development archive `20261007-cu-transfer`.
-
-0.2.28 closes presentations independently when source windows disappear, retries temporary capture failures and clears stale frames. Native transfer acceptance now independently checks the presentation process has exited.
-
-## Process transfer presentation
-
-Process push/pull flights follow source-window z-order and the live expanded-preview layer without forcing a collapse or unconditional topmost activation. Native animation receipts expose layer, preview_expanded and topmost. Empty virtual desktops use pure black; no fixture application is launched by default.
-
-## 0.2.30 display pacing and Linux
-
-`components/computeruse/lib/linux-desktop.js` launches the isolated X11 host; `linux-desktop.py` owns leases, authenticated Xvfb, mappings, GPU presentation and independent capture. `linux-process-guard.py` guards virtual process lifetime. Windows `desktop-pet.cs` and `desktop-transfer.cs` use output vblank pacing with bounded pending frames. Preserve input isolation and original process identity; distinguish render callbacks from physical scanout.
-
-0.2.31 separates TransferBroker controlTimer (commands/status) from its PetFrameClock (presentation).
+Development archives, private profiles, session records and machine-specific visual evidence remain outside this repository and npm artifact.

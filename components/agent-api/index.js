@@ -172,6 +172,7 @@ export function apply(ctx, config) {
       tools: ctx.tools,
       webServer: ctx.webServer,
       llm: optional('llm'),
+      attachments: optional('attachments'),
       core: optional(coreService),
     }),
   });

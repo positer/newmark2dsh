@@ -7,7 +7,7 @@ function SameProcess($expected) {
   $p=Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.pid)"
   if (!$p) { return $null }
   $actual=Identity $p
-  if ($actual.path -ne $expected.path -or $actual.created -ne $expected.created) { throw 'Process identity changed; restart stopped' }
+  if ($actual.path -ne $expected.path -or $actual.created -ne $expected.created) { return $null }
   return $p
 }
 if ($Mode -eq 'Probe') {

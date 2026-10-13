@@ -170,6 +170,9 @@ export function cancellableDelay(delayMs, signal) {
 }
 
 /** A `MessageId` for a message this component mints. Branded at the type level, a string at runtime. */
+// Public DSH conversation parser; provider adapters stay entirely behind the LLM service.
+let NativeBlockAssembler;
+try { ({BlockAssembler:NativeBlockAssembler}=await import('@deepseek-ai/dsh-llm')); } catch { /* Legacy/test hosts without this public export retain the standard-chunk fallback. */ }
 let messageCounter = 0;
 function messageId() {
   messageCounter += 1;
@@ -207,7 +210,7 @@ export function toRequestMessage(message, model) {
       id: messageId(),
       role: 'assistant',
       content: message.content,
-      source: { kind: 'model', provider: String(model?.provider ?? ''), model: String(model?.model ?? '') },
+      source: { kind: 'model', provider: String(model?.provider ?? ''), model: String(model?.model ?? ''), ...(message.replayState !== undefined && message.model?.provider === model?.provider && message.model?.model === model?.model ? {replayState:message.replayState} : {}) },
     };
   }
   return { role: 'user', content: message.content };
@@ -372,13 +375,17 @@ export function stableJson(value) {
  *     answer that matters comes from a later, complete turn, which is why this is safe.
  */
 export async function collectAssistant(stream, model, onPartial, options = {}) {
+  const Assembler=options.BlockAssembler||NativeBlockAssembler;
+  const assembler=Assembler?new Assembler():null;
   const blocks = [];
   const toolCalls = new Map();
   let usage;
   let finish;
+  let replayState;
   let streamError = null;
   try {
     for await (const chunk of stream) {
+      if(assembler&&(Number.isInteger(chunk?.index)||chunk?.type==='finish'||chunk?.type==='usage'))assembler.push(chunk);
       switch (chunk?.type) {
         case 'block-end':
           if (Number.isInteger(chunk.index)) blocks[chunk.index] = chunk.block;
@@ -395,6 +402,7 @@ export async function collectAssistant(stream, model, onPartial, options = {}) {
           break;
         case 'finish':
           finish = chunk.reason;
+          replayState = chunk.replayState;
           break;
         default:
           break;
@@ -406,7 +414,7 @@ export async function collectAssistant(stream, model, onPartial, options = {}) {
     streamError = error;
   }
 
-  const content = blocks.filter(Boolean);
+  const content = assembler ? assembler.blocks() : blocks.filter(Boolean);
   if (content.length === 0 && toolCalls.size > 0) {
     // No completed blocks arrived, so the deltas are all there is. Recovered rather than
     // dropped: the alternative is a run that quietly stops calling tools. The recovered
@@ -437,6 +445,7 @@ export async function collectAssistant(stream, model, onPartial, options = {}) {
     content,
     usage,
     stopReason,
+    ...(replayState === undefined ? {} : {replayState}),
     diagnostic: failureText(finish?.failure),
     failureCode: finish?.failure ? String(finish.failure.code ?? '') : '',
     model,
@@ -490,6 +499,8 @@ export function failureText(failure) {
  * the fourth attempt during an outage" indistinguishable from "succeeded immediately".
  */
 export function createLlmStreamFn(llm, selection, options = {}) {
+  // Bind each run to its original provider/model, including later turns and retries.
+  selection = Object.freeze({ ...selection });
   const retry = { ...DEFAULT_RETRY, ...(options.retry ?? {}) };
   return async function streamFn(_model, request, ctx = {}) {
     const provider = String(selection?.provider ?? '');
@@ -513,6 +524,8 @@ export function createLlmStreamFn(llm, selection, options = {}) {
     const generate = {
       provider,
       model,
+      // Provider transport correlation only; this does not create a DSH session.
+      ...(options.sessionId ? { sessionId: String(options.sessionId) } : {}),
       messages: toRequestMessages(request.messages, { provider, model }),
       ...(request.systemPrompt ? { system: String(request.systemPrompt) } : {}),
       ...(Array.isArray(request.tools) && request.tools.length > 0 ? { tools: request.tools } : {}),
@@ -539,7 +552,13 @@ export function createLlmStreamFn(llm, selection, options = {}) {
            * cannot disagree about what is transient. */
           let stream;
           try {
-            stream = llm.stream(generate);
+            if(typeof llm.prepareCall==='function'){
+              // The same resolver used by DSH conversations; a prepared call is single-use.
+              const config={provider,model,...selection.reasoningEffort===undefined?{}:{reasoningEffort:selection.reasoningEffort},...Number.isFinite(options.maxTokens)?{maxTokens:options.maxTokens}:{}};
+              const prepared=await llm.prepareCall(config,ctx.signal);
+              if(prepared?.config?.provider!==provider||prepared.config.model!==model||typeof prepared.stream!=='function')throw Object.assign(Error('DSH prepared call changed provider/model or has no stream'),{code:'INVALID_PREPARED_CALL'});
+              stream=prepared.stream({...generate,...prepared.config});
+            }else stream = llm.stream(generate);
           } catch (error) {
             lastRefusal = { message: `the llm service refused the call: ${failureText(error)}`, code: String(error?.code ?? 'LLM_CALL_FAILED') };
             const asked = retryableAttempt({ attempts }, true, lastRefusal.code, retry);
@@ -553,7 +572,7 @@ export function createLlmStreamFn(llm, selection, options = {}) {
 
           let message;
           try {
-            message = await collectAssistant(stream, modelId, undefined, { signal: ctx.signal });
+            message = await collectAssistant(stream, modelId, undefined, { signal: ctx.signal, BlockAssembler: options.BlockAssembler });
           } catch (error) {
             message = assistantMessageWithError(modelId, `the model stream failed: ${failureText(error)}`, String(error?.code ?? 'LLM_STREAM_FAILED'));
             message.causeText = error?.cause?.message;

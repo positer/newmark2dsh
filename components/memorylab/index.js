@@ -19,6 +19,7 @@ import { schema } from './lib/schema.js';
 import { resolveRoot } from './lib/root.js';
 import { embedJson } from './lib/embed.js';
 import { causeChain, describeError } from '../../lib/errors.js';
+import { createShortMemory } from './lib/short-memory.js';
 
 /** The page global this row publishes. */
 export const SNAPSHOT_GLOBAL = '__NEWMARK_MEMORYLAB__';
@@ -126,6 +127,13 @@ export function apply(ctx, config) {
   });
 
   const definitions = memorylab.tools();
+  const shortMemory = createShortMemory(root);
+  ctx.effect(() => ctx.webServer.register({kind:'exact',path:'/newmark-memorylab/short-memory',handler:async(req,res)=>{
+    let status=200,body;try{if(req.method!=='GET'){status=405;body={ok:false,error:'method_not_allowed'};}else body={ok:true,path:shortMemory.file,items:shortMemory.all()};}catch(e){status=500;body={ok:false,error:e.message};}
+    res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(body));
+  }}),
+    'memorylab-short-memory-route',
+  );
   for (const definition of definitions) {
     ctx.effect(() => ctx.tools.register(definition), `newmark-memorylab-tool-${definition.name}`);
   }

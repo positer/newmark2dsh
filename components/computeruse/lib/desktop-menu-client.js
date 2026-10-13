@@ -6,6 +6,7 @@ export function startDshMenuThemeBridge({React, createRoot, Menu, connection, re
   let disposed=false, busy=false, timer, last='', captured=null;
   const resources=new Map();
   const processedSheets=new WeakMap();
+  let menuClasses=[];
   const yieldToShell=()=>new Promise(resolve=>setTimeout(resolve,0));
   const sliderStyle=document.createElement('style');sliderStyle.textContent=sliderCss;document.head.append(sliderStyle);
   const attrs = element => Object.fromEntries([...element.attributes].filter(a => /^(class|style|lang|dir|data-[a-z0-9_-]+)$/.test(a.name)).map(a=>[a.name,a.value]));
@@ -19,7 +20,8 @@ export function startDshMenuThemeBridge({React, createRoot, Menu, connection, re
       for(let i=0;i<30 && !holder.querySelector('[role="menu"]');i++) await tick();
       const menu=holder.querySelector('[role="menu"]'); if(!menu) throw Error('DSH Menu unavailable');
       const clone=menu.cloneNode(true); clone.setAttribute('data-newmate-menu',''); clone.removeAttribute('style');
-      if(!clone.querySelector('[data-newmate-slider]'))throw Error('DSH size slider unavailable');
+      menuClasses=[...new Set([clone,...clone.querySelectorAll('*')].flatMap(element=>[...(element.classList||[])]))];
+      if(!clone.querySelector('[data-newmate-action="stop-companion"]')||!clone.querySelector('[data-newmate-action="settings"]'))throw Error('DSH configuration actions unavailable');
       for(const element of [clone,...clone.querySelectorAll('*')]) for(const a of [...element.attributes]) if(/^on/i.test(a.name)) element.removeAttribute(a.name);
       return {html:clone.outerHTML};
     } finally { mount.unmount(); holder.remove(); }
@@ -46,6 +48,9 @@ export function startDshMenuThemeBridge({React, createRoot, Menu, connection, re
     let rules; try { rules=[...sheet.cssRules]; } catch { return ''; }
     const parts=[];
     for(const rule of rules) {
+      // Copy only rules that can affect this menu; avoid exporting the entire application's fonts and CSS.
+      if(rule.type===5)continue;
+      if(rule.type===1&&rule.selectorText&&menuClasses.length&&!menuClasses.some(name=>rule.selectorText.includes('.'+name))&&!/(?:^|,)\s*(?:html|body|:root|\*)\b/.test(rule.selectorText))continue;
       if(rule.type===3 && rule.styleSheet) {
         let text=await sheetText(rule.styleSheet);
         if(rule.media?.mediaText) text=`@media ${rule.media.mediaText}{${text}}`;
@@ -80,6 +85,7 @@ export function startDshMenuThemeBridge({React, createRoot, Menu, connection, re
       const computed=getComputedStyle(document.body); let inherited='';
       for(const key of computed) if(key.startsWith('--')) inherited+=key+':'+computed.getPropertyValue(key)+';';
       bodyAttributes.style=(bodyAttributes.style||'')+';'+inherited;
+      bodyAttributes.style+=';font-family:'+computed.getPropertyValue('font-family')+';font-size:'+computed.getPropertyValue('font-size')+';color:'+computed.getPropertyValue('color')+';';
       const snapshot={version:1,...captured,css,htmlAttributes:attrs(document.documentElement),bodyAttributes};
       const body=JSON.stringify(snapshot);
       if(body===last||disposed) return;

@@ -282,6 +282,7 @@ export async function executeToolCalls(toolCalls, context, config, signal, turn 
       // the JSON text the wire carries becomes a legible failure (`toolCallArgumentsChecked`);
       // called outside, that throw would escape `executeToolCalls` and end the RUN — the opposite
       // of what a malformed argument set should do, because it is the model that has to be told.
+      if(config.hasSteer?.())return toolResult(call,'用户已更新当前引导；该旧调用未执行。',true,{code:'superseded_by_steer'});
       const args = tool.prepareArguments ? tool.prepareArguments(call.arguments) : call.arguments;
       const result = await tool.execute(call.id, args, signal, { workspace: config.workspace });
       throwIfAborted(signal);
@@ -340,7 +341,7 @@ export async function executeToolCalls(toolCalls, context, config, signal, turn 
 }
 
 /**
- * The cycle. The reference's `runLoop`, with the steering machinery removed, a step cap added,
+ * The cycle. The reference's `runLoop`, with optional scoped steering at safe boundaries, a step cap added,
  * and — the part that is not in the reference because the reference has a user attached — a
  * bound on REPEATING A FAILED CALL.
  *
@@ -384,6 +385,7 @@ async function runLoop(context, newMessages, config, signal) {
   const callKey = typeof config.callKey === 'function' ? config.callKey : defaultCallKey;
   const failures = new Map();
   let refusedLastTurn = false;
+  const steer=()=>{const messages=config.pollSteer?.()||[];for(const message of messages){context.messages.push(message);newMessages.push(message);}return messages.length;};
   while (true) {
     throwIfAborted(signal);
     let hasMoreToolCalls = true;
@@ -396,6 +398,7 @@ async function runLoop(context, newMessages, config, signal) {
         await emit(config, { type: 'agent_end', messages: newMessages, stopReason: 'max-steps' });
         return { stopReason: 'max-steps', messages: newMessages };
       }
+      steer();
       turns += 1;
       await emit(config, { type: 'turn_start', turn: turns });
 
@@ -411,6 +414,13 @@ async function runLoop(context, newMessages, config, signal) {
 
       const toolCalls = (assistant.content || []).filter((block) => block.type === 'tool-call');
       const keyed = toolCalls.map((call) => ({ call, key: String(callKey(call)) }));
+      const guidance=config.pollSteer?.()||[];
+      if(guidance.length){
+        // Pair stale tool calls before steering; none of those calls may execute.
+        for(const call of toolCalls){const result=toolResult(call,'用户已更新当前引导；该旧调用未执行，请按最新输入继续。',true,{code:'superseded_by_steer'});context.messages.push(result);newMessages.push(result);}
+        for(const message of guidance){context.messages.push(message);newMessages.push(message);}
+        await emit(config,{type:'turn_end',message:assistant,toolResults:[],steered:true});continue;
+      }
 
       /* 5 — the point of no return. After a refusal the model was asked to answer; a turn that
        * calls nothing but already-refused calls is not an answer, and one more turn would only
@@ -489,6 +499,7 @@ async function runLoop(context, newMessages, config, signal) {
       }
       refusedLastTurn = refusedThisTurn > 0;
       await emit(config, { type: 'turn_end', message: assistant, toolResults: results });
+      if (!hasMoreToolCalls && steer()) {hasMoreToolCalls=true;continue;}
       if (!hasMoreToolCalls) {
         await emit(config, { type: 'agent_end', messages: newMessages, stopReason: assistant.stopReason });
         return { stopReason: assistant.stopReason, messages: newMessages };

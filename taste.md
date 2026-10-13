@@ -23,3 +23,6 @@ Process push/pull flights follow source-window z-order and the live expanded-pre
 `components/computeruse/lib/linux-desktop.js` launches the isolated X11 host; `linux-desktop.py` owns leases, authenticated Xvfb, mappings, GPU presentation and independent capture. `linux-process-guard.py` guards virtual process lifetime. Windows `desktop-pet.cs` and `desktop-transfer.cs` use output vblank pacing with bounded pending frames. Preserve input isolation and original process identity; distinguish render callbacks from physical scanout.
 
 Display-dependent rendering must not gate lifecycle commands or liveness heartbeats. Validate control progress with the display clock stopped.
+
+## 0.3.10 native boundaries
+Use DSH public model resolution, single-use prepared streams and BlockAssembler, without provider-name branches. Keep private replay state inside the exact provider/model route. Query live document preview registrations and wait for native session/sidebar mounting after switching global panels. Let native preview components own read authorization. Prewarm pet menus and reuse their loaded document. Treat Mac source, native compilation, hardware acceptance and guest routing as distinct evidence; never fall back from a virtual request to the physical desktop.

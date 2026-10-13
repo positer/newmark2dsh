@@ -31,6 +31,15 @@ internal static class PetNative {
     [DllImport("user32.dll")] internal static extern uint GetDpiForSystem();
     [DllImport("user32.dll")] internal static extern bool SetWindowPos(IntPtr w, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] internal static extern IntPtr GetDC(IntPtr w);
+    [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(IntPtr w);
+    [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr w, int command);
+    [StructLayout(LayoutKind.Sequential)] internal struct LastInput { public uint Size,Tick; }
+    [DllImport("user32.dll")] private static extern bool GetLastInputInfo(ref LastInput input);
+    internal static long InputIdleMillis(){var input=new LastInput{Size=8};return GetLastInputInfo(ref input)?(long)unchecked((uint)Environment.TickCount-input.Tick):-1L;}
+    [DllImport("user32.dll")] private static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] private static extern bool GetUserObjectInformation(IntPtr handle,int index,StringBuilder value,int length,out int needed);
+    internal static bool UserDesktopActive(){IntPtr desktop=OpenInputDesktop(0,false,1);if(desktop==IntPtr.Zero)return false;try{int needed;var name=new StringBuilder(256);return GetUserObjectInformation(desktop,2,name,512,out needed)&&String.Equals(name.ToString(),"Default",StringComparison.OrdinalIgnoreCase);}finally{CloseDesktop(desktop);}}
     [DllImport("user32.dll")] internal static extern int ReleaseDC(IntPtr w, IntPtr dc);
     [DllImport("gdi32.dll")] internal static extern IntPtr CreateCompatibleDC(IntPtr dc);
     [DllImport("gdi32.dll")] internal static extern bool DeleteDC(IntPtr dc);
@@ -150,6 +159,7 @@ internal sealed class PetConfig {
     public string menuThemePath { get; set; }
     public string menuShellPath { get; set; }
     public string menuCachePath { get; set; }
+    public string dshExe { get; set; }
 }
 
 internal static class PetFiles {
@@ -320,6 +330,53 @@ internal sealed class DesktopViewer : Form {
     protected override void Dispose(bool disposing){closed=true;if(disposing){if(frame!=null)frame.Dispose();web.Dispose();}base.Dispose(disposing);}
 }
 
+// A passive, per-pixel-alpha message bubble. It follows the one shared pet,
+// stays out of capture, never takes focus, and opens chat only on a user click.
+internal sealed class DesktopBubble : Form {
+    private PetSurface surface;
+    private string message="";
+    private int dpi=96,arrowX;
+    internal Action OpenChat;
+    private bool dark;
+    internal long Expires;
+    internal void SetTheme(bool value){if(dark==value)return;dark=value;if(Visible)Render();}
+    internal DesktopBubble(){Text="NewMate 消息";FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;StartPosition=FormStartPosition.Manual;AutoScaleMode=AutoScaleMode.None;Cursor=Cursors.Hand;}
+    protected override bool ShowWithoutActivation{get{return true;}}
+    protected override CreateParams CreateParams{get{var cp=base.CreateParams;cp.ExStyle|=0x08080088;return cp;}}
+    protected override void OnHandleCreated(EventArgs e){base.OnHandleCreated(e);PetNative.MarkPet(Handle);}
+    protected override void OnHandleDestroyed(EventArgs e){PetNative.UnmarkPet(Handle);base.OnHandleDestroyed(e);}
+    internal void Present(string text,Rectangle pet,int nextDpi,long now){
+        message=text;dpi=nextDpi;float scale=dpi/96f;int width=(int)Math.Round(292*scale),height;
+        using(var image=new Bitmap(1,1))using(var g=Graphics.FromImage(image))using(var font=new Font("Microsoft YaHei UI",13*scale,FontStyle.Regular,GraphicsUnit.Pixel)){
+            height=(int)Math.Ceiling(Math.Min(130*scale,g.MeasureString(message,font,width-(int)(32*scale)).Height))+ (int)(58*scale);
+        }
+        Size=new Size(width,height);Expires=now+15000;PositionAbove(pet);if(!Visible)Show();Render();
+    }
+    internal void PositionAbove(Rectangle pet){
+        float scale=dpi/96f;Rectangle area=Screen.FromRectangle(pet).WorkingArea;
+        int x=Math.Max(area.Left+8,Math.Min(pet.Right-Width-(int)(13*scale),area.Right-Width-8));
+        int y=Math.Max(area.Top+8,pet.Top-Height-(int)(6*scale));
+        Point position=new Point(x,y);int nextArrow=Math.Max((int)(24*scale),Math.Min(Width-(int)(24*scale),pet.Left+pet.Width/2-x));
+        bool changed=arrowX!=nextArrow;arrowX=nextArrow;if(Location!=position)Location=position;if(changed&&Visible)Render();
+    }
+    private void Render(){
+        if(!IsHandleCreated)return;if(surface==null||surface.Bitmap.Width!=Width||surface.Bitmap.Height!=Height){if(surface!=null)surface.Dispose();surface=new PetSurface(Width,Height);}
+        float scale=dpi/96f,radius=14*scale,tail=10*scale;var g=surface.Graphics;g.Clear(Color.Transparent);g.SmoothingMode=SmoothingMode.AntiAlias;
+        using(var path=new GraphicsPath()){
+            float right=Width-2,bottom=Height-tail-2;path.AddArc(1,1,radius*2,radius*2,180,90);path.AddArc(right-radius*2,1,radius*2,radius*2,270,90);path.AddArc(right-radius*2,bottom-radius*2,radius*2,radius*2,0,90);
+            path.AddLine(right-radius,bottom,arrowX+tail,bottom);path.AddLine(arrowX+tail,bottom,arrowX,Height-2);path.AddLine(arrowX,Height-2,arrowX-tail,bottom);path.AddArc(1,bottom-radius*2,radius*2,radius*2,90,90);path.CloseFigure();
+            using(var fill=new SolidBrush(dark?Color.FromArgb(252,35,36,40):Color.FromArgb(252,249,250,252)))g.FillPath(fill,path);using(var pen=new Pen(dark?Color.FromArgb(180,80,83,91):Color.FromArgb(65,80,90,110),Math.Max(1,scale)))g.DrawPath(pen,path);
+        }
+        using(var title=new Font("Microsoft YaHei UI",11*scale,FontStyle.Bold,GraphicsUnit.Pixel))using(var font=new Font("Microsoft YaHei UI",13*scale,FontStyle.Regular,GraphicsUnit.Pixel))using(var brush=new SolidBrush(dark?Color.FromArgb(241,242,245):Color.FromArgb(35,38,43)))using(var format=new StringFormat{Trimming=StringTrimming.EllipsisCharacter,FormatFlags=StringFormatFlags.LineLimit}){
+            g.DrawString("NewMate",title,brush,16*scale,11*scale);g.DrawString("×",font,brush,Width-30*scale,9*scale);g.DrawString(message,font,brush,new RectangleF(16*scale,35*scale,Width-32*scale,Height-52*scale),format);
+        }
+        g.Flush(FlushIntention.Sync);var location=new PetNative.Point(Left,Top);var origin=new PetNative.Point(0,0);var size=new PetNative.Size(Width,Height);var blend=new PetNative.Blend{Alpha=255,Format=1};
+        PetNative.UpdateLayeredWindow(Handle,IntPtr.Zero,ref location,ref size,surface.DC,ref origin,0,ref blend,2);
+    }
+    protected override void OnMouseClick(MouseEventArgs e){base.OnMouseClick(e);if(e.Button!=MouseButtons.Left)return;if(e.X<Width-40*dpi/96f||e.Y>32*dpi/96f){if(OpenChat!=null)OpenChat();}Hide();}
+    protected override void Dispose(bool disposing){if(disposing&&surface!=null){surface.Dispose();surface=null;}base.Dispose(disposing);}
+}
+
 internal sealed class DesktopPet : Form {
     private readonly PetConfig config;
     private readonly string configPath;
@@ -352,6 +409,23 @@ internal sealed class DesktopPet : Form {
     private int frameCount;
     private string captureError="";
     private string settingsError="";
+    private bool companion,cu=true;
+    private long pendingClick=-1,ignoreClickUntil=-1;
+    private long lastClickAt=-1;
+    private Point lastClickPoint;
+    private readonly List<object> hostNotices=new List<object>();
+    private string noticeThread="";
+    private readonly HashSet<string> shownNotices=new HashSet<string>();
+    private int notificationCount;
+    private DesktopBubble bubble;
+    private string bubbleId="",bubbleThread="";
+    private bool bubbleDark;
+    private long readerUntil;
+    private static long UtcMillis(){return(DateTime.UtcNow.Ticks-621355968000000000L)/10000;}
+    private bool ReaderFocused(){
+        if(readerUntil<=UtcMillis()||String.IsNullOrEmpty(config.dshExe))return false;
+        try{uint pid;PetNative.GetWindowThreadProcessId(PetNative.GetForegroundWindow(),out pid);return String.Equals(Process.GetProcessById((int)pid).MainModule.FileName,config.dshExe,StringComparison.OrdinalIgnoreCase);}catch{return false;}
+    }
 
     internal DesktopPet(PetConfig config, string configPath) {
         this.config=config; this.configPath=configPath; ownerIdentity=PetFiles.Identity(config.ownerPid);
@@ -359,16 +433,18 @@ internal sealed class DesktopPet : Form {
         FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false;
         StartPosition=FormStartPosition.Manual; AutoScaleMode=AutoScaleMode.None;
         Cursor=Cursors.Hand;
+        SetStyle(ControlStyles.StandardClick|ControlStyles.StandardDoubleClick,true);
         LoadScale();
         BuildBody((int)PetNative.GetDpiForSystem());
         BuildMenu();
+        PollCompanion();
         Rectangle area=Screen.FromPoint(Cursor.Position).WorkingArea;
         Location=new Point(area.Right-Width-24,area.Bottom-Height-24);
         timer=new PetFrameClock(this,delegate{Tick(this,EventArgs.Empty);});
-        Shown+=delegate { appearedAt=previousTick=clock.ElapsedMilliseconds; Render(); WriteStatus(); timer.Start(); };
+        Shown+=delegate { appearedAt=previousTick=clock.ElapsedMilliseconds; Render(); WriteStatus(); timer.Start(); BeginInvoke((Action)delegate{if(!String.IsNullOrEmpty(config.menuThemePath)){dshMenu=new DshPetMenu(config,ChangeScale,WriteStatus,delegate(Point point){if(exitStarted<0)sizeMenu.Show(point);},MenuAction);dshMenu.Warm();}}); };
     }
     protected override bool ShowWithoutActivation { get { return true; } }
-    protected override CreateParams CreateParams { get { var cp=base.CreateParams; cp.ExStyle|=0x08080088; return cp; } }
+    protected override CreateParams CreateParams { get { var cp=base.CreateParams; cp.ExStyle|=0x08080088; cp.ClassStyle|=0x8; return cp; } }
     protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); PetNative.MarkPet(Handle); }
     protected override void OnHandleDestroyed(EventArgs e) { PetNative.UnmarkPet(Handle); base.OnHandleDestroyed(e); }
 
@@ -417,18 +493,16 @@ internal sealed class DesktopPet : Form {
     }
 
     private void BuildMenu() {
-        sizeMenu.ShowImageMargin=false; sizeMenu.ShowCheckMargin=true;
-        sizeMenu.Items.Add(new ToolStripMenuItem("NewMate · 大小倍率") { Enabled=false });
-        sizeMenu.Items.Add(new ToolStripSeparator());
-        var slider=new TrackBar {Minimum=300,Maximum=3000,TickStyle=TickStyle.None,SmallChange=1,LargeChange=100,Width=260,Height=35,AutoSize=false};
-        sizeMenu.Items.Add(new ToolStripControlHost(slider));
-        slider.Scroll+=delegate {ChangeScale(slider.Value/1000.0);sizeMenu.Items[0].Text="NewMate · "+(sizeMultiplier*100).ToString("0.#")+"%";};
-        sizeMenu.Opening+=delegate {
-            slider.Value=(int)Math.Round(sizeMultiplier*1000);
-            sizeMenu.Items[0].Text="NewMate · "+(sizeMultiplier*100).ToString("0.#")+"% (30%–300%)";
-        };
-        sizeMenu.Opened+=delegate { WriteStatus(); };
-        sizeMenu.Closed+=delegate { WriteStatus(); };
+        sizeMenu.ShowImageMargin=false;sizeMenu.ShowCheckMargin=false;sizeMenu.Font=new Font("Microsoft YaHei UI",9.5f);sizeMenu.Padding=new Padding(6);
+        sizeMenu.Items.Add(new ToolStripMenuItem("退出伴随",null,delegate{MenuAction("stop-companion");}));
+        sizeMenu.Items.Add(new ToolStripMenuItem("打开设置",null,delegate{MenuAction("settings");}));
+        foreach(ToolStripItem item in sizeMenu.Items)item.Padding=new Padding(12,8,12,8);
+        sizeMenu.Opening+=delegate{sizeMenu.Items[0].Enabled=companion;sizeMenu.BackColor=bubbleDark?Color.FromArgb(35,36,40):Color.FromArgb(249,250,252);sizeMenu.ForeColor=bubbleDark?Color.FromArgb(241,242,245):Color.FromArgb(35,38,43);};
+        sizeMenu.Opened+=delegate{WriteStatus();};sizeMenu.Closed+=delegate{WriteStatus();};
+    }
+    private void MenuAction(string action){
+        if(action=="stop-companion"){if(companion)PetFiles.WriteJson(Path.Combine(config.directory,"companion-command.json"),new{id=Guid.NewGuid().ToString(),action=action,at=DateTime.UtcNow.ToString("o")});}
+        if(action=="settings"){PetFiles.WriteJson(Path.Combine(config.directory,"open-chat.json"),new{id=Guid.NewGuid().ToString(),page="settings",at=DateTime.UtcNow.ToString("o")});WakeDsh();}
     }
     private void LoadScale() {
         // Read before the first bitmap/window is built: no default-size flash.
@@ -498,24 +572,81 @@ internal sealed class DesktopPet : Form {
         if (exitStarted>=0) return;
         if (e.Button==MouseButtons.Right) {
             if(!String.IsNullOrEmpty(config.menuThemePath) && File.Exists(config.menuThemePath)) {
-                if(dshMenu==null) dshMenu=new DshPetMenu(config,ChangeScale,WriteStatus,delegate(Point point){if(exitStarted<0)sizeMenu.Show(point);});
-                dshMenu.Present(PointToScreen(e.Location),sizeMultiplier,Bounds);
+                if(dshMenu==null) dshMenu=new DshPetMenu(config,ChangeScale,WriteStatus,delegate(Point point){if(exitStarted<0)sizeMenu.Show(point);},MenuAction);
+                if(dshMenu.Ready)dshMenu.Present(PointToScreen(e.Location),sizeMultiplier,Bounds);
+                else { dshMenu.Warm();sizeMenu.Show(PointToScreen(e.Location)); }
             } else sizeMenu.Show(PointToScreen(e.Location));
             return;
         }
         if (!pressed || e.Button!=MouseButtons.Left) return;
         bool toggle=!dragged;
         if (dragged) {
+            lastClickAt=-1;
             Point final=PointToScreen(e.Location);
             Location=new Point(pressLocation.X+final.X-pressScreen.X,pressLocation.Y+final.Y-pressScreen.Y);
         }
         pressed=false; Capture=false;
         stretchX.Target=stretchY.Target=1;
         KeepVisible();
-        if (toggle) Toggle();
+        if (toggle && clock.ElapsedMilliseconds>=ignoreClickUntil) {
+            if(companion) {
+                long clickTime=clock.ElapsedMilliseconds;Point clickPoint=PointToScreen(e.Location);
+                if(lastClickAt>=0&&clickTime-lastClickAt<=SystemInformation.DoubleClickTime&&Math.Abs(clickPoint.X-lastClickPoint.X)<=SystemInformation.DoubleClickSize.Width&&Math.Abs(clickPoint.Y-lastClickPoint.Y)<=SystemInformation.DoubleClickSize.Height){
+                    lastClickAt=-1;pendingClick=-1;ignoreClickUntil=clickTime+SystemInformation.DoubleClickTime;OpenChat("");
+                }else{lastClickAt=clickTime;lastClickPoint=clickPoint;if(cu)pendingClick=clickTime+SystemInformation.DoubleClickTime;}
+            }
+            else if(cu)Toggle();
+        }
         WriteStatus();
     }
     protected override void OnMouseCaptureChanged(EventArgs e) { base.OnMouseCaptureChanged(e); if (!Capture) { pressed=false; if (exitStarted<0) stretchX.Target=stretchY.Target=1; } }
+    protected override void OnMouseDoubleClick(MouseEventArgs e) {
+        base.OnMouseDoubleClick(e);
+        if(e.Button==MouseButtons.Left&&companion&&!dragged&&clock.ElapsedMilliseconds>=ignoreClickUntil){lastClickAt=-1;pendingClick=-1;ignoreClickUntil=clock.ElapsedMilliseconds+SystemInformation.DoubleClickTime;OpenChat("");}
+    }
+    private void OpenChat(string threadId) {
+        PetFiles.WriteJson(Path.Combine(config.directory,"open-chat.json"),new{id=Guid.NewGuid().ToString(),threadId=threadId,at=DateTime.UtcNow.ToString("o")});
+        WakeDsh();
+    }
+    private void WakeDsh() {
+        if(String.IsNullOrEmpty(config.dshExe)||!File.Exists(config.dshExe))return;
+        // Always ask the verified single-instance owner to show/recreate its primary window.
+        // A hidden Electron window can otherwise be mistaken for a successful activation.
+        try{var launch=new ProcessStartInfo(config.dshExe){UseShellExecute=false,WorkingDirectory=Path.GetDirectoryName(config.dshExe)};launch.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE");launch.EnvironmentVariables.Remove("NODE_OPTIONS");Process.Start(launch);}catch(Exception ex){settingsError=ex.Message;}
+        // User input belongs to this process even though the pet never activates.
+        // Restore only the verified DSH owner, before using its single-instance fallback.
+        foreach(var process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(config.dshExe)))using(process)try{
+            IntPtr window=process.MainWindowHandle;
+            if(window==IntPtr.Zero||!PetNative.IsWindowVisible(window)||!String.Equals(process.MainModule.FileName,config.dshExe,StringComparison.OrdinalIgnoreCase))continue;
+            if(PetNative.IsIconic(window))PetNative.ShowWindow(window,9);
+            if(PetNative.SetForegroundWindow(window))return;
+        }catch(InvalidOperationException){}catch(System.ComponentModel.Win32Exception){}
+    }
+    private void PollCompanion() {
+        try {
+            string mode=Path.Combine(config.directory,"mode.json");
+            if(File.Exists(mode)){
+                var data=PetFiles.Json.Deserialize<Dictionary<string,object>>(File.ReadAllText(mode));
+                bool previousCu=cu;companion=data.ContainsKey("companion")&&(bool)data["companion"];cu=!data.ContainsKey("cu")||(bool)data["cu"];
+                if(previousCu!=cu)Render();
+                if(data.ContainsKey("dshExe"))config.dshExe=Convert.ToString(data["dshExe"]);
+                bubbleDark=data.ContainsKey("bubbleDark")&&(bool)data["bubbleDark"];if(bubble!=null)bubble.SetTheme(bubbleDark);
+                readerUntil=data.ContainsKey("readerUntil")?Convert.ToInt64(data["readerUntil"]):0;
+                if(!cu&&viewer!=null&&viewerOpening)Collapse();
+            }
+            if(bubble!=null&&(!companion||ReaderFocused()||UtcMillis()>=bubble.Expires))bubble.Hide();
+            if(!companion)return;
+            string file=Path.Combine(config.directory,"notifications.json");if(!File.Exists(file))return;
+            var items=PetFiles.Json.Deserialize<List<Dictionary<string,object>>>(File.ReadAllText(file));
+            foreach(var item in items){string id=Convert.ToString(item["id"]);if(!shownNotices.Add(id))continue;
+                if(ReaderFocused())continue;
+                noticeThread=item.ContainsKey("threadId")?Convert.ToString(item["threadId"]):"";
+                if(bubble==null){bubble=new DesktopBubble();bubble.OpenChat=()=>OpenChat(bubbleThread);}bubble.SetTheme(bubbleDark);bubbleId=id;bubbleThread=noticeThread;bubble.Present(Convert.ToString(item.ContainsKey("bubble")?item["bubble"]:item["text"]),Bounds,currentDpi,UtcMillis());
+                // NewMate delivery is exclusively the shared desktop bubble.
+                PetFiles.WriteJson(Path.Combine(config.directory,"notification-ack.json"),new{id=id,submitted=false,bubble=true,notifications=hostNotices,at=DateTime.UtcNow.ToString("o")});
+            }
+        }catch(IOException){}catch(ArgumentException){}catch(InvalidOperationException){}
+    }
     protected override void WndProc(ref Message m) {
         if (m.Msg==0x02E0 && body!=null) { BuildBody((int)(m.WParam.ToInt64()&0xffff)); KeepVisible(); }
         base.WndProc(ref m);
@@ -610,6 +741,7 @@ internal sealed class DesktopPet : Form {
         long nowTime=clock.ElapsedMilliseconds;
         if(nowTime-lastSettingsPoll>=200){
             lastSettingsPoll=nowTime;
+            PollCompanion();
             string transferMotion=Path.Combine(config.directory,"transfer-motion");
             if(exitStarted<0&&File.Exists(transferMotion))try{string direction=File.ReadAllText(transferMotion);File.Delete(transferMotion);stretchX.Target=stretchY.Target=1;stretchX.Velocity+=direction=="in"?-4:4;stretchY.Velocity+=direction=="in"?4:-4;}catch(IOException){}
             if (File.Exists(Path.Combine(config.directory,"stop")) || !PetFiles.Alive(config.ownerPid,ownerIdentity)) BeginExit();
@@ -617,6 +749,7 @@ internal sealed class DesktopPet : Form {
                 double oldScale=sizeMultiplier;LoadScale();double next=sizeMultiplier;sizeMultiplier=oldScale;ApplyScale(next,false);
             }
         }
+        if(pendingClick>=0&&nowTime>=pendingClick){pendingClick=-1;if(cu)Toggle();}
         double dt=Math.Max(0.001,Math.Min(0.064,(nowTime-previousTick)/1000.0)); previousTick=nowTime;
         if (exitStarted>=0 && nowTime-exitStarted>90) { stretchX.Target=0.04; stretchY.Target=0.02; }
         stretchX.Step(dt,23,exitStarted<0 ? 0.58 : 0.8); stretchY.Step(dt,25,exitStarted<0 ? 0.58 : 0.8);
@@ -631,7 +764,7 @@ internal sealed class DesktopPet : Form {
             if (!viewerOpening && !reveal.Moving) FinishCollapse();
         }
         bool moving=stretchX.Moving || stretchY.Moving || (viewer!=null && reveal.Moving) || exitStarted>=0;
-        if (moving || !anyExpanded) Render();
+        if (moving || (cu&&!anyExpanded)) Render();
         if (exitStarted>=0 && nowTime-exitStarted>=650 && viewer==null) { allowClose=true; Close(); return; }
         if (nowTime-lastStatus>=250) {
             bool now=PetNative.AnyViewer();
@@ -639,9 +772,11 @@ internal sealed class DesktopPet : Form {
             WriteStatus(); lastStatus=clock.ElapsedMilliseconds;
         }
         PollCapture();
+        if(bubble!=null&&bubble.Visible)bubble.PositionAbove(Bounds);
         if (clock.ElapsedMilliseconds-lastRaise>=1000) {
             if (viewer!=null) PetNative.Raise(viewer.Handle);
             PetNative.Raise(Handle); lastRaise=clock.ElapsedMilliseconds;
+            if(bubble!=null&&bubble.Visible)PetNative.Raise(bubble.Handle);
             if(dshMenu!=null && dshMenu.Open)PetNative.Raise(dshMenu.Handle);
             if (!pressed) KeepVisible();
         }
@@ -650,7 +785,7 @@ internal sealed class DesktopPet : Form {
         if(!IsHandleCreated || body==null)return;
         if(surface==null || surface.Bitmap.Width!=Width || surface.Bitmap.Height!=Height){if(surface!=null)surface.Dispose();surface=new PetSurface(Width,Height);}
         Buffer.BlockCopy(basePixels,0,paintPixels,0,basePixels.Length);
-        if(!anyExpanded){double time=4*Math.PI*clock.Elapsed.TotalMilliseconds/3000,cos=Math.Cos(time),sin=Math.Sin(time);
+        if(cu&&!anyExpanded){double time=4*Math.PI*clock.Elapsed.TotalMilliseconds/3000,cos=Math.Cos(time),sin=Math.Sin(time);
             for(int i=0;i<outline.Count;i++){int offset=outline[i].Y*pixelStride+outline[i].X*4;byte value=(byte)Math.Round(127.5*(1-outlineCos[i]*cos-outlineSin[i]*sin));paintPixels[offset]=paintPixels[offset+1]=paintPixels[offset+2]=value;paintPixels[offset+3]=255;}
         }
         var bits=painted.LockBits(new Rectangle(Point.Empty,painted.Size),ImageLockMode.WriteOnly,PixelFormat.Format32bppArgb);
@@ -665,7 +800,8 @@ internal sealed class DesktopPet : Form {
     private void WriteStatus() {
         try { PetFiles.WriteJson(Path.Combine(config.directory,"status.json"),new {
             kind="virtual-desktop-pet", pid=Process.GetCurrentProcess().Id, hwnd=Handle.ToInt64(),
-            desktop=config.desktop, bounds=PetNative.Bounds(Bounds), expanded=expanded, outline_active=!anyExpanded,
+            desktop=config.desktop, bounds=PetNative.Bounds(Bounds), expanded=expanded, outline_active=cu&&!anyExpanded, companion=companion,cu=cu,notification_count=notificationCount,
+            bubble_dark=bubbleDark,bubble_visible=bubble!=null&&bubble.Visible,bubble_message_id=bubbleId,bubble_bounds=bubble!=null&&bubble.Visible?PetNative.Bounds(bubble.Bounds):null,reader_focused=ReaderFocused(),input_idle_ms=PetNative.InputIdleMillis(),user_desktop_active=PetNative.UserDesktopActive(),
             viewer_hwnd=viewer==null ? 0 : viewer.Handle.ToInt64(), viewer_bounds=viewer==null ? null : PetNative.Bounds(viewer.Bounds),
             viewer_transition=viewer==null ? "hidden" : (reveal.Moving ? (viewerOpening ? "opening" : "closing") : "open"),
             viewer_content_bounds=viewer==null ? null : PetNative.Bounds(viewer.ContentBounds),
@@ -686,6 +822,7 @@ internal sealed class DesktopPet : Form {
     }
     protected override void Dispose(bool disposing) {
         if (disposing) {
+            if(bubble!=null){bubble.Dispose();bubble=null;}
             timer.Stop(); timer.Dispose();
             if(surface!=null){surface.Dispose();surface=null;}if(painted!=null){painted.Dispose();painted=null;}
             StopCapture(); expanded=false; Owner=null;

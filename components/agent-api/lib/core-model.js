@@ -127,6 +127,17 @@ export async function verifyModelAvailable(llm, selection) {
   if (!selection?.ok) {
     return { verified: false, code: String(selection?.code ?? 'model_not_selected'), reason: String(selection?.reason ?? '') };
   }
+  // The catalog is advisory. DSH's exact-model resolver owns plugin route compatibility.
+  if(typeof llm?.resolveModelInfo==='function'){
+    try{
+      const info=await llm.resolveModelInfo(selection.provider,selection.model);
+      if(info?.provider!==selection.provider||info?.id!==selection.model)return{verified:false,code:'model_unavailable',reason:'DSH returned model metadata for a different provider/model'};
+      return{verified:true,code:'',reason:'DSH exact model resolver accepted the authorised provider/model'};
+    }catch(error){
+      if(['NO_ADAPTER','UNKNOWN_MODEL','INVALID_MODEL_INFO'].includes(error?.code))return{verified:false,code:'model_unavailable',reason:String(error.message)};
+      return{verified:null,code:'model_unverified',reason:'DSH exact model lookup failed: '+String(error.message)};
+    }
+  }
   if (typeof llm?.listModels !== 'function') {
     return {
       verified: null,
@@ -156,7 +167,8 @@ export async function verifyModelAvailable(llm, selection) {
       reason: `the provider ${selection.provider} currently lists no models at all, so the authorised model ${selection.model} is not available`,
     };
   }
-  const found = listed.some((entry) => String(entry?.[MODEL_INFO_FIELDS.id] ?? '') === selection.model);
+  const found = listed.some((entry) => entry?.[MODEL_INFO_FIELDS.provider] === selection.provider &&
+    entry?.[MODEL_INFO_FIELDS.id] === selection.model);
   return found
     ? { verified: true, code: '', reason: `the provider ${selection.provider} lists ${selection.model}` }
     : {

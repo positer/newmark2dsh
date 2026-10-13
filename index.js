@@ -49,7 +49,6 @@ import { schema } from './lib/schema.js';
 import { defaultRoot, resolveRoot } from './lib/root.js';
 import { embedJson } from './lib/embed.js';
 import { latestCore } from './lib/core-update.js';
-import { createRestartController } from './lib/core-restart.js';
 import { causeChain, createErrorLog, describeError } from './lib/errors.js';
 import {
   MODEL_ID_FIELD,
@@ -128,6 +127,7 @@ export const Config = schema
         .string()
         .description('The provider route the authorised model belongs to, e.g. deepseek-official.')
         .default(''),
+      newMateWatchRoot: schema.string().description('Opt-in directory for NewMate shallow file-change measurement; empty disables background observation.').default(''),
     })
   : undefined;
 
@@ -193,6 +193,14 @@ const COMPONENTS = {
     load: () => import('./components/agent-api/index.js'),
     config: (root) => ({ root, workspace: '', timeoutMs: 120000, maxSteps: 8 }),
   },
+  newMate: {
+    load: () => import('./components/newmate/index.js'),
+    config: (root, source = {}) => ({ root, watchRoot: source.newMateWatchRoot || '' }),
+  },
+  heartBeat: {
+    load: () => import('./components/heartbeat/index.js'),
+    config: (root) => ({ root }),
+  },
 };
 
 /**
@@ -209,11 +217,16 @@ const COMPONENT_GLOBALS = {
   memoryLab: '__NEWMARK_MEMORYLAB__',
   computerUse: '__NEWMARK_COMPUTERUSE__',
   agentApi: '__NEWMARK_AGENTAPI__',
+  newMate: '__NEWMARK_NEWMATE__',
+  heartBeat: '__NEWMARK_HEARTBEAT__',
 };
 
 export function apply(ctx, config) {
   const root = resolveRoot(config);
-  const restart = createRestartController(root);
+  const restart = () => {
+    if (!service.heartBeat) throw Error('heartBeat 组件未启用，无法交托更新后重启任务');
+    return service.heartBeat;
+  };
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path: '/newmark-core/update',
@@ -229,9 +242,9 @@ export function apply(ctx, config) {
             if (raw.length > 2048) throw Error('重启请求过大');
           }
           const input = JSON.parse(raw);
-          if (input.action === 'prepare') body = await restart.prepare(input.version);
+          if (input.action === 'prepare') body = await restart().prepare(input.version);
           else if (input.action === 'restart') {
-            const helper = await restart.restart(input.ticket);
+            const helper = await restart().restart(input.ticket, true);
             res.once('finish', helper.commit);
             res.once('close', () => { if (!res.writableFinished) helper.cancel(); });
             body = { ok: true, restarting: true };
@@ -347,7 +360,7 @@ export function apply(ctx, config) {
     component
       .load()
       .then((module) => {
-        if (!composed.has(name)) composed.set(name, ctx.plugin(module, component.config(root)));
+        if (!composed.has(name)) composed.set(name, ctx.plugin(module, component.config(root, liveConfig())));
       })
       .catch((error) => {
         ctx.logger?.error?.(
@@ -540,7 +553,7 @@ export function apply(ctx, config) {
             }
             const name = String(parsed.component || '');
             const wanted = parsed.enabled === true;
-            if (name === 'newMate') {
+            if (name === 'newMate' && Object.hasOwn(parsed, 'sizeMultiplier')) {
               try { send(200, {ok:true,newMate:writeNewMateSettings(root,parsed.sizeMultiplier)}); }
               catch(error) { send(400,{ok:false,error:error.message}); }
               return;
@@ -751,7 +764,7 @@ export function apply(ctx, config) {
             .load()
             .then((module) => {
               if (cancelled) return;
-              composed.set(name, ctx.plugin(module, component.config(root)));
+              composed.set(name, ctx.plugin(module, component.config(root, liveConfig())));
             })
             .catch((error) => {
               ctx.logger?.error?.(

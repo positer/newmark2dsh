@@ -1,0 +1,10 @@
+{
+  "name": "newmark2dsh-heartbeat",
+  "version": "0.3.10",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  }
+}

@@ -209,6 +209,7 @@
  * =====================================================================================
  */
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import {
   EXIT_ABORTED,
@@ -224,6 +225,8 @@ import {
   hostProfile,
 } from './lib/contract.js';
 import { runAgentLoop } from './lib/loop.js';
+import { admitImages, visualToolContent } from './lib/visual.js';
+import { newMateContext } from '../../lib/newmate-context.js';
 import { JUDGE_SYSTEM_PROMPT, createLlmStreamFn, excerpt, toolCallArgumentsChecked, toolCallKey } from './lib/llm-seam.js';
 import { readCoreSelection, verifyModelAvailable } from './lib/core-model.js';
 
@@ -771,7 +774,7 @@ export function createAgentApi({
    * names, and a name outside the set is answered by `executeToolCalls` without the registry being
    * asked. A failing tool still throws, so a failure reaches the model as a failure it can adapt to.
    */
-  function buildRunTools(view, filter, signal, scope, reach) {
+  function buildRunTools(view, filter, signal, scope, reach, selection = readCoreSelection(view)) {
     const schemasFor = (layer) => {
       const schemas = isFn(view.tools?.schemas) ? view.tools.schemas(layer) : [];
       return Array.isArray(schemas) ? schemas : [];
@@ -843,7 +846,7 @@ export function createAgentApi({
               throw error;
             }
             return {
-              content: typeof classified.result === 'string' ? classified.result : JSON.stringify(classified.result, null, 2),
+              content: await visualToolContent(name, classified.result, view, selection, signal),
               details: { exit: EXIT_OK },
             };
           },
@@ -981,9 +984,9 @@ export function createAgentApi({
     const runReach = dispatchScope(runCall);
     // The offer and its reconciliation come back together: `tools` is always a subset of the layer
     // the calls resolve in, and `withheld` names what the caller could see and the offer dropped.
-    const runSet = buildRunTools(view, toolFilter, controller.signal, runCall.scope, runReach);
+    const runSet = buildRunTools(view, toolFilter, controller.signal, runCall.scope, runReach, selection);
     const runTools = runSet.tools;
-    const streamFn = createLlmStreamFn(view.llm, selection, {});
+    const streamFn = createLlmStreamFn(view.llm, selection, { sessionId: `newmark-run-${randomUUID()}` });
     const events = [];
     /**
      * The event log, bounded twice: a count and a character budget.
@@ -1021,15 +1024,18 @@ export function createAgentApi({
     let outcome;
     try {
       counters.modelCalls += 1;
-      contextStats = conversation.push({ role: 'user', content: [{ type: 'text', text: prompt }] });
+      const images = await admitImages(args.images ?? [], view, selection, controller.signal);
+      contextStats = conversation.push({ role: 'user', content: [{ type: 'text', text: prompt }, ...images] });
       outcome = await runAgentLoop(
         // Handed the conversation's own message array, already trimmed to the bound. This is the
         // prompt list; the loop then owns its per-turn history, which `maxSteps` bounds (see the
         // note on `createConversation` for exactly what is and is not bounded here).
         conversation.messages.slice(),
         {
-          state: { model: selection, systemPrompt: JUDGE_SYSTEM_PROMPT, messages: [], tools: runTools },
+          state: { model: selection, systemPrompt: newMateContext()?.prefix ? `${newMateContext().prefix}\n\n${JUDGE_SYSTEM_PROMPT}` : JUDGE_SYSTEM_PROMPT, messages: [], tools: runTools },
           streamFn,
+          pollSteer: newMateContext()?.steer?.drain,
+          hasSteer: newMateContext()?.steer?.hasPending,
           toolExecution: 'serial',
           maxSteps: Math.floor(steps),
           // THE RETRY BOUND, wired where the wire shape is known. `toolCallKey` canonicalises a
@@ -1514,6 +1520,7 @@ export function createAgentApi({
             properties: {
               prompt: { type: 'string', description: 'The task to have judged. Required and must be non-empty.' },
               output_schema: { type: 'object', description: "A JSON Schema with type: 'object'. When present the run must answer with JSON matching it, or the call fails with exit 4 schema_violation." },
+              images: { type: 'array', maxItems: 4, description: 'Optional image uploads admitted by the DSH attachment store and passed as image blocks; requires verified image capability on the Core authorised model.', items: { type: 'object', properties: { data: { type: 'string' }, mediaType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] } }, required: ['data', 'mediaType'], additionalProperties: false } },
               workspace: { type: 'string', description: 'Absolute working directory for the run. Default <newmarkRoot>/Work, created if absent.' },
               timeout_ms: { type: 'number', description: 'Abort the run after this many milliseconds. Default 120000.' },
               max_steps: { type: 'number', description: 'Model turns before the run is stopped and reported as max_steps. Default 8.' },
