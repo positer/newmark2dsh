@@ -35,7 +35,7 @@ import Darwin
     }
     func openPreview(){
         guard let pet=panel else{return};let screen=NSScreen.screens.first(where:{$0.frame.intersects(pet.frame)}) ?? NSScreen.main;guard let screen=screen else{return}
-        let window=PreviewWindow(contentRect:screen.visibleFrame,styleMask:[.titled,.closable,.resizable],backing:.buffered,defer:false);window.setFrame(screen.visibleFrame,display:true);window.title="NewMate · Space 只读预览";window.isReleasedWhenClosed=false;window.level = .floating;window.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary];window.closed={[weak self] in self?.closePreview()}
+        let window=PreviewWindow(contentRect:screen.visibleFrame,styleMask:[.titled,.closable,.resizable],backing:.buffered,defer:false);window.setFrame(screen.visibleFrame,display:true);window.title="NewMate · Space 只读预览";window.isReleasedWhenClosed=false;window.level = .normal;window.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary];window.closed={[weak self] in self?.closePreview()}
         let root=NSView(frame:NSRect(origin:.zero,size:screen.visibleFrame.size)),image=NSImageView(frame:root.bounds);image.imageScaling = .scaleProportionallyUpOrDown;image.autoresizingMask=[.width,.height];root.addSubview(image)
         let label=NSTextField(labelWithString:"等待目标窗口画面；预览不转发输入");label.frame=NSRect(x:16,y:16,width:root.bounds.width-32,height:44);label.autoresizingMask=[.width];root.addSubview(label);window.contentView=root;preview=window;previewImage=image;previewLabel=label;window.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps:true);write("preview-request.json",["id":UUID().uuidString,"at":ISO8601DateFormatter().string(from:Date())]);refreshPreview()

@@ -46,6 +46,14 @@ jobs:
           NEWMARK_NATIVE_BINARY: ${{ runner.temp }}/newmark-cu
           NEWMARK_EVIDENCE_DIR: ${{ runner.temp }}/newmark-evidence
         run: node scripts/verify-darwin-render-pipeline.mjs
+      - name: Real NewMate client browser rendering
+        env:
+          NEWMARK_WEB_DEPS: ${{ runner.temp }}/newmark-web-deps
+          NEWMARK_EVIDENCE_DIR: ${{ runner.temp }}/newmark-evidence
+        run: |
+          npm install --prefix "$NEWMARK_WEB_DEPS" --no-package-lock --no-audit --no-fund react@18.3.1 react-dom@18.3.1 playwright@1.56.1
+          "$NEWMARK_WEB_DEPS/node_modules/.bin/playwright" install chromium webkit
+          node scripts/verify-darwin-web-render.mjs
       - name: Preserve owned window render evidence
         if: always()
         uses: actions/upload-artifact@v4
