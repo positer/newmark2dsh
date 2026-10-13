@@ -9,7 +9,7 @@ on:
         default: false
         description: Run only the Mission Control UI availability probe
 concurrency:
-  group: macos-validation-${{ github.ref }}
+  group: macos-validation-${{ github.ref }}-${{ inputs.probe_only }}
   cancel-in-progress: true
 permissions:
   contents: read
@@ -74,7 +74,11 @@ jobs:
           if-no-files-found: warn
   space_probe:
     if: ${{ inputs.probe_only }}
-    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -90,6 +94,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mission-control-probe
+          name: mission-control-probe-${{ matrix.os }}
           path: ${{ runner.temp }}/space-evidence
           retention-days: 3

@@ -18,7 +18,7 @@ check('native guard waits at least 100ms with bounded polling',swift.includes('i
 check('agent events use a private state and do not suppress physical input',swift.includes('stateID:.privateState')&&swift.includes('localEventsSuppressionInterval=0')&&!swift.includes('EventSource:nil'));
 check('background Space AX calls have no global fallback',swift.includes('space_ax_action_unavailable')&&swift.includes('space_takeover_required'));
 check('exact foreground AX window and mouse are saved before delivery',swift.includes('UserContext(app:app,window:window,windowID:id,mouse:mouse,revision:revision)'));
-check('success and failure both pass through context restoration',swift.includes('let restored=await restoreUserContext(saved,pid)')&&swift.includes('catch let failure as CuFailure {answer='));
+check('success and failure both pass through context restoration',swift.includes('let restored=await restoreUserContext(saved,pid,forceSpaceRestore:offSpace)')&&swift.includes('catch let failure as CuFailure {answer='));
 check('cursor/focus restoration yield to newly resumed user input',swift.includes('new_user_input_preserved')&&swift.includes('unexpected_new_focus_preserved'));
 check('native restoration raises exact original window and restores cursor',swift.includes('AXUIElementPerformAction(saved.window,kAXRaiseAction')&&swift.includes('CGWarpMouseCursorPosition(saved.mouse)'));
 check('delivery failure reports applied action instead of replaying',swift.includes('"action_applied"]=true')&&swift.includes('do not replay the action'));
