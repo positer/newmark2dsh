@@ -46,6 +46,10 @@ jobs:
         run: |
           xcrun swiftc -parse-as-library components/computeruse/lib/darwin-native.swift -o "$RUNNER_TEMP/newmark-cu" -framework AppKit -framework ScreenCaptureKit
           xcrun swiftc -parse-as-library components/computeruse/lib/desktop-pet-darwin.swift -o "$RUNNER_TEMP/newmark-pet" -framework AppKit -framework CoreGraphics
+      - name: Native production contour at 1x and 2x backing scale
+        env:
+          NEWMARK_EVIDENCE_DIR: ${{ runner.temp }}/newmark-evidence
+        run: node scripts/verify-darwin-border-scale.mjs
       - name: Read-only native protocol smoke
         env:
           NEWMARK_NATIVE_BINARY: ${{ runner.temp }}/newmark-cu

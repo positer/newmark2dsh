@@ -1,0 +1,8 @@
+import fs from 'node:fs';import path from 'node:path';import os from 'node:os';import {fileURLToPath} from 'node:url';import {execFileSync} from 'node:child_process';import assert from 'node:assert/strict';
+if(process.platform!=='darwin'){console.log('SKIP native contour scale probe requires macOS');process.exit(0);}
+const core=fs.existsSync(fileURLToPath(new URL('../components',import.meta.url)))?fileURLToPath(new URL('../',import.meta.url)):fileURLToPath(new URL('../',import.meta.url)),evidence=process.env.NEWMARK_EVIDENCE_DIR;
+assert(evidence);fs.mkdirSync(evidence,{recursive:true});const folder=fs.mkdtempSync(path.join(os.tmpdir(),'mac-contour-scale-')),source=fs.readFileSync(path.join(core,'components/computeruse/lib/desktop-pet-darwin.swift'),'utf8'),entry=source.lastIndexOf('@main @MainActor struct MacPet');assert(entry>0);
+// Replace only the executable entrypoint; compile the unmodified production PetImage class.
+const probe=path.join(folder,'scale.swift'),binary=path.join(folder,'scale');fs.writeFileSync(probe,source.slice(0,entry)+'\n'+fs.readFileSync(new URL('./lib/macos-border-scale-probe.swift',import.meta.url),'utf8'));
+execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library',probe,'-o',binary,'-framework','AppKit','-framework','CoreGraphics','-framework','ImageIO'],{stdio:'inherit'});
+const result=JSON.parse(execFileSync(binary,[path.join(core,'components/computeruse/assets/desktop-pet.png'),evidence],{encoding:'utf8',timeout:15000}));assert(result.ok&&result.results.length===2);fs.writeFileSync(path.join(evidence,'native-contour-scale.json'),JSON.stringify(result,null,2));console.log('PASS native production contour at 1x/2x backing scale: transparent bounds and all consecutive phases change');
