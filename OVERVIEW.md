@@ -1,6 +1,6 @@
 # Package overview
 
-0.3.13 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
+0.3.14 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
 
 | Path | Purpose |
 |---|---|
@@ -25,3 +25,5 @@ Development archives, private profiles, session records and machine-specific vis
 ## 0.3.13 acceptance additions
 
 components/newmate/lib/todo-list.js validates future zoned timestamps and durably reconciles delivery. The client owns the manual form and reminder status panel. scripts/verify-newmate-todo*.mjs cover kernel, HTTP and Chromium/WebKit interaction. .github/workflows/macos-validation.yml compiles actual Swift helpers and runs native render/input and real two-Space fixtures on ARM64 macOS 14/15/26. Public archives exclude profile backups and private data.
+
+0.3.14 scheduled activation is implemented in components/newmate/component.js and lib/todo-list.js, with MCP and page mode selection. darwin-native.swift implements the perimeter marquee; desktop-pet-darwin.swift crops the sprite and renders backing-scale alpha contours; desktop-pet.js preserves active CU ownership on companion startup. Windows regression scripts accept installed package roots. CHANGELOG-0.3.14.md records validation and platform boundaries.

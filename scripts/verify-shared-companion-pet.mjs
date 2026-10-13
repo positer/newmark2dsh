@@ -1,0 +1,48 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {pathToFileURL,fileURLToPath} from 'node:url';
+const pkg=process.env.NEWMARK_TEST_PACKAGE_ROOT||fileURLToPath(new URL('../',import.meta.url));
+const {startDesktopPet,stopDesktopPet,desktopPetState,companionPetEvents,petPresentation,notifyDesktopPet,claimDesktopPetNotice,updateDesktopPetTheme}=await import(pathToFileURL(path.join(pkg,'components/computeruse/lib/desktop-pet.js')));
+const {runComputerUse,stopAll}=await import(pathToFileURL(path.join(pkg,'components/computeruse/lib/win32.js')));
+const root=fs.mkdtempSync(path.join(os.tmpdir(),'shared-companion-pet-'));let checks=0;
+const check=(name,value)=>{assert.ok(value,name);console.log(`ok ${++checks} - ${name}`);};
+const wait=async predicate=>{for(let i=0;i<80;i++){if(predicate())return;await new Promise(r=>setTimeout(r,100));}throw Error('Native pet state timeout');};
+try{
+ for(const companion of [false,true])for(const cu of [false,true]){const p=petPresentation({companion,cu});check('declarative visibility and CU-owned outline',p.visible===(companion||cu)&&p.outline===cu);}
+ const companion=await startDesktopPet({usage:'companion',userRoot:root});check('native companion starts successfully',companion.ok);
+ await wait(()=>desktopPetState().window?.companion&&!desktopPetState().window?.outline_active);
+ check('companion is resident without flashing outline',desktopPetState().running&&!desktopPetState().window.outline_active);
+ check('native companion exposes only coarse read-only availability and input idle time',Number.isFinite(desktopPetState().window.input_idle_ms)&&desktopPetState().window.input_idle_ms>=0&&typeof desktopPetState().window.user_desktop_active==='boolean');
+ notifyDesktopPet({id:'bubble-fixture',threadId:'default',text:'NewMate 气泡测试',system:false});await wait(()=>desktopPetState().window?.bubble_visible);
+ check('background message uses a bubble above the shared pet without enabling CU',desktopPetState().window.bubble_bounds.y+desktopPetState().window.bubble_bounds.height<desktopPetState().window.bounds.y&&!desktopPetState().window.outline_active&&desktopPetState().window.notification_count===0);
+ updateDesktopPetTheme(false);await wait(()=>desktopPetState().window?.bubble_dark===false);check('native bubble switches to light appearance without replacing the pet',desktopPetState().window.bubble_visible);
+ updateDesktopPetTheme(true);await wait(()=>desktopPetState().window?.bubble_dark===true);check('native bubble switches to dark appearance without replacing the pet',desktopPetState().window.bubble_visible);
+ notifyDesktopPet({id:'summary-fixture',text:'完整主体回复'.repeat(80),summary:'简短独立摘要',system:true});await wait(()=>desktopPetState().window?.bubble_message_id==='summary-fixture');check('native bubble receives the independent summary while OS notice stays absent',desktopPetState().window.bubble_visible&&claimDesktopPetNotice('summary-fixture').notice===null);
+ notifyDesktopPet({id:'host-notification',threadId:'default',text:'系统通知由 DSH 承载',system:true});await wait(()=>desktopPetState().window?.bubble_message_id==='host-notification');
+ check('legacy system=true cannot bypass bubble-only delivery',desktopPetState().window.notification_count===0&&companionPetEvents().notifications.length===0&&desktopPetState().window.bubble_visible);
+ check('multiple DSH windows cannot claim the same OS notification twice',claimDesktopPetNotice('host-notification').notice===null&&companionPetEvents().notifications.length===0);
+ const pid=desktopPetState().pid;
+ const cu=await startDesktopPet({userRoot:root});check('CU reuses the identical pet process',cu.ok&&desktopPetState().pid===pid);
+ await wait(()=>desktopPetState().window?.cu&&desktopPetState().window?.outline_active);
+ check('CU ownership enables its existing outline',desktopPetState().window.cu&&companionPetEvents().users.length===2);
+ await stopDesktopPet('test_cu_release');await wait(()=>!desktopPetState().window?.cu);
+ check('CU release preserves companion PID and removes outline',desktopPetState().pid===pid&&desktopPetState().running&&!desktopPetState().window.outline_active);
+ await startDesktopPet({userRoot:root});await stopDesktopPet('test_companion_release','companion');await wait(()=>!desktopPetState().window?.companion);
+ check('companion release preserves the CU pet',desktopPetState().pid===pid&&desktopPetState().window.cu&&companionPetEvents().users.join(',')==='cu');
+ await stopDesktopPet('test_finished');check('final owner release stops only its owned helper',!desktopPetState().running);
+ await startDesktopPet({usage:'companion',userRoot:root});notifyDesktopPet({id:'fresh-helper-notice',threadId:'default',text:'新窗口消息去重复验',system:false});await wait(()=>desktopPetState().window?.bubble_message_id==='fresh-helper-notice');
+ const petRoot=path.join(os.tmpdir(),'newmark2dsh-computer-use','pet');const session=fs.readdirSync(petRoot).filter(n=>n.startsWith('session-')).map(n=>path.join(petRoot,n)).find(dir=>{try{return JSON.parse(fs.readFileSync(path.join(dir,'status.json'))).pid===desktopPetState().pid;}catch{return false;}});
+ const queued=JSON.parse(fs.readFileSync(path.join(session,'notifications.json')));
+ check('physical helper replacement cannot replay previously shown messages',queued.length===1&&queued[0].id==='fresh-helper-notice');await stopDesktopPet('fresh_helper_finished','companion');
+ const virtual=JSON.parse(await runComputerUse({action:'takeover_start',mouseMode:'virtual',desktop:'hidden',userRoot:root,ownerId:'shared-pet-regression'}));
+ check('virtual CU starts its owned hidden desktop',virtual.ok&&virtual.target_desktop.startsWith('NmCuHidden'));
+ await wait(()=>desktopPetState().window?.cu);const hiddenPid=desktopPetState().pid;
+ await startDesktopPet({usage:'companion',userRoot:root});await wait(()=>desktopPetState().window?.companion);
+ check('companion default inherits the active CU desktop and native PID',desktopPetState().pid===hiddenPid&&desktopPetState().window.desktop===virtual.target_desktop);
+ const release=JSON.parse(await runComputerUse({action:'takeover_stop',ownerId:'shared-pet-regression'}));await wait(()=>!desktopPetState().window?.cu);
+ check('virtual CU release keeps its shared companion without outline',release.ok&&desktopPetState().pid===hiddenPid&&!desktopPetState().window.outline_active);
+ await stopDesktopPet('virtual_regression_finished','companion');check('final virtual owner cleanup removes native helper',!desktopPetState().running);
+ console.log(`PASS ${checks} real Windows shared pet lifecycle checks`);
+}finally{await stopDesktopPet('test_cleanup','companion');await stopDesktopPet('test_cleanup');await stopAll();}

@@ -32,3 +32,6 @@ Render generated HTML in each reply with isolated scripts, no same-origin permis
 
 ## 0.3.13 durable reminders and Space acceptance
 Validate zoned calendar timestamps before persistence. Persist a fixed reminder message ID before notification and reconcile in-flight state after restart without re-notification. Reuse attention and interruption policy, with no extra model call. Test new tools through the actual host registry rather than treating increased roster counts as failures. Keep visual and AX channels independent, cross-check optional; pause agent input for user activity and restore exact foreground/cursor without fighting renewed user input. Report cloud fixture evidence separately from official installed containers and physical hardware.
+
+- Scheduled NewMate activation must protect current attention, use native memory context, persist a one-time receipt and never automatically repeat failed/crashed runs.
+- Align cross-platform contour geometry and marquee timing while preserving native DPI, menu and window semantics; report fixture vs physical/container evidence explicitly.
