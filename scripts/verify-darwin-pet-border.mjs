@@ -16,7 +16,7 @@ check('CU and companion use the same existing native pet launcher',launcher.incl
 check('normal CU border spans each display and is click-through',cu.includes('for screen in NSScreen.screens')&&cu.includes('panel.ignoresMouseEvents=true'));
 check('normal border runs across Spaces and responds to monitor changes',cu.includes('didChangeScreenParametersNotification')&&cu.includes('spaceHandle.isEmpty else{return}'));
 check('normal border has a live AppKit loop without blocking stdin',cu.includes('app.run()')&&cu.includes('while let line=await nextLine()')&&cu.includes('DispatchQueue.global(qos:.utility)'));
-check('Space preview does not replace Agent AX target IDs',cu.includes('if request["previewOnly"] as? Bool==true{var answer=try await capture')&&backend.includes("options.previewOnly?'preview:'"));
+check('Space preview does not replace Agent AX target IDs',cu.includes('if request["previewOnly"] as? Bool==true || channel=="visual"{var answer=try await capture')&&backend.includes("options.previewOnly?'preview:'"));
 check('preview capture is bounded and only active while expanded',backend.includes('viewer_expanded')&&backend.includes('previewBusy')&&backend.includes('},500)')&&backend.includes('previewFiles.size>2'));
 check('normal takeover stop disposes border timer, observer and windows',cu.includes('borderTimer?.invalidate()')&&cu.includes('NotificationCenter.default.removeObserver(observer)')&&cu.includes('for panel in borders{panel.orderOut(nil)}'));
 check('failure to start pet releases the Space lease',backend.includes('desktop_pet_unavailable')&&backend.includes('lease_released:true'));
