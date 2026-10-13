@@ -21,7 +21,8 @@ import CoreGraphics
         }else{
             let pid=input["pid"] as! Int;guard allowed.contains(pid) else{throw NSError(domain:"unowned_pid",code:1)}
             let rows=(CGWindowListCopyWindowInfo([.optionAll,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []).filter{($0[kCGWindowOwnerPID as String] as? Int)==pid}
-            if action=="windows"{result=["windows":rows.map{["id":$0[kCGWindowNumber as String] ?? 0,"title":$0[kCGWindowName as String] ?? "","bounds":$0[kCGWindowBounds as String] ?? [:],"visible":$0[kCGWindowIsOnscreen as String] ?? false]}]}
+            if action=="ax_windows"{let app=AXUIElementCreateApplication(pid_t(pid));AXUIElementSetMessagingTimeout(app,2);result=["count":(attr(app,kAXWindowsAttribute) as? [AXUIElement] ?? []).count]}
+            else if action=="windows"{result=["windows":rows.map{["id":$0[kCGWindowNumber as String] ?? 0,"title":$0[kCGWindowName as String] ?? "","bounds":$0[kCGWindowBounds as String] ?? [:],"visible":$0[kCGWindowIsOnscreen as String] ?? false]}]}
             else if action=="activate"{result=["ok":NSRunningApplication(processIdentifier:pid_t(pid))?.activate(options:[]) ?? false]}
             else if action=="escape"{guard NSWorkspace.shared.frontmostApplication?.processIdentifier==pid_t(pid) else{throw NSError(domain:"unfocused_owned_window",code:4)};for down in [true,false]{CGEvent(keyboardEventSource:CGEventSource(stateID:.privateState),virtualKey:53,keyDown:down)?.post(tap:.cghidEventTap)};result=["ok":true]}
             else if action=="click" || action=="hold" {
