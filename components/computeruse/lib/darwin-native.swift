@@ -68,18 +68,18 @@ final class CuBorder: NSView {
         guard let frame=axRect(window),let row=windows().first(where:{($0[kCGWindowOwnerPID as String] as? Int)==Int(app.processIdentifier) && abs(bounds($0).minX-frame.minX)<2 && abs(bounds($0).minY-frame.minY)<2 && abs(bounds($0).width-frame.width)<2 && abs(bounds($0).height-frame.height)<2}),let id=row[kCGWindowNumber as String] as? UInt32 else{try fail("context_snapshot_unavailable","Original focused window is not visible in the current Space")}
         return UserContext(app:app,window:window,windowID:id,mouse:mouse,revision:revision)
     }
-    static func restoreUserContext(_ saved:UserContext,_ targetPID:pid_t?)async->[String:Any]{
+    static func restoreUserContext(_ saved:UserContext,_ targetPID:pid_t?,forceSpaceRestore:Bool=false)async->[String:Any]{
         if physicalRevision() != saved.revision || physicalHeld(){return["cursor_restored":false,"focus_restored":false,"user_preempted":true,"reason":"new_user_input_preserved"]}
         let current=NSWorkspace.shared.frontmostApplication?.processIdentifier
         if current != saved.app.processIdentifier && current != targetPID {return["cursor_restored":false,"focus_restored":false,"user_preempted":true,"reason":"unexpected_new_focus_preserved"]}
         var focus=false,cursor=false
         if !saved.app.isTerminated {
             let focused=axElement(axAttribute(AXUIElementCreateApplication(saved.app.processIdentifier),kAXFocusedWindowAttribute))
-            if current==saved.app.processIdentifier && focused.map({CFEqual($0,saved.window)})==true && windows().contains(where:{($0[kCGWindowNumber as String] as? UInt32)==saved.windowID}) {focus=true}
+            if !forceSpaceRestore && current==saved.app.processIdentifier && focused.map({CFEqual($0,saved.window)})==true && windows().contains(where:{($0[kCGWindowNumber as String] as? UInt32)==saved.windowID}) {focus=true}
             else if physicalRevision()==saved.revision,saved.app.activate(options:[]) {
                 if physicalRevision()==saved.revision {focus=AXUIElementPerformAction(saved.window,kAXRaiseAction as CFString) == .success}
                 // Allow the public activation request to settle; stop restoring if user input resumes.
-                for _ in 0..<100 {if physicalRevision() != saved.revision {break};let active=NSWorkspace.shared.frontmostApplication?.processIdentifier==saved.app.processIdentifier,window=axElement(axAttribute(AXUIElementCreateApplication(saved.app.processIdentifier),kAXFocusedWindowAttribute)),visible=windows().contains(where:{($0[kCGWindowNumber as String] as? UInt32)==saved.windowID});if active && visible && window.map({CFEqual($0,saved.window)})==true {focus=true;break};focus=false;try? await Task.sleep(nanoseconds:20_000_000)}
+                var stableSince:Double?;for _ in 0..<150 {if physicalRevision() != saved.revision {break};let active=NSWorkspace.shared.frontmostApplication?.processIdentifier==saved.app.processIdentifier,window=axElement(axAttribute(AXUIElementCreateApplication(saved.app.processIdentifier),kAXFocusedWindowAttribute)),visible=windows().contains(where:{($0[kCGWindowNumber as String] as? UInt32)==saved.windowID}),now=ProcessInfo.processInfo.systemUptime;if active && visible && window.map({CFEqual($0,saved.window)})==true {if stableSince==nil{stableSince=now};if now-(stableSince ?? now)>=(forceSpaceRestore ? 0.6:0){focus=true;break}}else{stableSince=nil};focus=false;try? await Task.sleep(nanoseconds:20_000_000)}
             }
         }
         if physicalRevision() != saved.revision || physicalHeld(){return["cursor_restored":false,"focus_restored":focus,"user_preempted":true,"reason":"new_user_input_preserved"]}
@@ -140,7 +140,7 @@ final class CuBorder: NSView {
             try lease(request);guard !spaceHandle.isEmpty,request["windowHandle"] as? String==spaceHandle else{try fail("space_takeover_required","Observation activation requires the bound Space lease")}
             let revision=try await waitForUserIdle(),saved=try userContext(revision),pid=pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0);var answer:[String:Any]
             do{try inputCheckpoint(revision);let window=try axWindow(row);guard let app=NSRunningApplication(processIdentifier:pid),app.activate(options:[]) else{try fail("activation_failed","Cannot activate selected Space for pixels")};try inputCheckpoint(revision);guard AXUIElementPerformAction(window,kAXRaiseAction as CFString) == .success else{try fail("activation_failed","Cannot raise selected observation window")};for _ in 0..<50 {try inputCheckpoint(revision);if windows().contains(where:{($0[kCGWindowNumber as String] as? UInt32)==row[kCGWindowNumber as String] as? UInt32}){break};try await Task.sleep(nanoseconds:20_000_000)};answer=try await observeAccessibleBody(try target(request),request)}catch let failure as CuFailure{answer=["ok":false,"error_code":failure.code,"error":failure.message]}catch{answer=["ok":false,"error_code":"space_observation_failed","error":String(describing:error)]}
-            let restored=await restoreUserContext(saved,pid);answer["context_restore"]=restored;answer["space_activated_for_observation"]=true
+            let restored=await restoreUserContext(saved,pid,forceSpaceRestore:true);answer["context_restore"]=restored;answer["space_activated_for_observation"]=true
             if restored["user_preempted"] as? Bool != true,(restored["focus_restored"] as? Bool != true || restored["cursor_restored"] as? Bool != true){answer["ok"]=false;answer["error_code"]="context_restore_failed"};return answer
         }
         return try await observeAccessibleBody(row,request)
@@ -255,6 +255,7 @@ final class CuBorder: NSView {
         guard isSpace ? !spaceHandle.isEmpty:spaceHandle.isEmpty else{try fail("space_takeover_required","Input mode does not match the held native lease")}
         if isSpace && !action.hasPrefix("app_"){try fail("unsafe_space_action","Space mode requires scoped app_* actions")}
         let revision=try await waitForUserIdle(),saved=try userContext(revision),pid=(try? target(request)).map{pid_t($0[kCGWindowOwnerPID as String] as? Int ?? 0)}
+        let offSpace=isSpace && (try? target(request))?[kCGWindowIsOnscreen as String] as? Bool != true
         var answer:[String:Any]
         operationRevision=revision;defer{operationRevision=nil}
         do {try inputCheckpoint(revision);answer=try await dispatchBody(request)}
@@ -262,7 +263,8 @@ final class CuBorder: NSView {
         catch {answer=["ok":false,"error_code":"macos_action_failed","error":String(describing:error),"delivery_state":"unconfirmed; do not automatically replay"]}
         if answer["input_route"] as? String=="coregraphics" {try? await Task.sleep(nanoseconds:25_000_000)}
         answer["input_channel"]=channel;answer["cross_check"]=["requested":request["crossCheck"] as? Bool ?? false,"matched":request["crossCheck"] as? Bool==true && answer["ok"] as? Bool==true]
-        let restored=await restoreUserContext(saved,pid);answer["context_restore"]=restored;answer["user_input_guard"]=["idle_ms":100,"user_input_blocked":false]
+        if offSpace {for _ in 0..<30 {if physicalRevision() != revision{break};try? await Task.sleep(nanoseconds:20_000_000)}}
+        let restored=await restoreUserContext(saved,pid,forceSpaceRestore:offSpace);answer["context_restore"]=restored;answer["user_input_guard"]=["idle_ms":100,"user_input_blocked":false]
         if answer["ok"] as? Bool==true,restored["user_preempted"] as? Bool != true,(restored["focus_restored"] as? Bool != true || restored["cursor_restored"] as? Bool != true){answer["ok"]=false;answer["error_code"]="context_restore_failed";answer["action_applied"]=true;answer["error"]="Action completed but exact context restoration failed; do not replay the action"}
         return answer
     }
@@ -295,7 +297,7 @@ final class CuBorder: NSView {
                     let revision=try await waitForUserIdle(),saved=try userContext(revision),pid=pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0)
                     var bindingFailure:Error?
                     do{try inputCheckpoint(revision);guard let app=NSRunningApplication(processIdentifier:pid),app.activate(options:[]) else{try fail("activation_failed","Cannot initialize AX for the selected Space")};for _ in 0..<50 {try inputCheckpoint(revision);if (try? axWindow(try target(request))) != nil{break};try await Task.sleep(nanoseconds:20_000_000)};_ = try axWindow(try target(request))}catch{bindingFailure=error}
-                    let restored=await restoreUserContext(saved,pid)
+                    let restored=await restoreUserContext(saved,pid,forceSpaceRestore:true)
                     if let failure=bindingFailure{throw failure}
                     guard restored["focus_restored"] as? Bool==true,restored["cursor_restored"] as? Bool==true,restored["user_preempted"] as? Bool==false else{try fail("space_binding_restore_unconfirmed","Space binding did not restore the original context; re-observe before continuing")}
                 }
