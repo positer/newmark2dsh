@@ -4,12 +4,12 @@ import CoreGraphics
 import Darwin
 
 @MainActor final class PetImage:NSView {
-    var image:NSImage?;var outlined=false;var phase=false;var clicked:((Int)->Void)?,dragged:(()->Void)?,menuRequested:(()->Void)?
+    var image:NSImage?;var outlined=false;var phase=false;var clicked:((Int)->Void)?,dragged:(()->Void)?,menuRequested:((NSEvent)->Void)?
     override var acceptsFirstResponder:Bool{false}
     override func draw(_ dirtyRect:NSRect){image?.draw(in:bounds.insetBy(dx:6,dy:6));if outlined{(phase ? NSColor.white:NSColor.black).setStroke();let line=NSBezierPath(roundedRect:bounds.insetBy(dx:3,dy:3),xRadius:12,yRadius:12);line.lineWidth=2;line.stroke()}}
     override func mouseDown(with event:NSEvent){clicked?(event.clickCount)}
     override func mouseDragged(with event:NSEvent){dragged?();window?.performDrag(with:event)}
-    override func rightMouseDown(with event:NSEvent){menuRequested?()}
+    override func rightMouseDown(with event:NSEvent){menuRequested?(event)}
 }
 @MainActor final class PreviewWindow:NSWindow {var closed:()->Void = {};override func cancelOperation(_ sender:Any?){closed()}}
 @MainActor final class PetHost:NSObject,NSApplicationDelegate {
@@ -21,7 +21,7 @@ import Darwin
         config=value;directory=dir;owner=pid_t(pid)
         let rect=NSRect(x:screen.visibleFrame.maxX-112,y:screen.visibleFrame.minY+28,width:88,height:88),pet=NSPanel(contentRect:rect,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
         pet.isOpaque=false;pet.backgroundColor = .clear;pet.hasShadow=false;pet.level = .floating;pet.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary];pet.isReleasedWhenClosed=false
-        let view=PetImage(frame:NSRect(origin:.zero,size:rect.size));view.image=image;view.clicked={[weak self] clicks in self?.click(clicks)};view.dragged={[weak self] in self?.pendingClick?.cancel()};view.menuRequested={[weak self] in self?.configurationMenu()};pet.contentView=view;panel=pet;imageView=view;pet.orderFrontRegardless()
+        let view=PetImage(frame:NSRect(origin:.zero,size:rect.size));view.image=image;view.clicked={[weak self] clicks in self?.click(clicks)};view.dragged={[weak self] in self?.pendingClick?.cancel()};view.menuRequested={[weak self] event in self?.configurationMenu(event)};pet.contentView=view;panel=pet;imageView=view;pet.orderFrontRegardless()
         timer=Timer.scheduledTimer(withTimeInterval:0.2,repeats:true){[weak self] _ in MainActor.assumeIsolated{self?.tick()}};tick()
     }
     func click(_ count:Int){
@@ -49,7 +49,7 @@ import Darwin
         let button=NSButton(title:text,target:self,action:#selector(bubbleClick));button.frame=NSRect(x:10,y:8,width:280,height:64);button.isBordered=false;button.lineBreakMode = .byWordWrapping;button.font = .systemFont(ofSize:13);window.contentView=button;bubble=window;window.orderFrontRegardless()
     }
     @objc func bubbleClick(){bubble?.orderOut(nil);bubble=nil;openChat()}
-    func configurationMenu(){pendingClick?.cancel();let menu=NSMenu(),quit=NSMenuItem(title:"退出陪伴",action:#selector(stopCompanion),keyEquivalent:""),settings=NSMenuItem(title:"打开设置",action:#selector(openSettings),keyEquivalent:"");quit.target=self;settings.target=self;quit.isEnabled=mode["companion"] as? Bool==true;menu.autoenablesItems=false;menu.addItem(quit);menu.addItem(settings);menu.popUp(positioning:nil,at:NSEvent.mouseLocation,in:nil)}
+    func configurationMenu(_ event:NSEvent){pendingClick?.cancel();guard let view=imageView else{return};let menu=NSMenu(),quit=NSMenuItem(title:"退出陪伴",action:#selector(stopCompanion),keyEquivalent:""),settings=NSMenuItem(title:"打开设置",action:#selector(openSettings),keyEquivalent:"");quit.target=self;settings.target=self;quit.isEnabled=mode["companion"] as? Bool==true;menu.autoenablesItems=false;menu.addItem(quit);menu.addItem(settings);NSMenu.popUpContextMenu(menu,with:event,for:view)}
     @objc func stopCompanion(){write("companion-command.json",["id":UUID().uuidString,"action":"stop-companion"])}
     @objc func openSettings(){openChat("settings")}
     func tick(){
