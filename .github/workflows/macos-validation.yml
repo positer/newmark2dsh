@@ -3,6 +3,11 @@ on:
   push:
     branches: [codex/macos-space-validation]
   workflow_dispatch:
+    inputs:
+      probe_only:
+        type: boolean
+        default: false
+        description: Run only the Mission Control UI availability probe
 concurrency:
   group: macos-validation-${{ github.ref }}
   cancel-in-progress: true
@@ -10,6 +15,7 @@ permissions:
   contents: read
 jobs:
   validate:
+    if: ${{ !inputs.probe_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -66,3 +72,24 @@ jobs:
           path: ${{ runner.temp }}/newmark-evidence
           retention-days: 3
           if-no-files-found: warn
+  space_probe:
+    if: ${{ inputs.probe_only }}
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Probe public Mission Control AX surface
+        env:
+          NEWMARK_EVIDENCE_DIR: ${{ runner.temp }}/space-evidence
+        run: |
+          mkdir -p "$NEWMARK_EVIDENCE_DIR"
+          node scripts/probe-macos-spaces.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mission-control-probe
+          path: ${{ runner.temp }}/space-evidence
+          retention-days: 3
