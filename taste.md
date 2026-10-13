@@ -29,3 +29,6 @@ Use DSH public model resolution, single-use prepared streams and BlockAssembler,
 
 ## 0.3.11 inline and native documents
 Render generated HTML in each reply with isolated scripts, no same-origin permission or external network. Preserve iframe state across expansion/source toggles. Mount the registered DSH document component and its native state in NewMate’s own sidebar; never hand off the global conversation or implement a replacement file renderer. Memory write checks use isolated stores and verify completed tasks.
+
+## 0.3.13 durable reminders and Space acceptance
+Validate zoned calendar timestamps before persistence. Persist a fixed reminder message ID before notification and reconcile in-flight state after restart without re-notification. Reuse attention and interruption policy, with no extra model call. Test new tools through the actual host registry rather than treating increased roster counts as failures. Keep visual and AX channels independent, cross-check optional; pause agent input for user activity and restore exact foreground/cursor without fighting renewed user input. Report cloud fixture evidence separately from official installed containers and physical hardware.

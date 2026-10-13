@@ -1,27 +1,23 @@
 # Newmark2DSH
 
-A self-contained plugin that brings persistent memory, desktop automation and a personalized companion to DeepSeek Harness. Five independent switches control MemoryLab, ComputerUse, Agent API, NewMate and heartBeat over the shared `~/.Newmark` user store.
+A self-contained plugin bringing persistent memory, desktop automation and a personalized companion to DeepSeek Harness. Five independent switches control MemoryLab, ComputerUse, Agent API, NewMate and heartBeat over the shared ~/.Newmark store.
 
-## Current release: 0.3.11
+## Current release: 0.3.13
 
-NewMate supports persistent chat, MemoryLab personalization, steering during a run, read-only history and low-frequency proactive messages through a shared desktop pet. heartBeat owns desktop restart and one-time post-restart delivery. Agent API follows the DSH public model resolver and stream parser, so provider integrations stay in the host adapter layer. File links prefer registered native sidebar previews and otherwise reveal files in the file manager.
+NewMate adds a durable toDoList: choose activation time and message in its page, or create reminders from any DSH conversation, NewMate or authenticated MCP through newmate_todo_add/list/cancel. Due messages follow attention protection and automatic conversation handoff without an extra model call. Companion-off postpones delivery; quiet/snooze/bubble limits suppress interruption. Stable message IDs and permanent delivery state prevent restart replay.
 
-Windows acceptance includes inline generated HTML interaction and native Markdown in NewMate’s own sidebar, with 259 focused checks. NewMate can add short memories and create/update native MemoryLab entries without deletion permission. macOS CU and isolated VM code are **source prototypes awaiting native compilation and hardware acceptance**; guest CU is not connected. [Release details and limits](CHANGELOG-0.3.11.md).
+NewMate supports steering, read-only history, inline generated HTML, registered native document previews, scoped memory writes and themed shared-pet bubbles. Agent API uses the DSH public model resolver and parser with exact provider/model isolation. heartBeat owns Windows desktop restart and permanently consumes post-restart tasks.
 
 ## Install
 
-Install `newmark2dsh` through the DSH plugin manager and enable the required components in configuration. Updating loaded backend/native modules requires a host restart. Official DSH's package-age policy can select an older version for a bare package name; explicit version selection is preferable when requesting this release. Full automatic desktop restart currently supports the official Windows container.
+Install newmark2dsh@0.3.13 through the DSH plugin manager and enable desired components. Loaded backend/native updates require a host restart. Explicit versions avoid the official host package-age policy selecting older releases. Full automatic desktop restart currently targets the official Windows container.
 
-## Components
+## Platforms and validation
 
-- MemoryLab: persistent tagged memory, relationship trees and shortMemory tools.
-- ComputerUse: bounded observation/input, takeover indication and supported isolated desktop backends.
-- Agent API: model-backed agent execution using DSH public services; no bundled credentials.
-- NewMate: personalized companion core, current chat, read-only history, bubbles and MCP access.
-- heartBeat: restart tasks, scoped conversation delivery and permanent consumption receipts.
+Windows helpers compile using system .NET Framework and cache by source hash. Apple Silicon macOS 14/15/26 uses visual and Accessibility channels plus Mission Control Spaces, a 100ms user-input idle guard, foreground/cursor restoration, a shared pet and normal CU border. [Native and browser matrix](https://github.com/positer/newmark2dsh/actions/runs/38360580407) · [Mission Control two-Space matrix](https://github.com/positer/newmark2dsh/actions/runs/38360583039).
 
-## Platforms
+Cloud validation uses owned native fixtures and the actual NewMate client with explicit host/model fixtures. It does not prove official macOS DSH installation, physical keyboard/mouse timing, multi-display/fullscreen combinations or minimum Neo hardware performance. Spaces share user input; they are not complete isolation.
 
-Windows helpers are compiled from bundled source using system .NET Framework and cached by source hash. Linux/WSLg uses isolated X11 sessions; dependencies include xvfb, xauth, openbox, xdotool, wmctrl, python3-xlib, python3-pil and python3-pyqt5. Native Wayland control is not supported. Mac prototypes and their explicit limits are documented in [the platform assessment](docs/native-model-and-macos.md).
+Linux/WSLg uses isolated X11 sessions (xvfb, xauth, openbox, xdotool, wmctrl, python3-xlib, python3-pil, python3-pyqt5); native Wayland control is unsupported.
 
-[Package layout](OVERVIEW.md) · [Engineering conventions](taste.md)
+[Release notes](CHANGELOG-0.3.13.md) · [Package layout](OVERVIEW.md) · [Engineering conventions](taste.md) · [Mac acceptance](MACOS-CANDIDATE.md)

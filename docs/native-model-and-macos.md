@@ -14,20 +14,10 @@ Agent API 复用 DSH 公共 `llm.resolveModelInfo(provider, model)`、`llm.prepa
 
 0.3.11 起，NewMate 对 assistant 回复中的文件引用进行路径及现存普通文件校验，再读取有界、读前后未变化的原文件字节。客户端实时查询 DSH documentPreviews 和 sidebar.right.tab.document 注册项，将实际原生组件及其 store/locale 在 NewMate 自己的侧栏挂载，不切换本体对话。不自行实现文档渲染器；原生组件缺失、绑定不支持或读取失败，则通过 sessionController.openWorkspacePath 的 reveal 动作定位文件。没有静态后缀白名单，后续注册预览实现自动参与。导航草稿只留在当前窗口内存，历史仍不可编辑或重新激活。
 
-## macOS 官方容器基线
+## macOS 当前实现及证据
 
-基于 [deepseek-ai 官方 desktop 容器](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/desktop/README.md)：Electron 桌面及其 Cordis Host。没有采用第三方桌面包装器或私有 macOS Space 接口。公共宿主生命周期与原生桥仍需在目标官方构建中验收。
+0.3.13 选择 Mission Control Space + AX 控制层。视觉/AX 可分别调用，允许但不强制交叉核验；用户输入进行时暂缓 Agent 输入，空闲 100ms 后执行。操作后恢复光标和原前台窗口，用户再次输入优先。共享桌宠、主题消息气泡及正常 CU 边框已在 Apple Silicon 云端原生夹具编译、渲染和操作验证。Space 仍共享物理输入，不提供完全隔离。历史 VM 源码不作为默认实现。
 
-`computeruse/lib/darwin.js` 是延迟加载的调度层，Swift helper 源码按哈希编译到 `~/Library/Caches/Newmark-CU`，通过有界 NDJSON 通信。Windows 不编译、加载或执行它。没有安装好的 SDK 就返回缺失状态，不自动触发 Xcode 安装。
+[Native and browser matrix](https://github.com/positer/newmark2dsh/actions/runs/38360580407) · [Mission Control two-Space matrix](https://github.com/positer/newmark2dsh/actions/runs/38360583039)
 
-`darwin-native.swift` 使用 AppKit、CoreGraphics、Accessibility 和 [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit)。仅预检屏幕录制/辅助功能权限，不主动申请 TCC。实现应用和窗口枚举、观察、截图、应用激活、移动/点击、Unicode 输入、按键、滚动、有界 sequence/wait 和 takeover 生命周期。现代截图采用主屏逻辑坐标以避免 Retina 坐标混用。32×18 稀疏观察网格无变化时不发布 PNG，变化阈值 0.02，至少每 60 秒完整刷新，缓存有界。
-
-交互原型要求 macOS 14+ 及 SDK 14+；旧系统只有观察降级路径。每个窗口标识记录 windowID 与 PID，动作前检查窗口存在及前台目标；helper 用 per-user flock 防止同时接管，退出/EOF 释放锁，接管有可见 NSPanel 描边。**这些保护不会屏蔽人的物理输入**：结果明确 `user_input_blocked:false`，不是 Windows 完整输入锁的等价物。未实现 Mac NewMate 桌宠同等能力；本轮不宣称生产级 Mac CU。
-
-## 隔离虚拟桌面
-
-macOS Space 是用户界面的组织方式，不能作为独立自动化隔离边界。源码试验采用 Apple [Virtualization.framework](https://developer.apple.com/documentation/virtualization) 与 [Linux VM 路径](https://developer.apple.com/documentation/virtualization/running-linux-in-a-virtual-machine)。`darwin-vm.swift` 仅承载用户手动提供 kernel/initrd/disk 的独立 VM 启动和窗口视图原型，macOS 13+，CPU/内存范围有界。没有共享目录、剪贴板或自动下载，NAT 必须显式启用。签名 entitlement 为 `com.apple.security.virtualization`，对应 `darwin-vm.entitlements.plist`。
-
-**guest CU 传输和 Agent API 的 VM 路由尚未接通**。virtual/desktop/desktopName 请求当前统一返回 `macos_vm_not_provisioned`，绝不静默落到宿主物理桌面。VM 显示源码不等于隐藏虚拟桌面自动化可用。
-
-Mac 验收需要：在官方容器版本中用本地 SDK 编译 helper；用户配置 TCC；检查正常/拒绝权限、Retina 与多屏坐标、前台保护和 helper 崩溃释放；手动提供 Linux 启动资产并签名 VM helper，确认隔离启动后再接通 guest 协议。Windows 本轮仅完成 13 项 Darwin JS 分派/边界/稀疏测量检查，**没有 Mac 编译、输入、VM 启动或硬件验收**。
+Cloud validation uses owned native fixtures and the actual NewMate client with explicit host/model fixtures. It does not prove official macOS DSH installation, physical keyboard/mouse timing, multi-display/fullscreen combinations or minimum Neo hardware performance. Spaces share user input; they are not complete isolation.
