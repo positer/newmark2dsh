@@ -87,6 +87,7 @@ final class CuBorder: NSView {
     }
     struct AXTarget { let element:AXUIElement; let window:AXUIElement; let pid:pid_t; let handle:String; let owner:String; let at:Date }
     static var axTargets:[String:AXTarget]=[:]
+    static var boundAXWindows:[String:AXUIElement]=[:]
     static func axAttribute(_ element:AXUIElement,_ name:String)->CFTypeRef? {
         var value:CFTypeRef?; return AXUIElementCopyAttributeValue(element,name as CFString,&value) == .success ? value:nil
     }
@@ -104,7 +105,11 @@ final class CuBorder: NSView {
         let rect=bounds(row),title=row[kCGWindowName as String] as? String ?? "",all=axAttribute(app,kAXWindowsAttribute) as? [AXUIElement] ?? []
         var matches=all.filter{element in guard let frame=axRect(element) else{return false};return abs(frame.minX-rect.minX)<2 && abs(frame.minY-rect.minY)<2 && abs(frame.width-rect.width)<2 && abs(frame.height-rect.height)<2}
         if matches.count>1 && !title.isEmpty {matches=matches.filter{(axAttribute($0,kAXTitleAttribute) as? String)==title}}
-        guard matches.count==1 else{try fail("accessibility_window_unavailable","No unique AX window matches the fresh bounds (\(matches.count) matches / \(all.count) AX windows); no arbitrary window is selected")};AXUIElementSetMessagingTimeout(matches[0],0.05);return matches[0]
+        let key="\(row[kCGWindowNumber as String] as? UInt32 ?? 0):\(row[kCGWindowOwnerPID as String] as? Int ?? 0)"
+        // Mission Control omits off-Space windows from AXWindows. Retain only a previously
+        // uniquely matched reference; revalidate its PID, role and geometry against fresh CG data.
+        if matches.isEmpty,let cached=boundAXWindows[key],let frame=axRect(cached) {var pid:pid_t=0;AXUIElementGetPid(cached,&pid);if pid==pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0),(axAttribute(cached,kAXRoleAttribute) as? String)=="AXWindow",abs(frame.minX-rect.minX)<2,abs(frame.minY-rect.minY)<2,abs(frame.width-rect.width)<2,abs(frame.height-rect.height)<2{return cached}}
+        guard matches.count==1 else{try fail("accessibility_window_unavailable","No unique AX window matches the fresh bounds (\(matches.count) matches / \(all.count) AX windows); no arbitrary window is selected")};AXUIElementSetMessagingTimeout(matches[0],0.05);boundAXWindows[key]=matches[0];return matches[0]
     }
     static func axActions(_ element:AXUIElement)->[String] {var names:CFArray?;return AXUIElementCopyActionNames(element,&names) == .success ? (names as? [String] ?? []):[]}
     static func axSecure(_ element:AXUIElement)->Bool {(axAttribute(element,kAXRoleAttribute) as? String)=="AXSecureTextField" || (axAttribute(element,kAXSubroleAttribute) as? String)=="AXSecureTextField"}
@@ -189,7 +194,7 @@ final class CuBorder: NSView {
     }
     static func bounds(_ row:[String:Any])->CGRect { CGRect(dictionaryRepresentation:row[kCGWindowBounds as String] as! CFDictionary) ?? .zero }
     static func permissions()->[String:Bool] { ["accessibility":AXIsProcessTrusted(),"screenRecording":CGPreflightScreenCaptureAccess(),"inputMonitoring":CGPreflightListenEventAccess()] }
-    static func release() { if let tap=userTap{CGEvent.tapEnable(tap:tap,enable:false);CFMachPortInvalidate(tap)};if let source=userTapSource{CFRunLoopRemoveSource(CFRunLoopGetMain(),source,.commonModes)};userTap=nil;userTapSource=nil;userKeys.removeAll();userButtons.removeAll();borderTimer?.invalidate();borderTimer=nil;if let observer=screenObserver{NotificationCenter.default.removeObserver(observer)};screenObserver=nil;for panel in borders{panel.orderOut(nil)};borders.removeAll();axTargets.removeAll();spaceHandle="";if lockFD >= 0 {flock(lockFD,LOCK_UN);close(lockFD)};lockFD = -1;owner="" }
+    static func release() { if let tap=userTap{CGEvent.tapEnable(tap:tap,enable:false);CFMachPortInvalidate(tap)};if let source=userTapSource{CFRunLoopRemoveSource(CFRunLoopGetMain(),source,.commonModes)};userTap=nil;userTapSource=nil;userKeys.removeAll();userButtons.removeAll();borderTimer?.invalidate();borderTimer=nil;if let observer=screenObserver{NotificationCenter.default.removeObserver(observer)};screenObserver=nil;for panel in borders{panel.orderOut(nil)};borders.removeAll();axTargets.removeAll();boundAXWindows.removeAll();spaceHandle="";if lockFD >= 0 {flock(lockFD,LOCK_UN);close(lockFD)};lockFD = -1;owner="" }
     static func lease(_ request:[String:Any])throws {
         guard lockFD >= 0,!owner.isEmpty,request["ownerId"] as? String==owner else {try fail("takeover_required","Acquire this caller's native takeover lease first")}
         guard AXIsProcessTrusted() else {try fail("accessibility_permission_required","Grant Accessibility to the requesting helper/owning desktop identified in macOS settings; no permission is requested automatically")}
@@ -261,7 +266,20 @@ final class CuBorder: NSView {
             guard AXIsProcessTrusted() else {return ["ok":false,"error_code":"accessibility_permission_required","permissions":permissions()]}
             guard NSScreen.main != nil else {try fail("desktop_unavailable","No interactive macOS display is available")}
             let proposed=request["spaceMode"] as? Bool==true ? (request["windowHandle"] as? String ?? ""):""
-            if !proposed.isEmpty {_ = try axWindow(try target(request))}
+            if !proposed.isEmpty {
+                let row=try target(request)
+                do{_ = try axWindow(row)}catch let failure as CuFailure {
+                    guard failure.code=="accessibility_window_unavailable" else{throw failure}
+                    // First binding may require the public activation of the selected app's Space.
+                    // This is a guarded setup operation and always restores the exact user context.
+                    let revision=try await waitForUserIdle(),saved=try userContext(revision),pid=pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0)
+                    var bindingFailure:Error?
+                    do{try inputCheckpoint(revision);guard let app=NSRunningApplication(processIdentifier:pid),app.activate(options:[]) else{try fail("activation_failed","Cannot initialize AX for the selected Space")};for _ in 0..<50 {try inputCheckpoint(revision);if (try? axWindow(try target(request))) != nil{break};try await Task.sleep(nanoseconds:20_000_000)};_ = try axWindow(try target(request))}catch{bindingFailure=error}
+                    let restored=await restoreUserContext(saved,pid)
+                    if let failure=bindingFailure{throw failure}
+                    guard restored["focus_restored"] as? Bool==true,restored["cursor_restored"] as? Bool==true,restored["user_preempted"] as? Bool==false else{try fail("space_binding_restore_unconfirmed","Space binding did not restore the original context; re-observe before continuing")}
+                }
+            }
             if request["spaceMode"] as? Bool==true && proposed.isEmpty {try fail("space_target_required","Select a window already placed in the Agent Space")}
             if lockFD >= 0 {guard next==owner,proposed==spaceHandle else {try fail("takeover_busy","Another route or caller owns this helper")};return ["ok":true,"owner_id":owner,"lease_expiry":"none"]}
             let directory=FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/Newmark-CU",isDirectory:true)
