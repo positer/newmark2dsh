@@ -2224,7 +2224,8 @@ function readPageGlobals() {
               const content=definition.loading==='text-pages'?(()=>{const text=new TextDecoder('utf-8',{fatal:true}).decode(file.data);return{kind:'text',text,eof:true,pages:[{offset:1,text,lines:text.split('\n').length}]};})():definition.loading==='renderer'?undefined:{kind:'bytes',data:file.data};
               const address='dsh-resource://file/session/'+encodeURIComponent(id)+'/'+file.path.replaceAll('\\','/').split('/').map(encodeURIComponent).join('/');
               const tab={id,contentId:address,navigation:{params:{}},signal:life.signal};
-              const useStore=selector=>{const value=React.useSyncExternalStore(store?.subscribe||(()=>()=>{}),store?.getSnapshot||(()=>({})),store?.getSnapshot||(()=>({})));return typeof selector==='function'?selector(value):value;};
+              const emptySnapshot={};
+              const useStore=selector=>{const value=React.useSyncExternalStore(store?.subscribe||(()=>()=>{}),store?.getSnapshot||(()=>emptySnapshot),store?.getSnapshot||(()=>emptySnapshot));return typeof selector==='function'?selector(value):value;};
               return{entry,props:{...injected,content,resourceAddress:address,wrap:false,actions,useStore,useTabInfo:()=>({tab}),useResource:()=>({phase:'ready',value:{absolutePath:file.path,version:file.version}}),useInteractivePreview:selector=>typeof selector==='function'?selector(false):false,retainTab:()=>{},readRelated:async()=>({ok:false,error:{code:'UNAVAILABLE',message:'仅展示当前已引用的文件'}}),addResource:()=>{},setResources:()=>{},scrollportRef:()=>{},t:entry.locale?ctx.get?.('locale')?.bind?.(entry.locale):key=>key}};
             },[file.path,file.version,native?.definition?.id,native?.entry]);
             React.useEffect(()=>()=>binding?.props.actions.forget?.(scope.current),[binding]);
