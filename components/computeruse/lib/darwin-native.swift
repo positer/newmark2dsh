@@ -62,10 +62,11 @@ final class CuBorder: NSView {
         guard CGPreflightListenEventAccess(),userTap.map({CGEvent.tapIsEnabled(tap:$0)})==true,physicalRevision()==revision,physicalIdle()>=0.1,!physicalHeld() else{try fail("user_input_preempted","User activity resumed; stop agent delivery and re-observe before retrying")}
     }
     static func deliveryCheckpoint()throws{guard let revision=operationRevision else{try fail("input_guard_required","No protected input operation is active")};try inputCheckpoint(revision)}
-    struct UserContext {let app:NSRunningApplication;let window:AXUIElement;let mouse:CGPoint;let revision:[UInt32]}
+    struct UserContext {let app:NSRunningApplication;let window:AXUIElement;let windowID:UInt32;let mouse:CGPoint;let revision:[UInt32]}
     static func userContext(_ revision:[UInt32])throws->UserContext{
         guard let app=NSWorkspace.shared.frontmostApplication,let mouse=CGEvent(source:nil)?.location,let window=axElement(axAttribute(AXUIElementCreateApplication(app.processIdentifier),kAXFocusedWindowAttribute)) else{try fail("context_snapshot_unavailable","Cannot snapshot exact user focus and cursor; no agent action is sent")}
-        return UserContext(app:app,window:window,mouse:mouse,revision:revision)
+        guard let frame=axRect(window),let row=windows().first(where:{($0[kCGWindowOwnerPID as String] as? Int)==Int(app.processIdentifier) && abs(bounds($0).minX-frame.minX)<2 && abs(bounds($0).minY-frame.minY)<2 && abs(bounds($0).width-frame.width)<2 && abs(bounds($0).height-frame.height)<2}),let id=row[kCGWindowNumber as String] as? UInt32 else{try fail("context_snapshot_unavailable","Original focused window is not visible in the current Space")}
+        return UserContext(app:app,window:window,windowID:id,mouse:mouse,revision:revision)
     }
     static func restoreUserContext(_ saved:UserContext,_ targetPID:pid_t?)async->[String:Any]{
         if physicalRevision() != saved.revision || physicalHeld(){return["cursor_restored":false,"focus_restored":false,"user_preempted":true,"reason":"new_user_input_preserved"]}
@@ -74,11 +75,11 @@ final class CuBorder: NSView {
         var focus=false,cursor=false
         if !saved.app.isTerminated {
             let focused=axElement(axAttribute(AXUIElementCreateApplication(saved.app.processIdentifier),kAXFocusedWindowAttribute))
-            if current==saved.app.processIdentifier && focused.map({CFEqual($0,saved.window)})==true {focus=true}
+            if current==saved.app.processIdentifier && focused.map({CFEqual($0,saved.window)})==true && windows().contains(where:{($0[kCGWindowNumber as String] as? UInt32)==saved.windowID}) {focus=true}
             else if physicalRevision()==saved.revision,saved.app.activate(options:[]) {
                 if physicalRevision()==saved.revision {focus=AXUIElementPerformAction(saved.window,kAXRaiseAction as CFString) == .success}
                 // Allow the public activation request to settle; stop restoring if user input resumes.
-                for _ in 0..<10 {if physicalRevision() != saved.revision {break};let active=NSWorkspace.shared.frontmostApplication?.processIdentifier==saved.app.processIdentifier,window=axElement(axAttribute(AXUIElementCreateApplication(saved.app.processIdentifier),kAXFocusedWindowAttribute));if active && window.map({CFEqual($0,saved.window)})==true {focus=true;break};focus=false;try? await Task.sleep(nanoseconds:20_000_000)}
+                for _ in 0..<100 {if physicalRevision() != saved.revision {break};let active=NSWorkspace.shared.frontmostApplication?.processIdentifier==saved.app.processIdentifier,window=axElement(axAttribute(AXUIElementCreateApplication(saved.app.processIdentifier),kAXFocusedWindowAttribute)),visible=windows().contains(where:{($0[kCGWindowNumber as String] as? UInt32)==saved.windowID});if active && visible && window.map({CFEqual($0,saved.window)})==true {focus=true;break};focus=false;try? await Task.sleep(nanoseconds:20_000_000)}
             }
         }
         if physicalRevision() != saved.revision || physicalHeld(){return["cursor_restored":false,"focus_restored":focus,"user_preempted":true,"reason":"new_user_input_preserved"]}

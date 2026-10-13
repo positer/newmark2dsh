@@ -16,4 +16,7 @@ check('verification requires a fresh AX target',validateDarwinRequest({...base,c
 check('verification does not accept an unscoped action',validateDarwinRequest({...base,action:'click',mouseMode:'real',targetId:id,crossCheck:true})?.error_code==='invalid_cross_check');
 check('explicit AX route does not silently emit scroll events',validateDarwinRequest({...base,action:'app_scroll',inputChannel:'accessibility'})?.error_code==='unsupported_accessibility_action');
 check('normal and Space inventories expose both routes without required verification',Object.values(MODE_INVENTORY).every(v=>v.inputChannels.includes('visual')&&v.inputChannels.includes('accessibility')&&v.crossValidationRequired===false));
+check('explicit observation activation remains independently usable',validateDarwinRequest({action:'app_observe',windowHandle:'mac:1:2',activateForObservation:true,observationChannel:'visual'})===null);
+check('pet preview cannot request a Space switch',validateDarwinRequest({action:'app_observe',windowHandle:'mac:1:2',activateForObservation:true,previewOnly:true})?.error_code==='invalid_observation_activation');
+check('observation activation rejects non-boolean options',validateDarwinRequest({action:'app_observe',activateForObservation:'yes'})?.error_code==='invalid_observation_activation');
 console.log('PASS '+count+' independent channel and optional geometry verification contracts');
