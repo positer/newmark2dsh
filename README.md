@@ -2,11 +2,11 @@
 
 A self-contained plugin that brings persistent memory, desktop automation and a personalized companion to DeepSeek Harness. Five independent switches control MemoryLab, ComputerUse, Agent API, NewMate and heartBeat over the shared `~/.Newmark` user store.
 
-## Current release: 0.3.10
+## Current release: 0.3.11
 
 NewMate supports persistent chat, MemoryLab personalization, steering during a run, read-only history and low-frequency proactive messages through a shared desktop pet. heartBeat owns desktop restart and one-time post-restart delivery. Agent API follows the DSH public model resolver and stream parser, so provider integrations stay in the host adapter layer. File links prefer registered native sidebar previews and otherwise reveal files in the file manager.
 
-Windows acceptance includes native document navigation, menu integration probes and 699 related checks. macOS CU and isolated VM code are **source prototypes awaiting native compilation and hardware acceptance**; guest CU is not connected. [Release details and limits](CHANGELOG-0.3.10.md).
+Windows acceptance includes inline generated HTML interaction and native Markdown in NewMate’s own sidebar, with 259 focused checks. NewMate can add short memories and create/update native MemoryLab entries without deletion permission. macOS CU and isolated VM code are **source prototypes awaiting native compilation and hardware acceptance**; guest CU is not connected. [Release details and limits](CHANGELOG-0.3.11.md).
 
 ## Install
 

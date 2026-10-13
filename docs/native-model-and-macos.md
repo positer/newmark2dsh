@@ -12,7 +12,7 @@ Agent API 复用 DSH 公共 `llm.resolveModelInfo(provider, model)`、`llm.prepa
 
 ## 文件导航
 
-NewMate 对 assistant 回复中的文件引用进行路径及现存普通文件校验，不读取文件正文。客户端每次点击查询 DSH documentPreviews 实时注册表；有原生预览时恢复已选中的 DSH 对话并等待其原生侧栏挂载，再通过 sidebarRight 打开资源。没有可用会话、类型或原生打开失败，则通过 sessionController.openWorkspacePath 的 reveal 动作定位文件。没有静态后缀白名单，后续注册预览实现自动参与。导航草稿只留在当前窗口内存，历史仍不可编辑或重新激活。
+0.3.11 起，NewMate 对 assistant 回复中的文件引用进行路径及现存普通文件校验，再读取有界、读前后未变化的原文件字节。客户端实时查询 DSH documentPreviews 和 sidebar.right.tab.document 注册项，将实际原生组件及其 store/locale 在 NewMate 自己的侧栏挂载，不切换本体对话。不自行实现文档渲染器；原生组件缺失、绑定不支持或读取失败，则通过 sessionController.openWorkspacePath 的 reveal 动作定位文件。没有静态后缀白名单，后续注册预览实现自动参与。导航草稿只留在当前窗口内存，历史仍不可编辑或重新激活。
 
 ## macOS 官方容器基线
 

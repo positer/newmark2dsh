@@ -26,3 +26,6 @@ Display-dependent rendering must not gate lifecycle commands or liveness heartbe
 
 ## 0.3.10 native boundaries
 Use DSH public model resolution, single-use prepared streams and BlockAssembler, without provider-name branches. Keep private replay state inside the exact provider/model route. Query live document preview registrations and wait for native session/sidebar mounting after switching global panels. Let native preview components own read authorization. Prewarm pet menus and reuse their loaded document. Treat Mac source, native compilation, hardware acceptance and guest routing as distinct evidence; never fall back from a virtual request to the physical desktop.
+
+## 0.3.11 inline and native documents
+Render generated HTML in each reply with isolated scripts, no same-origin permission or external network. Preserve iframe state across expansion/source toggles. Mount the registered DSH document component and its native state in NewMate’s own sidebar; never hand off the global conversation or implement a replacement file renderer. Memory write checks use isolated stores and verify completed tasks.

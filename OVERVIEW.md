@@ -1,6 +1,6 @@
 # Package overview
 
-0.3.10 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
+0.3.11 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
 
 | Path | Purpose |
 |---|---|

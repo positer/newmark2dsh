@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import {referencedFile,revealReferencedFile} from './lib/file-navigation.js';
+import {referencedFile,revealReferencedFile,readReferencedFile} from './lib/file-navigation.js';
 import { createNewMate } from './component.js';
 import { resolveRoot } from '../../lib/root.js';
 import { embedJson } from '../../lib/embed.js';
@@ -63,6 +63,7 @@ export function apply(ctx, config) {
         switch(input.action){
           case 'theme':body=updateDesktopPetTheme(input.dark);break;
           case 'file-target':body={ok:true,path:referencedFile(mate.state().messages,input.id,input.path)};break;
+          case 'file-content':body=readReferencedFile(mate.state().messages,input.id,input.path);break;
           case 'reveal-file':body=await revealReferencedFile({messages:mate.state().messages,id:input.id,target:input.path,controller:ctx.get?.('sessionController'),signal:new AbortController().signal});break;
           case 'claim-notification':body=claimDesktopPetNotice(input.id);break;
           case 'retry':body=mate.retry(input.id);break;

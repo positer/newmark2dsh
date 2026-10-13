@@ -2192,33 +2192,51 @@ function readPageGlobals() {
 
           const mateFileLinks=text=>{const result=[];for(const m of String(text).matchAll(/\[([^\]]+)\]\((?:<([^>]+)>|([^\s)]+))\)/g)){let path=m[2]||m[3];try{if(/^file:\/\//i.test(path)){const u=new URL(path);if(u.hostname&&u.hostname!=='localhost')continue;path=decodeURIComponent(u.pathname).replace(/^\/([a-z]:)/i,'$1');}else path=decodeURIComponent(path);}catch{continue;}if(/^[a-z]:[\\/]|^\/(?!\/)/i.test(path))result.push({label:m[1],path});}return result;};
           const matePreviewDocument=html=>'<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src &apos;none&apos;; script-src &apos;unsafe-inline&apos;; style-src &apos;unsafe-inline&apos;; img-src data:; font-src data:; connect-src &apos;none&apos;; frame-src &apos;none&apos;; object-src &apos;none&apos;; form-action &apos;none&apos;; base-uri &apos;none&apos;"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:16px;font-family:system-ui,sans-serif}*{box-sizing:border-box}</style></head><body>'+html+'</body></html>';
+          function nativeDocumentEntry(path){
+            const definitions=ctx.get?.('documentPreviews')?.candidates?.(path)||[],entries=ctx.slots.entriesOfSlot?.('sidebar.right.tab.document')||ctx.slots.entries('sidebar.right.tab.document');
+            for(const definition of definitions){const entry=entries.find(e=>e.options?.key===definition.id);if(entry?.component)return{definition,entry};}
+          }
           async function openMateFile(file,id){
             const request=async action=>{const r=await fetch('/newmark-newmate',{method:'POST',headers:{'content-type':'application/json','x-newmark-newmate':'1'},body:JSON.stringify({action,id,path:file.path})});const body=await r.json();if(!r.ok||!body.ok)throw Error(body.error||'文件定位失败');return body;};
-            const target=await request('file-target');
-            const previews=ctx.get?.('documentPreviews'),sidebar=ctx.get?.('sidebarRight'),ui=ctx.get?.('uiSession'),layout=ctx.get?.('layout');
-            // Resolve the live registry on every click; new plugin preview types need no extension list here.
-            if(previews?.candidates?.(target.path)?.length&&sidebar?.openResource&&layout?.selectPanel&&ui?.adapter?.current){
-              try{
-                layout.selectPanel(null);
-                let sessionId;
-                for(let attempt=0;attempt<10;attempt++){
-                  await new Promise(resolve=>setTimeout(resolve,50));
-                  sessionId=ui.adapter.current.getSnapshot()?.key;
-                  if(sessionId)break;
-                }
-                if(!sessionId)throw Error('DSH 当前对话不可用');
-                // Native document types own workspace read authorization and metadata.
-                // Do not reach through an undeclared remote proxy from this global panel.
-                const address='dsh-resource://file/session/'+encodeURIComponent(sessionId)+'/'+target.path.replaceAll('\\','/').split('/').map(encodeURIComponent).join('/');
-                // A global panel unmounts the conversation's native sidebar seat.
-                // Let React restore that seat before asking its public navigator to open.
-                for(let attempt=0;;attempt++){
-                  await new Promise(resolve=>setTimeout(resolve,50));
-                  try{sidebar.openResource(address);return;}catch(error){if(attempt>=4||!String(error?.message).includes('no session surface is mounted'))throw error;}
-                }
-              }catch(error){console.debug('[newmate] native file navigation unavailable:',error?.message||String(error));layout.selectPanel('newmate');}
-            }
-            await request('reveal-file');
+            const target=await request('file-target'),native=nativeDocumentEntry(target.path);
+            if(!native){await request('reveal-file');return;}
+            const reveal=()=>request('reveal-file');
+            try{
+              const value=await request('file-content');
+              const data=Uint8Array.from(atob(value.data),c=>c.charCodeAt(0));
+              window.dispatchEvent(new CustomEvent('newmark-newmate-preview',{detail:{file:{path:target.path,data,version:value.version},title:file.label,reveal}}));
+            }catch(error){console.debug('[newmate] native document unavailable:',error?.message);await reveal();}
+          }
+          const NativeDocumentBoundary=React.Component?class extends React.Component{
+            constructor(props){super(props);this.state={failed:false};}
+            static getDerivedStateFromError(){return{failed:true};}
+            componentDidCatch(error){console.debug('[newmate] registered document renderer failed:',error?.message);Promise.resolve(this.props.reveal()).catch(()=>{});}
+            render(){return this.state.failed?h('div',{role:'alert'},'当前原生预览不可用。',h('button',{onClick:()=>this.props.reveal()},'在文件管理器定位')):this.props.children;}
+          }:({children})=>children;
+          function NewMateNativeDocument({file,reveal}){
+            const native=nativeDocumentEntry(file.path),scope=React.useRef('newmate-document-'+Math.random().toString(36).slice(2));
+            const life=React.useMemo(()=>new AbortController(),[file.path,file.version]);
+            React.useEffect(()=>()=>life.abort(),[life]);
+            const binding=React.useMemo(()=>{
+              if(!native)return null;
+              const {definition,entry}=native,id=scope.current,store=entry.store?.create?.(id),actions=store?.actions||{};
+              const injected=typeof entry.inject==='function'?entry.inject(id,actions):entry.inject||{};
+              const content=definition.loading==='text-pages'?(()=>{const text=new TextDecoder('utf-8',{fatal:true}).decode(file.data);return{kind:'text',text,eof:true,pages:[{offset:1,text,lines:text.split('\n').length}]};})():definition.loading==='renderer'?undefined:{kind:'bytes',data:file.data};
+              const address='dsh-resource://file/session/'+encodeURIComponent(id)+'/'+file.path.replaceAll('\\','/').split('/').map(encodeURIComponent).join('/');
+              const tab={id,contentId:address,navigation:{params:{}},signal:life.signal};
+              const useStore=selector=>{const value=React.useSyncExternalStore(store?.subscribe||(()=>()=>{}),store?.getSnapshot||(()=>({})),store?.getSnapshot||(()=>({})));return typeof selector==='function'?selector(value):value;};
+              return{entry,props:{...injected,content,resourceAddress:address,wrap:false,actions,useStore,useTabInfo:()=>({tab}),useResource:()=>({phase:'ready',value:{absolutePath:file.path,version:file.version}}),useInteractivePreview:selector=>typeof selector==='function'?selector(false):false,retainTab:()=>{},readRelated:async()=>({ok:false,error:{code:'UNAVAILABLE',message:'仅展示当前已引用的文件'}}),addResource:()=>{},setResources:()=>{},scrollportRef:()=>{},t:entry.locale?ctx.get?.('locale')?.bind?.(entry.locale):key=>key}};
+            },[file.path,file.version,native?.definition?.id,native?.entry]);
+            React.useEffect(()=>()=>binding?.props.actions.forget?.(scope.current),[binding]);
+            if(!binding)return h('button',{onClick:reveal},'在文件管理器定位');
+            return h(NativeDocumentBoundary,{key:file.path+file.version,reveal},h(binding.entry.component,binding.props));
+          }
+          function NewMateInteractive({html,index}){
+            const frame=React.useRef(null),[height,setHeight]=React.useState(340),[expanded,setExpanded]=React.useState(false),[sourceOpen,setSourceOpen]=React.useState(false),token=React.useRef('newmate-inline-'+Math.random().toString(36).slice(2));
+            React.useEffect(()=>{const resize=e=>{if(expanded||e.source!==frame.current?.contentWindow||e.data?.token!==token.current||e.data?.type!=='newmate-size')return;const n=Number(e.data.height);if(Number.isFinite(n))setHeight(Math.max(160,Math.min(1200,n)));};window.addEventListener('message',resize);return()=>window.removeEventListener('message',resize);},[expanded]);
+            const measure='<script>(()=>{const send=()=>parent.postMessage({type:"newmate-size",token:'+JSON.stringify(token.current)+',height:document.documentElement.scrollHeight},"*");new ResizeObserver(send).observe(document.documentElement);addEventListener("load",send);send();})()</script>';
+            return h('section',{className:'nm-inline-ui','aria-label':'交互回复 '+(index+1)},h('div',{className:'nm-inline-toolbar'},h('span',null,'交互页面'),h('button',{onClick:()=>{setHeight(340);setExpanded(v=>!v);}},expanded?'收起':'展开'),h('button',{onClick:()=>setSourceOpen(v=>!v)},sourceOpen?'隐藏源码':'源码'),h('button',{onClick:()=>navigator.clipboard?.writeText(html)},'复制代码')),
+              h('iframe',{ref:frame,title:'NewMate 交互回复 '+(index+1),sandbox:'allow-scripts',referrerPolicy:'no-referrer',srcDoc:matePreviewDocument(html+measure),style:{height:expanded?'70vh':height,width:'100%',border:0,display:'block',background:'white'}}),sourceOpen&&h('pre',null,html));
           }
           function NewMateReply({message}){
             const [fileError,setFileError]=React.useState('');
@@ -2230,13 +2248,13 @@ function readPageGlobals() {
             const fileMentions={resolve:value=>{const file=files.find(f=>f.label===value||f.path===value);return file?{title:file.path,label:'打开文件 '+file.label,open:()=>openFile(file)}:undefined;}};
             return h(React.Fragment,null,h('div',{className:'nm-reply-body'},NewMateMarkdown?h(NewMateMarkdown,{text:prose,labels:newMateMarkdownLabels,fileMentions}):prose),fileError&&h('p',{role:'alert'},fileError),
               !NewMateMarkdown&&files.length>0&&h('div',{className:'nm-file-links'},...files.map((file,i)=>h('button',{key:i,className:'nm-file-link',title:file.path,onClick:()=>openFile(file)},'↗ '+file.label))),
-              ...artifacts.map((a,i)=>h('div',{key:i,className:'nm-artifact'},h('div',null,h('strong',null,'交互页面'),h('p',null,'在独立面板中查看与操作')),h('button',{onClick:()=>show({html:a[1],title:'交互页面'})},'打开预览'),h('button',{onClick:()=>navigator.clipboard?.writeText(a[1])},'复制代码'))));
+              ...artifacts.map((a,i)=>h(NewMateInteractive,{key:i,html:a[1],index:i})));
           }
           const newMateMarkdownLabels={code:{copyLabel:'复制',copiedLabel:'已复制'},footnotes:'注释'};
           function NewMateIcon(props){const size=typeof props?.size==='number'?props.size:18;return h('span',{style:{width:size,height:size,display:'inline-flex',alignItems:'center',justifyContent:'center',overflow:'hidden',flexShrink:0,opacity:.84},'aria-hidden':true},h('img',{src:'/newmark-newmate/avatar.png',alt:'',width:Math.round(size*1.15),height:size,style:{display:'block',objectFit:'contain',transform:'scale(1.65) scaleX(-1)',filter:'grayscale(1)'}}));}
           const NEWMATE_CHAT_CSS = `
             .nm-page .nm-reply-body code:has(>button[aria-label^="打开文件 "]){background:transparent;border:0;border-radius:0;padding:0;font:inherit;box-shadow:none}.nm-page .nm-reply-body button[aria-label^="打开文件 "]{display:inline;padding:0;border:0;border-radius:0;background:transparent;font:inherit;font-weight:600;text-decoration:underline;text-underline-offset:3px;box-shadow:none}.nm-page .nm-reply-body button[aria-label^="打开文件 "] svg{display:none}.nm-page .nm-reply-body button[aria-label^="打开文件 "]:hover{background:transparent;text-decoration-thickness:2px}
-            .nm-file-links{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.nm-page .nm-file-link{border:0;border-radius:0;background:transparent;font-weight:600;color:var(--dsw-alias-brand-primary,#6ea2ff);text-decoration:underline;text-align:left;padding:4px 0}.nm-artifact{display:flex;align-items:center;gap:12px;padding:14px 16px;margin:14px 0;border:1px solid var(--dsw-alias-border-secondary,#7774);border-radius:12px;background:var(--dsw-alias-bg-elevated,#252525)}.nm-artifact div{flex:1}.nm-artifact p{font-size:12px;margin:4px 0;color:var(--dsw-alias-label-secondary,#aaa)}.nm-preview{position:absolute;z-index:10;right:0;top:0;bottom:0;width:min(55%,820px);min-width:min(360px,100%);display:flex;flex-direction:column;background:var(--dsw-alias-bg-base,#141414);border-left:1px solid var(--dsw-alias-border-primary,#555);box-shadow:-10px 0 30px #0002}.nm-preview.expanded{width:100%;min-width:0}.nm-preview header{display:flex;gap:6px;align-items:center;padding:14px;border-bottom:1px solid var(--dsw-alias-border-secondary,#7774)}.nm-preview header strong{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nm-preview iframe{width:100%;flex:1;min-height:0;border:0;background:white}.nm-preview pre{margin:0;padding:18px;overflow:auto;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.7 monospace}.nm-preview-path{padding:8px 16px;font-size:11px;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary,#aaa)}
+            .nm-inline-ui{margin:14px 0;border:1px solid var(--dsw-alias-border-secondary);border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-layer-2)}.nm-inline-toolbar{display:flex;align-items:center;gap:6px;padding:8px 12px;font-size:12px}.nm-inline-toolbar>span{flex:1;color:var(--dsw-alias-label-secondary)}.nm-inline-ui pre{margin:0;padding:14px;max-height:360px;overflow:auto;white-space:pre-wrap;font:12px/1.6 monospace}.nm-native-document{flex:1;min-height:0;overflow:auto;padding:12px;position:relative}.nm-file-links{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.nm-page .nm-file-link{border:0;border-radius:0;background:transparent;font-weight:600;color:var(--dsw-alias-brand-primary,#6ea2ff);text-decoration:underline;text-align:left;padding:4px 0}.nm-artifact{display:flex;align-items:center;gap:12px;padding:14px 16px;margin:14px 0;border:1px solid var(--dsw-alias-border-secondary,#7774);border-radius:12px;background:var(--dsw-alias-bg-elevated,#252525)}.nm-artifact div{flex:1}.nm-artifact p{font-size:12px;margin:4px 0;color:var(--dsw-alias-label-secondary,#aaa)}.nm-preview{position:absolute;z-index:10;right:0;top:0;bottom:0;width:min(55%,820px);min-width:min(360px,100%);display:flex;flex-direction:column;background:var(--dsw-alias-bg-base,#141414);border-left:1px solid var(--dsw-alias-border-primary,#555);box-shadow:-10px 0 30px #0002}.nm-preview.expanded{width:100%;min-width:0}.nm-preview header{display:flex;gap:6px;align-items:center;padding:14px;border-bottom:1px solid var(--dsw-alias-border-secondary,#7774)}.nm-preview header strong{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nm-preview iframe{width:100%;flex:1;min-height:0;border:0;background:white}.nm-preview pre{margin:0;padding:18px;overflow:auto;flex:1;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.7 monospace}.nm-preview-path{padding:8px 16px;font-size:11px;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary,#aaa)}
             .nm-page{height:100%;width:100%;min-height:0;overflow:hidden;display:grid;grid-template-columns:minmax(0,1fr);background:var(--dsw-alias-bg-base,#141414);color:var(--dsw-alias-label-primary,#eee);font:inherit;font-size:14px;position:relative}
             .nm-page *{box-sizing:border-box}.nm-page button,.nm-page input,.nm-page textarea{font:inherit;color:inherit}.nm-page button{cursor:pointer;transition:background .15s;border:1px solid transparent;border-radius:9px;background:transparent;padding:8px 12px}.nm-page button:hover{background:var(--dsw-alias-bg-hover,#ffffff0b)}.nm-page button:focus-visible,.nm-page textarea:focus-visible,.nm-page input:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#6ea2ff);outline-offset:2px}.nm-page button:disabled{opacity:.45;cursor:default}
             .nm-history{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--dsw-alias-border-secondary,#ffffff12);background:var(--dsw-alias-bg-elevated,#1b1b1b);padding:20px 12px 12px;gap:16px}.nm-history-heading{display:flex;align-items:center;justify-content:space-between;padding:0 8px;font-size:15px;font-weight:600}.nm-new{width:100%;border-color:var(--dsw-alias-border-secondary,#ffffff20);text-align:left;min-height:40px}.nm-search{width:100%;padding:9px 11px;border:1px solid var(--dsw-alias-border-secondary,#ffffff20);border-radius:9px;background:transparent}.nm-thread-list{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:5px}.nm-thread{position:relative;border-radius:10px}.nm-thread.active{background:var(--dsw-alias-bg-hover,#ffffff0b)}.nm-page .nm-thread-main{width:100%;text-align:left;padding:12px;display:grid;gap:6px}.nm-thread-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;padding-right:9px}.nm-thread-date{color:var(--dsw-alias-label-tertiary,#888);font-size:11px}.nm-thread-actions{display:flex;justify-content:flex-end;padding:0 5px 5px;gap:2px}.nm-thread-actions button{font-size:11px;padding:4px 7px;color:var(--dsw-alias-label-secondary,#aaa)}.nm-history-footer{display:grid;gap:5px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-secondary,#ffffff12)}.nm-history-empty{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-tertiary,#888);padding:12px}.nm-unread{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-brand-primary,#6ea2ff);margin-right:6px}
@@ -2246,7 +2264,7 @@ function readPageGlobals() {
           function NewMatePanel() {
             const [preview,setPreview]=React.useState(null),[previewExpanded,setPreviewExpanded]=React.useState(false),[previewSource,setPreviewSource]=React.useState(false);
             const previewRequest=React.useRef(0);
-            React.useEffect(()=>{const open=e=>{const value=e.detail;if(typeof value?.html!=='string')return;setPreviewExpanded(false);setPreviewSource(false);setPreview(value);};window.addEventListener('newmark-newmate-preview',open);return()=>window.removeEventListener('newmark-newmate-preview',open);},[]);
+            React.useEffect(()=>{const open=e=>{const value=e.detail;if(!value?.file)return;setPreviewExpanded(false);setPreviewSource(false);setPreview(value);};window.addEventListener('newmark-newmate-preview',open);return()=>window.removeEventListener('newmark-newmate-preview',open);},[]);
 
             const [state, setState] = React.useState({ messages: [], tasks: [], threads:[],settings:{companion:false,notifications:false} });
             const [text, setText] = React.useState('');
@@ -2284,6 +2302,7 @@ function readPageGlobals() {
             async function send(e){e?.preventDefault?.();if(!text.trim()||sending||!threadId)return;setSending(true);setError('');follow.current=true;const message=text;try{await post({action:'chat',text:message,threadId});if(drafts.current[threadId]===message){drafts.current[threadId]='';setText('');}}catch(e){setError(e.message);}finally{setSending(false);}}
             const toggle=h('button',{className:'nm-switch',role:'switch','aria-label':'陪伴开关','aria-checked':state.settings.companion===true,disabled:busy,onClick:()=>act({action:'settings',settings:{companion:!state.settings.companion}})},h('span',{className:'nm-switch-track','aria-hidden':true}),'陪伴');
             const date=at=>new Date(at).toLocaleDateString('zh-CN',{month:'numeric',day:'numeric'});
+            function renderPreview(){return preview?.file&&h('aside',{className:'nm-preview'+(previewExpanded?' expanded':''),'aria-label':'NewMate 原生文件预览'},h('header',null,h('strong',null,preview.title||'文件预览'),h('button',{onClick:()=>setPreviewExpanded(v=>!v)},previewExpanded?'收起':'展开'),h('button',{onClick:()=>preview.reveal()},'定位文件'),h('button',{'aria-label':'关闭预览',onClick:()=>setPreview(null)},'×')),h('div',{className:'nm-preview-path'},preview.file.path),h('div',{className:'nm-native-document'},h(NativeDocumentBoundary,{key:preview.file.path+preview.file.version,reveal:preview.reveal},h(NewMateNativeDocument,{file:preview.file,reveal:preview.reveal}))));}
             if(settingsView){
               const reasons={disabled:'主动陪伴已关闭',snoozed:'主动陪伴已暂停',quiet_hours:'静默时段，不主动打扰',runtime_unavailable:'等待桌面可用',startup_settle:'开启后稍候再主动联系',reading:'正在阅读，不打扰',busy:'等待当前任务结束',away:'离开设备，暂不打扰',typing:'等待使用空隙',recent_conversation:'刚聊过，稍后再联系',daily_reasoning_budget:'今天的自动检查已达上限',daily_message_budget:'今天的主动消息已达上限',cooldown:'冷却中',ready:'等待下一次合适的联系时机'};
               const counts=state.initiativeStatus?.counts||{sent:0,attempts:0};
@@ -2302,7 +2321,7 @@ function readPageGlobals() {
               return h('section',{className:'nm-page','aria-label':'NewMate 历史只读'},h('style',null,NEWMATE_CHAT_CSS),h('div',{className:selected?'nm-history-reading':'nm-history-view'},
                 h('header',{className:'nm-header'},h('div',{className:'nm-heading'},h('h2',null,selected?.title||'历史对话'),h('span',{className:'nm-subtitle'},'仅供查看 · 不可编辑或重新激活')),h('div',{className:'nm-header-actions'},selected&&h('button',{onClick:()=>setViewedHistory(null)},'历史列表'),h('button',{onClick:()=>{setHistoryOpen(false);setViewedHistory(null);}},'返回当前对话'))),
                 selected?h('div',{className:'nm-feed'},...past.map((m,i)=>h('article',{key:m.id+':'+i,className:'nm-message'},h('div',{className:'nm-message-label'},m.role==='user'?null:'NewMate',h('time',null,new Date(m.at).toLocaleString('zh-CN'))),h('div',{className:'nm-message-body'},m.role==='assistant'?h(NewMateReply,{message:m}):m.text)))):
-                h(React.Fragment,null,h('input',{className:'nm-search',value:search,'aria-label':'搜索历史对话',placeholder:'搜索历史对话',onChange:e=>setSearch(e.target.value)}),h('div',{className:'nm-thread-list'},...history.map(t=>h('button',{key:t.id,className:'nm-thread-main',onClick:()=>setViewedHistory(t.id)},h('span',{className:'nm-thread-title'},t.title),h('span',{className:'nm-thread-date'},date(t.updated)))),!history.length&&h('p',{className:'nm-history-empty'},'暂无历史对话')))));
+                h(React.Fragment,null,h('input',{className:'nm-search',value:search,'aria-label':'搜索历史对话',placeholder:'搜索历史对话',onChange:e=>setSearch(e.target.value)}),h('div',{className:'nm-thread-list'},...history.map(t=>h('button',{key:t.id,className:'nm-thread-main',onClick:()=>setViewedHistory(t.id)},h('span',{className:'nm-thread-title'},t.title),h('span',{className:'nm-thread-date'},date(t.updated)))),!history.length&&h('p',{className:'nm-history-empty'},'暂无历史对话')))),renderPreview());
             }
             return h('section',{className:'nm-page','aria-label':'NewMate 聊天'},h('style',null,NEWMATE_CHAT_CSS),
               h('main',{className:'nm-main'},h('header',{className:'nm-header'},h('div',{className:'nm-brand'},h('span',{className:'nm-brand-mark','aria-hidden':true},h('img',{src:'/newmark-newmate/avatar.png',alt:''})),h('div',{className:'nm-heading'},h('h2',null,'NewMate'),h('span',{className:'nm-subtitle'},state.settings.companion?'陪伴已开启 · 双击桌宠来聊聊':'由 MemoryLab 记忆陪伴你'))),h('div',{className:'nm-header-actions'},h('button',{className:'nm-history-toggle','aria-label':'历史对话',onClick:()=>{setViewedHistory(null);setHistoryOpen(true);}},'历史'),h('button',{disabled:busy,onClick:()=>act({action:'new-thread'})},'新对话'),toggle,h('button',{'aria-label':'Newmark 插件设置',onClick:()=>setSettingsView(true)},'设置'))),
@@ -2312,7 +2331,7 @@ function readPageGlobals() {
                   pending&&h('p',{className:'nm-pending',role:'status'},'NewMate 正在回复 · 可继续输入引导'),
                   tasks.some(t=>!['measurement','self_activation'].includes(t.kind)&&['failed','interrupted'].includes(t.status))&&h('details',{className:'nm-tasks'},h('summary',null,'需要处理的任务'),...tasks.filter(t=>!['measurement','self_activation'].includes(t.kind)&&['failed','interrupted'].includes(t.status)).map(t=>h('div',{key:t.id,className:'nm-tasks-row'},t.prompt.slice(0,80),h('p',null,t.error),h('button',{disabled:busy,onClick:()=>act({action:'retry',id:t.id})},'重试'))))),
                 h('div',{className:'nm-composer-wrap'},error&&h('p',{role:'alert',className:'nm-error'},error),h('form',{className:'nm-composer',onSubmit:send},h('textarea',{value:text,rows:2,maxLength:16000,'aria-label':'给 NewMate 的消息',placeholder:threadId?(state.interaction?.running?'补充要求，直接引导当前回复…':'和 NewMate 聊聊…'):'新建一段对话，开始聊聊…',disabled:!threadId,onChange:e=>{setText(e.target.value);drafts.current[threadId]=e.target.value;},onKeyDown:e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent?.isComposing){e.preventDefault();send();}}}),h('div',{className:'nm-composer-row'},h('span',{className:'nm-composer-hint'},state.interaction?.running?'Enter 加入引导 · Shift + Enter 换行':'Enter 发送 · Shift + Enter 换行'),h('button',{type:'submit',className:'nm-send',disabled:sending||!threadId||!text.trim()},sending?'发送中…':state.interaction?.running?'引导':'发送'))))),
-                preview&&h('aside',{className:'nm-preview'+(previewExpanded?' expanded':''),'aria-label':'NewMate 回复预览'},h('header',null,h('strong',null,preview.title||'预览'),preview.html&&h('button',{onClick:()=>setPreviewSource(v=>!v)},previewSource?'页面':'源码'),h('button',{onClick:()=>setPreviewExpanded(v=>!v)},previewExpanded?'收起':'展开'),h('button',{'aria-label':'关闭预览',onClick:()=>{previewRequest.current++;setPreview(null);}},'×')),preview.path&&h('div',{className:'nm-preview-path'},preview.path),preview.loading?h('p',null,'正在读取…'):preview.error?h('p',{role:'alert'},preview.error):preview.html&&!previewSource?h('iframe',{title:preview.title||'交互页面',sandbox:'allow-scripts',referrerPolicy:'no-referrer',srcDoc:matePreviewDocument(preview.html)}):h('pre',null,preview.html||preview.text)));
+                renderPreview());
           }
 
           ctx.effect(()=>{
