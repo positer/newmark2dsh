@@ -23,6 +23,7 @@ import CoreGraphics
             let rows=(CGWindowListCopyWindowInfo([.optionAll,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []).filter{($0[kCGWindowOwnerPID as String] as? Int)==pid}
             if action=="windows"{result=["windows":rows.map{["id":$0[kCGWindowNumber as String] ?? 0,"title":$0[kCGWindowName as String] ?? "","bounds":$0[kCGWindowBounds as String] ?? [:],"visible":$0[kCGWindowIsOnscreen as String] ?? false]}]}
             else if action=="activate"{result=["ok":NSRunningApplication(processIdentifier:pid_t(pid))?.activate(options:[]) ?? false]}
+            else if action=="escape"{guard NSWorkspace.shared.frontmostApplication?.processIdentifier==pid_t(pid) else{throw NSError(domain:"unfocused_owned_window",code:4)};for down in [true,false]{CGEvent(keyboardEventSource:CGEventSource(stateID:.privateState),virtualKey:53,keyDown:down)?.post(tap:.cghidEventTap)};result=["ok":true]}
             else if action=="click" || action=="hold" {
                 let id=input["window"] as! Int;guard let row=rows.first(where:{($0[kCGWindowNumber as String] as? Int)==id}),row[kCGWindowIsOnscreen as String] as? Bool==true,let b=row[kCGWindowBounds as String] as? [String:Any],let rect=CGRect(dictionaryRepresentation:b as CFDictionary) else{throw NSError(domain:"owned_window_unavailable",code:2)}
                 let point=CGPoint(x:rect.minX+rect.width*(input["rx"] as? Double ?? 0.5),y:rect.minY+rect.height*(input["ry"] as? Double ?? 0.5));guard rect.contains(point) else{throw NSError(domain:"outside_owned_window",code:3)}
