@@ -1,0 +1,50 @@
+name: Verify published npm artifact
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable released tag
+        required: true
+        default: v0.3.13
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Retrieve official registry and compare every shipped file
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/pack.json"
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import crypto from 'node:crypto';
+          import assert from 'node:assert/strict';
+          import {execFileSync} from 'node:child_process';
+          const version=JSON.parse(fs.readFileSync('package.json')).version;
+          const response=await fetch('https://registry.npmjs.org/newmark2dsh/'+version,{headers:{'cache-control':'no-cache'}});
+          assert(response.ok,'Official version not available');
+          const metadata=await response.json();assert.equal(metadata.version,version);
+          const tar=await fetch(metadata.dist.tarball);assert(tar.ok);
+          const bytes=Buffer.from(await tar.arrayBuffer());
+          assert.equal(crypto.createHash('sha1').update(bytes).digest('hex'),metadata.dist.shasum);
+          assert.equal('sha512-'+crypto.createHash('sha512').update(bytes).digest('base64'),metadata.dist.integrity);
+          const folder=path.join(process.env.RUNNER_TEMP,'published');fs.mkdirSync(folder);fs.writeFileSync(path.join(folder,'package.tgz'),bytes);
+          execFileSync('tar',['-xzf',path.join(folder,'package.tgz'),'-C',folder]);
+          const files=JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP,'pack.json')))[0].files;
+          for(const f of files)assert(fs.readFileSync(f.path).equals(fs.readFileSync(path.join(folder,'package',f.path))),f.path);
+          const tags=await(await fetch('https://registry.npmjs.org/-/package/newmark2dsh/dist-tags',{headers:{'cache-control':'no-cache'}})).json();assert.equal(tags.latest,version);
+          fs.writeFileSync('publication-receipt.json',JSON.stringify({ok:true,version,latest:tags.latest,files:files.length,allEqual:true,integrity:metadata.dist.integrity,sha256:crypto.createHash('sha256').update(bytes).digest('hex'),at:new Date().toISOString()},null,2));
+          console.log('PASS official npm '+version+': '+files.length+' files match immutable release tag, latest verified');
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: official-publication-receipt
+          path: publication-receipt.json
