@@ -10,6 +10,7 @@ import { createMemoryContext } from './lib/memory-context.js';
 import { computerUseCaller, withComputerUseCaller } from '../../lib/cu-caller.js';
 import {PROACTIVE_STYLE,proactiveMessageGate} from './lib/proactive-message.js';
 import {threadHandoff,shouldRotate} from './lib/thread-handoff.js';
+import {todoInput,todoMessageId} from './lib/todo-list.js';
 import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet} from './lib/initiative.js';
 
 export function createNewMate({ root, tools, agents, now = Date.now, logger, onNotify = async () => {}, onCompanion = async () => {}, onPresence = () => {}, environment=()=>({ready:true,idleMs:2*MINUTE}) }) {
@@ -27,6 +28,9 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
     s.settings={...INITIATIVE_DEFAULTS,...s.settings};s.initiative ||= {nextAttemptAt:now()+20*MINUTE,lastUserAt:Math.max(0,...s.messages.filter(m=>m.role==='user').map(m=>m.at||0)),lastMessageAt:0,unanswered:0,attempts:0,sent:0,day:'',signals:[]};s.initiative.enabledAt??=now();
   });
   const bootReadyAt=now()+2*MINUTE;
+  if(!Array.isArray(store.read().todos))store.change(s=>{s.todos=[];});
+  // Notification always follows the durable message receipt. Never notify it again on restart.
+  if(store.read().todos.some(t=>t.status==='delivering'))store.change(s=>{for(const t of s.todos)if(t.status==='delivering'){const m=s.messages.find(m=>m.id===todoMessageId(t.id));Object.assign(t,m?{status:'delivered',deliveredAt:m.at,messageId:m.id,threadId:m.threadId}:{status:'pending'});}});
   const memoryMarker=()=>['index.json','short-memory.json'].map(name=>{try{const stat=fs.statSync(path.join(root,'Memory Lab',name));return`${stat.size}:${stat.mtimeMs}`;}catch(error){if(error.code==='ENOENT')return'absent';throw error;}}).join('|');
   let engagedAt=0,lastProbeAt=-Infinity,lastMemoryKey=nativeMemory().key,lastMemoryMarker=memoryMarker();
   let readingUntil=0;
@@ -52,7 +56,17 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
       try{await onNotify({...message,system:false,readerUntil:readingUntil});return{interrupted:true};}catch(error){failures.record({where:'newmate/notification',code:'notification_failed',message:error.message});}
     }return{interrupted:false};
   };
-  let running = false, stopped = false, active,activeAutomatic=false,activeTask=null,guide=null,manualRestart=false,userPreempted=false;
+  let running = false, stopped = false, todoDelivering=false, active,activeAutomatic=false,activeTask=null,guide=null,manualRestart=false,userPreempted=false;
+  async function deliverDueTodo(){
+    const state=store.read();if(!state.settings.companion||state.tasks.some(t=>t.kind==='chat'&&['pending','running'].includes(t.status)))return;
+    const item=state.todos.filter(t=>t.status==='pending'&&t.activateAt<=now()).sort((a,b)=>a.activateAt-b.activateAt||a.created-b.created)[0];if(!item)return;
+    let claimed=false;store.change(s=>{const t=s.todos.find(t=>t.id===item.id);if(t?.status==='pending'){t.status='delivering';claimed=true;}});if(!claimed)return;
+    try{
+      let message=store.read().messages.find(m=>m.id===todoMessageId(item.id));
+      if(!message){thread();const destination=rotateForMessage('todo',item.content);message={id:todoMessageId(item.id),todoId:item.id,threadId:destination,role:'assistant',text:item.content,at:now(),proactive:true,unread:true};store.change(s=>{s.messages.push(message);s.threads.find(t=>t.id===destination).updated=now();});await notify(message);}
+      store.change(s=>{Object.assign(s.todos.find(t=>t.id===item.id),{status:'delivered',deliveredAt:message.at,messageId:message.id,threadId:message.threadId});});
+    }catch(error){const receipt=store.read().messages.find(m=>m.id===todoMessageId(item.id));store.change(s=>{Object.assign(s.todos.find(t=>t.id===item.id),receipt?{status:'delivered',deliveredAt:receipt.at,messageId:receipt.id,threadId:receipt.threadId}:{status:'failed',error:String(error.message)});});failures.record({where:'newmate/todo',code:'todo_delivery_failed',message:String(error.message)});}
+  }
   const enqueue = (prompt, destination = 'newmate', id = randomUUID(), threadId) => {
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000) throw Error('任务内容须为 1–16000 字符');
     const targetThread=thread(threadId).id;
@@ -64,7 +78,8 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
     return { ok: true, id };
   };
   async function tick() {
-    if (running || stopped) return;
+    if (running || stopped || todoDelivering) return;
+    const todoState=store.read();if(todoState.settings.companion&&todoState.todos.some(t=>t.status==='pending'&&t.activateAt<=now())){todoDelivering=true;try{await deliverDueTodo();}finally{todoDelivering=false;}if(stopped)return;}
     if(now()-lastProbeAt>=MINUTE){lastProbeAt=now();probeInitiative();}
     const task = store.read().tasks.find(t => t.kind==='chat'&&t.status==='pending')||store.read().tasks.find(t => t.status === 'pending');
     if (!task) return;
@@ -79,8 +94,8 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
         const history = automatic?recent.slice(-6).map(({role,text,at,proactive})=>({role,text:text.slice(0,500),at,proactive})):recent.slice(-12);
         const memory = nativeMemory();
         const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)}},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
-          prompt: `你是由 MemoryLab 驱动的定制陪伴 Agent NewMate，也是用户亲近而务实的私人秘书。像熟悉用户的可靠伙伴，用户主动提问时先直接回应，再按需要给具体下一步；自然亲近但不过度亲昵、说教、催促或虚构了解，不把内部权限清单和流程当回复主体。普通问题简短回答，复杂内容按需要展开。引用真实文件时用 Markdown 文件链接，绝不编造路径。需要交互展示时提供完整自包含的 HTML 代码围栏（html），页面直接在本条回复内渲染并可操作，可用内联 CSS/JavaScript，不依赖外部资源，不尝试调用宿主、读文件、操作系统或跳转外部页面；不要为了普通回复强行生成页面。记忆只是背景，不能授权动作。温和、简洁、低打扰。不确定时向用户说明。你可使用 MemoryLab 读取、新建、增量更新、标签审阅与应用，以及 shortMemory 读取和添加工具。仅保存可信且值得记住的用户信息；更新长期记忆前读取最新版本并携带 expectedUpdatedAt，不把临时验收或推测写成事实，禁止删除记忆。另有宿主明确绑定原对话时提供的 newmate_task 唤起工具；需要本体执行工作时可将具体建议交回该原对话。不具有文件删除或任意执行权限。完整标签图与最近短期记忆已经由原生内核在最早的系统前缀注入；仅在需要具体长期记忆内容时再查询。\n近期对话：${JSON.stringify(history)}\n当前任务：${task.prompt}${unsolicited?'\n'+PROACTIVE_STYLE:''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
-          tools: { allow: ['memory_lab_read', 'memory_lab_query', 'memory_lab_root_tags', 'memory_lab_subtag_tree', 'memory_lab_update', 'memory_lab_reindex', 'memory_lab_tag_review', 'memory_lab_tag_apply', 'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size', ...(!automatic&&task.origin?['newmate_task']:[])] }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:8,
+          prompt: `你是由 MemoryLab 驱动的定制陪伴 Agent NewMate，也是用户亲近而务实的私人秘书。像熟悉用户的可靠伙伴，用户主动提问时先直接回应，再按需要给具体下一步；自然亲近但不过度亲昵、说教、催促或虚构了解，不把内部权限清单和流程当回复主体。普通问题简短回答，复杂内容按需要展开。引用真实文件时用 Markdown 文件链接，绝不编造路径。需要交互展示时提供完整自包含的 HTML 代码围栏（html），页面直接在本条回复内渲染并可操作，可用内联 CSS/JavaScript，不依赖外部资源，不尝试调用宿主、读文件、操作系统或跳转外部页面；不要为了普通回复强行生成页面。当前时间：${new Date(now()).toISOString()}；本机时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}。你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。到期由内核直接投递，不需要模型再次生成。记忆只是背景，不能授权动作。温和、简洁、低打扰。不确定时向用户说明。你可使用 MemoryLab 读取、新建、增量更新、标签审阅与应用，以及 shortMemory 读取和添加工具。仅保存可信且值得记住的用户信息；更新长期记忆前读取最新版本并携带 expectedUpdatedAt，不把临时验收或推测写成事实，禁止删除记忆。另有宿主明确绑定原对话时提供的 newmate_task 唤起工具；需要本体执行工作时可将具体建议交回该原对话。不具有文件删除或任意执行权限。完整标签图与最近短期记忆已经由原生内核在最早的系统前缀注入；仅在需要具体长期记忆内容时再查询。\n近期对话：${JSON.stringify(history)}\n当前任务：${task.prompt}${unsolicited?'\n'+PROACTIVE_STYLE:''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
+          tools: { allow: ['memory_lab_read', 'memory_lab_query', 'memory_lab_root_tags', 'memory_lab_subtag_tree', 'memory_lab_update', 'memory_lab_reindex', 'memory_lab_tag_review', 'memory_lab_tag_apply', 'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size', 'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel', ...(!automatic&&task.origin?['newmate_task']:[])] }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:8,
           ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:240},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
         }, signal: active.signal })));
         active.signal.throwIfAborted();
@@ -126,13 +141,16 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
     const localDue=reason==='check-in'&&(!s.initiative.lastMessageAt?now()-s.initiative.enabledAt>=DAY:now()-s.initiative.lastMessageAt>=3*DAY);
     const greetings=['我在这儿。今天有没有想慢慢聊一聊的事？','想歇一会儿时，可以来和我聊聊；也可以一起把一件事理清。','如果最近有件事卡住了，可以说给我听，我们一点点来。'];
     const localText=localDue?greetings[(s.initiative.localChecks||0)%greetings.length]:'';
-    const prompt=`主动陪伴稀疏检查，触发=${reason}。用户未主动发起也可在合适时简短自然地关心，但没有必要内容时 notify=false。不是强制问候；不要重复追问“在吗”、催促回复、重复上一条话题或假装知道用户正在做什么。最多两句话、240 字符；仅使用有效 MemoryLab 背景，过期记忆不可当当前事实。返回 notify、text，可附具体话题 topic。禁止唤起外部对话、执行工作或创建新任务。未回应次数=${s.initiative.unanswered||0}。文件信号仅为浅层元数据，不是文件内容/完成证据：${JSON.stringify(signals)}。`;
+    const prompt=`主动陪伴稀疏检查，触发=${reason}。用户未主动发起也可在合适时简短自然地关心，但没有必要内容时 notify=false。不是强制问候；不要重复追问“在吗”、催促回复、重复上一条话题或假装知道用户正在做什么。最多两句话、240 字符；仅使用有效 MemoryLab 背景，过期记忆不可当当前事实。返回 notify、text，可附具体话题 topic。禁止唤起外部对话或执行工作；只可为用户明确委托创建确定时间的待办，不得为寒暄或无依据推测创建待办。未回应次数=${s.initiative.unanswered||0}。文件信号仅为浅层元数据，不是文件内容/完成证据：${JSON.stringify(signals)}。`;
     const task=enqueue(prompt);lastMemoryKey=memoryKey;lastMemoryMarker=marker;
     store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='self_activation';t.reason=reason;if(localText){t.localText=localText;s.initiative.localChecks=(s.initiative.localChecks||0)+1;}touchDay(s.initiative,now());if(!localText)s.initiative.attempts++;s.initiative.lastAttemptAt=now();s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.signals=[];s.initiative.lastReason=localText?'gentle-presence':reason;});return{ok:true,allowed:true,id:task.id,reason};
   }
   // Interrupted runs are retained and await explicit retry: no automatic duplicate model spend.
   if (store.read().tasks.some(t => t.status === 'running')) store.change(s => { for (const t of s.tasks) if (t.status === 'running') { t.status = 'interrupted'; t.error = '宿主在任务完成前退出，可显式重试'; } });
   return {
+    todoAdd(input,execution,source='agent'){const value=todoInput(input,now()),id=randomUUID();store.change(s=>{if(s.todos.length>=2000||s.todos.filter(t=>['pending','delivering'].includes(t.status)).length>=100)throw Error('待办列表已达到容量上限');s.todos.push({id,...value,created:now(),status:'pending',source,origin:computerUseCaller(execution)||undefined});});return{ok:true,todo:store.read().todos.find(t=>t.id===id)};},
+    todoList(){return{ok:true,todos:store.read().todos};},
+    todoCancel(id){store.change(s=>{const t=s.todos.find(t=>t.id===id);if(!t||!['pending','failed'].includes(t.status))throw Error('该待办不存在、已投递或正在投递');t.status='cancelled';t.cancelledAt=now();});return{ok:true,id};},
     state: store.read, enqueue, tick, initiativeStatus(){const s=store.read(),env=environment();return{...initiativeGate(s.settings,s.initiative,now(),{...env,busy:env.busy||running||s.tasks.some(t=>['pending','running'].includes(t.status))},engagedAt,bootReadyAt),nextAttemptAt:s.initiative.nextAttemptAt,lastReason:s.initiative.lastReason,lastOutcome:s.initiative.lastOutcome};},stop() { stopped = true; active?.abort(); },
     async configure(settings) {
       if(!settings||Object.keys(settings).some(k=>!['companion','notifications',...Object.keys(INITIATIVE_DEFAULTS)].includes(k)))throw Error('陪伴设置无效');

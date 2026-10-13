@@ -5,13 +5,16 @@ export const MCP_ROUTE='/newmark-newmate/mcp';
 export function newMateCalls(mate) {
   const output={schema:{type:'object'},render:(_,v)=>[{type:'text',text:JSON.stringify(v)}]};
   return [
+    {name:'newmate_todo_add',description:'Create a persistent one-shot NewMate reminder with an explicit activation time and the exact message to send. Any conversation or NewMate may create it. Use an ISO timestamp with time zone; ask for a missing time. At due time current attention is protected and the normal NewMate thread-handoff/bubble rules apply; companion off postpones delivery.',parameters:{type:'object',properties:{activateAt:{type:'string',description:'Future ISO timestamp with explicit Z or UTC offset.'},content:{type:'string',minLength:1,maxLength:16000}},required:['activateAt','content'],additionalProperties:false},execute:(a,e)=>mate.todoAdd(a,e)},
+    {name:'newmate_todo_list',description:'Read NewMate reminders with activation time, exact content and pending/delivered/cancelled state.',parameters:{type:'object',properties:{},additionalProperties:false},execute:()=>mate.todoList()},
+    {name:'newmate_todo_cancel',description:'Cancel an undelivered NewMate reminder; retains its audit entry and does not delete files or messages.',parameters:{type:'object',properties:{id:{type:'string'}},required:['id'],additionalProperties:false},execute:a=>mate.todoCancel(a.id)},
     {name:'newmate_chat',description:'Ask the persistent NewMate companion. Returns a task ID; poll newmate_task_status for the response. Native tag graph and recent short memories are already injected.',parameters:{type:'object',properties:{prompt:{type:'string',minLength:1,maxLength:16000}},required:['prompt'],additionalProperties:false},execute:(a,execution)=>mate.chat(a.prompt,execution)},
     {name:'newmate_task_status',description:'Read one NewMate task and its companion response.',parameters:{type:'object',properties:{id:{type:'string'}},required:['id'],additionalProperties:false},execute:a=>{const state=mate.state();const task=state.tasks.find(t=>t.id===a.id);if(!task)throw Error('任务不存在');return{ok:true,task,messages:state.messages.filter(m=>m.id===a.id)};}},
     {name:'newmate_message',description:'Send a proactive message to the user through NewMate and its desktop pet bubble. Do not send unsolicited capability or permission reports; these are suppressed. Requires the user companion switch enabled; no restart or file actions.',parameters:{type:'object',properties:{text:{type:'string',minLength:1,maxLength:16000},id:{type:'string',maxLength:100},summary:{type:'string',maxLength:100},topic:{type:'string',maxLength:80}},required:['text'],additionalProperties:false},execute:(a,e)=>mate.message(a.text,{id:a.id||e?.callId,summary:a.summary,topic:a.topic})},
     {name:'newmate_memory_context',description:'Read the native MemoryLab tag graph and latest ten short memories used by NewMate.',parameters:{type:'object',properties:{},additionalProperties:false},execute:()=>({ok:true,...mate.memoryContext()})},
   ].map(tool=>({...tool,output}));
 }
-export function createNewMateMcp({root,mate,version='0.3.12'}) {
+export function createNewMateMcp({root,mate,version='0.3.13'}) {
   const tokenFile=path.join(root,'newMate','mcp-token');
   const definitions=newMateCalls(mate);
   const token=()=>{try{return fs.readFileSync(tokenFile,'utf8').trim();}catch(e){if(e.code==='ENOENT')return '';throw e;}};

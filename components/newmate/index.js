@@ -61,6 +61,9 @@ export function apply(ctx, config) {
         const chunks=[];let bytes=0;for await(const chunk of req){const buffer=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);bytes+=buffer.length;if(bytes>64000)throw Error('请求过大');chunks.push(buffer);}const raw=Buffer.concat(chunks).toString('utf8');
         const input = JSON.parse(raw);
         switch(input.action){
+          case 'todo-add':body=mate.todoAdd({activateAt:input.activateAt,content:input.content},undefined,'user');break;
+          case 'todo-list':body=mate.todoList();break;
+          case 'todo-cancel':body=mate.todoCancel(input.id);break;
           case 'theme':body=updateDesktopPetTheme(input.dark);break;
           case 'file-target':body={ok:true,path:referencedFile(mate.state().messages,input.id,input.path)};break;
           case 'file-content':body=readReferencedFile(mate.state().messages,input.id,input.path);break;

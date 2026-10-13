@@ -1,4 +1,4 @@
-name: macOS candidate validation
+name: Apple Silicon release validation
 on:
   push:
     branches: [codex/macos-space-validation]
@@ -39,6 +39,8 @@ jobs:
           node scripts/verify-darwin-space-input.mjs
           node scripts/verify-darwin-pet-border.mjs
           node scripts/verify-darwin-channels.mjs
+          node scripts/verify-newmate-todo.mjs
+          node scripts/verify-short-memory-mcp.mjs
       - name: Compile native CU and pet with macOS SDK
         run: |
           xcrun swiftc -parse-as-library components/computeruse/lib/darwin-native.swift -o "$RUNNER_TEMP/newmark-cu" -framework AppKit -framework ScreenCaptureKit
@@ -64,6 +66,19 @@ jobs:
           npm install --prefix "$NEWMARK_WEB_DEPS" --no-package-lock --no-audit --no-fund react@18.3.1 react-dom@18.3.1 playwright@1.56.1
           "$NEWMARK_WEB_DEPS/node_modules/.bin/playwright" install chromium webkit
           node scripts/verify-darwin-web-render.mjs
+      - name: NewMate todo page with actual kernel on Chromium and WebKit
+        env:
+          NEWMARK_WEB_DEPS: ${{ runner.temp }}/newmark-web-deps
+        run: |
+          NEWMARK_WEB_ENGINE=chromium NEWMARK_EVIDENCE_DIR="$RUNNER_TEMP/newmark-evidence/todo-chromium" node scripts/verify-newmate-todo-web.mjs
+          NEWMARK_WEB_ENGINE=webkit NEWMARK_EVIDENCE_DIR="$RUNNER_TEMP/newmark-evidence/todo-webkit" node scripts/verify-newmate-todo-web.mjs
+      - name: Execute todo kernel from npm artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/newmark-packed"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/newmark-packed" --json > "$RUNNER_TEMP/newmark-packed/pack.json"
+          tar -xf "$RUNNER_TEMP/newmark-packed/newmark2dsh-0.3.13.tgz" -C "$RUNNER_TEMP/newmark-packed"
+          node --input-type=module -e 'import fs from "node:fs";fs.writeFileSync(process.env.RUNNER_TEMP+"/newmark-packed/test.mjs",fs.readFileSync("scripts/verify-newmate-todo.mjs","utf8").replaceAll("../components/","./package/components/"));'
+          node "$RUNNER_TEMP/newmark-packed/test.mjs"
       - name: Preserve owned window render evidence
         if: always()
         uses: actions/upload-artifact@v4
