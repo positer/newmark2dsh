@@ -266,6 +266,15 @@ final class CuBorder: NSView {
             guard AXIsProcessTrusted() else {return ["ok":false,"error_code":"accessibility_permission_required","permissions":permissions()]}
             guard NSScreen.main != nil else {try fail("desktop_unavailable","No interactive macOS display is available")}
             let proposed=request["spaceMode"] as? Bool==true ? (request["windowHandle"] as? String ?? ""):""
+            if request["spaceMode"] as? Bool==true && proposed.isEmpty {try fail("space_target_required","Select a window already placed in the Agent Space")}
+            if lockFD >= 0 {guard next==owner,proposed==spaceHandle else {try fail("takeover_busy","Another route or caller owns this helper")};return ["ok":true,"owner_id":owner,"lease_expiry":"none"]}
+            let directory=FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/Newmark-CU",isDirectory:true)
+            try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+            let fd=open(directory.appendingPathComponent("takeover.lock").path,O_CREAT|O_RDWR|O_NOFOLLOW,0o600)
+            guard fd >= 0 else {try fail("lease_unavailable","Cannot open native lease file")}
+            guard flock(fd,LOCK_EX|LOCK_NB)==0 else {close(fd);try fail("takeover_busy","Another native helper owns the kernel lease")}
+            lockFD=fd;owner=next;spaceHandle=proposed
+            var bound=false;defer{if !bound{release()}}
             if !proposed.isEmpty {
                 let row=try target(request)
                 do{_ = try axWindow(row)}catch let failure as CuFailure {
@@ -280,14 +289,7 @@ final class CuBorder: NSView {
                     guard restored["focus_restored"] as? Bool==true,restored["cursor_restored"] as? Bool==true,restored["user_preempted"] as? Bool==false else{try fail("space_binding_restore_unconfirmed","Space binding did not restore the original context; re-observe before continuing")}
                 }
             }
-            if request["spaceMode"] as? Bool==true && proposed.isEmpty {try fail("space_target_required","Select a window already placed in the Agent Space")}
-            if lockFD >= 0 {guard next==owner,proposed==spaceHandle else {try fail("takeover_busy","Another route or caller owns this helper")};return ["ok":true,"owner_id":owner,"lease_expiry":"none"]}
-            let directory=FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/Newmark-CU",isDirectory:true)
-            try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
-            let fd=open(directory.appendingPathComponent("takeover.lock").path,O_CREAT|O_RDWR|O_NOFOLLOW,0o600)
-            guard fd >= 0 else {try fail("lease_unavailable","Cannot open native lease file")}
-            guard flock(fd,LOCK_EX|LOCK_NB)==0 else {close(fd);try fail("takeover_busy","Another native helper owns the kernel lease")}
-            lockFD=fd;owner=next;spaceHandle=proposed
+            bound=true
             startBorders()
             return ["ok":true,"owner_id":owner,"lease_expiry":"none","lease":["owner_id":owner,"mouse_mode":spaceHandle.isEmpty ? "real":"virtual","acquired_at":Date().timeIntervalSince1970*1000],"native_border":!borders.isEmpty,"user_input_blocked":false,"permissions":permissions(),"desktop_backend":spaceHandle.isEmpty ? "native":"mission_control_space","space_window_handle":spaceHandle,"independent_input":false,"input_guard":"100ms physical-user idle; exact context restoration; AX-first scoped targets"]
         }
