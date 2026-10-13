@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';import fs from 'node:fs';import {createSpaceDispatch,validateSpaceRequest} from '../components/computeruse/lib/darwin-space.js';import {petPresentation} from '../components/computeruse/lib/desktop-pet.js';
+let checks=0;const check=(n,v)=>{assert.ok(v,n);console.log(`ok ${++checks} - ${n}`);};const root='../components/computeruse/lib/',source=n=>fs.readFileSync(new URL(root+n,import.meta.url),'utf8'),calls=[],bridge=createSpaceDispatch(async input=>{calls.push(input);return{ok:true};});
+await bridge.run({action:'takeover_start',ownerId:'normal',mouseMode:'real'});check('explicit normal CU does not require or create a Space binding',calls.at(-1).spaceMode!==true&&bridge.size()===0);
+check('normal input is accepted only by explicit real mode',validateSpaceRequest({action:'move',mouseMode:'real'})===null&&validateSpaceRequest({action:'move'})?.code==='unsafe_space_action');
+await bridge.run({action:'takeover_start',ownerId:'space',windowHandle:'mac:1:2'});await bridge.run({action:'app_observe',ownerId:'space',previewOnly:true});check('preview inherits exact bound Space without a second lease',calls.at(-1).windowHandle==='mac:1:2'&&calls.at(-1).previewOnly===true&&bridge.size()===1);
+for(const companion of [false,true])for(const cu of [false,true]){const p=petPresentation({companion,cu});check('shared pet stays visible until both users release',p.visible===(companion||cu)&&p.outline===cu);}
+const pet=source('desktop-pet-darwin.swift'),cu=source('darwin-native.swift'),backend=source('darwin.js'),launcher=source('desktop-pet.js'),mate=fs.readFileSync(new URL('../components/newmate/index.js',import.meta.url),'utf8');
+check('native pet remains visible across Spaces/full-screen contexts',pet.includes('canJoinAllSpaces')&&pet.includes('fullScreenAuxiliary')&&pet.includes('setActivationPolicy(.accessory)'));
+check('single click expansion and double-click NewMate have distinct paths',pet.includes('count>=2{closePreview();openChat()')&&pet.includes('self.openPreview():self.closePreview()'));
+check('drag cancels pending click expansion',pet.includes('dragged?()')&&pet.includes('pendingClick?.cancel()'));
+check('preview is read-only and closes with Escape',pet.includes('input_forwarding":false')&&pet.includes('cancelOperation')&&!pet.includes('.post(tap:'));
+check('stale preview frames are cleared',pet.includes('age<3000')&&pet.includes('previewImage?.image=nil'));
+check('double click uses DSH reopen plus the existing event channel',pet.includes('open-chat.json')&&pet.includes('openApplication(at:')&&pet.includes('createsNewApplicationInstance=false'));
+check('right menu sends existing companion/settings actions',pet.includes('stop-companion')&&pet.includes('openChat("settings")'));
+check('CU and companion use the same existing native pet launcher',launcher.includes("process.platform==='darwin'")&&launcher.includes('desktop-pet-darwin.swift')&&mate.includes("process.platform==='darwin'?{path:process.execPath}"));
+check('normal CU border spans each display and is click-through',cu.includes('for screen in NSScreen.screens')&&cu.includes('panel.ignoresMouseEvents=true'));
+check('normal border runs across Spaces and responds to monitor changes',cu.includes('didChangeScreenParametersNotification')&&cu.includes('spaceHandle.isEmpty else{return}'));
+check('normal border has a live AppKit loop without blocking stdin',cu.includes('app.run()')&&cu.includes('while let line=await nextLine()')&&cu.includes('DispatchQueue.global(qos:.utility)'));
+check('Space preview does not replace Agent AX target IDs',cu.includes('if request["previewOnly"] as? Bool==true{var answer=try await capture')&&backend.includes("options.previewOnly?'preview:'"));
+check('preview capture is bounded and only active while expanded',backend.includes('viewer_expanded')&&backend.includes('previewBusy')&&backend.includes('},500)')&&backend.includes('previewFiles.size>2'));
+check('normal takeover stop disposes border timer, observer and windows',cu.includes('borderTimer?.invalidate()')&&cu.includes('NotificationCenter.default.removeObserver(observer)')&&cu.includes('for panel in borders{panel.orderOut(nil)}'));
+check('failure to start pet releases the Space lease',backend.includes('desktop_pet_unavailable')&&backend.includes('lease_released:true'));
+console.log(`PASS ${checks} real JS routing/shared presentation and Mac native source contracts; no Mac rendering or clicking claimed`);

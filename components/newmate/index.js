@@ -18,7 +18,7 @@ export function apply(ctx, config) {
   let companionChange=Promise.resolve();
   const companion=enabled=>companionChange=companionChange.catch(()=>{}).then(async()=>{
     if(!enabled)return stopDesktopPet('companion_disabled','companion');
-    const owner=await probeDesktop();if(disposed)return;
+    const owner=process.platform==='darwin'?{path:process.execPath}:await probeDesktop();if(disposed)return;
     const answer=await startDesktopPet({usage:'companion',userRoot:resolveRoot(config),dshExe:owner.path});
     if(disposed){await stopDesktopPet('companion_disposed','companion');return;}
     if(!answer.ok)throw Error(answer.error||'陪伴桌宠未能启动');

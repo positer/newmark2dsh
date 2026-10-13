@@ -19,11 +19,13 @@ const users = new Map();
 let shellExe = '';
 let readerUntil = 0;
 let bubbleDark = true;
+let cuMode='virtual',spacePreview={};
+export function updateDesktopPetCU({mouseMode='virtual',preview}={}){cuMode=mouseMode;if(preview)spacePreview=preview;syncMode();return{ok:true};}
 export function updateDesktopPetTheme(dark){if(typeof dark!=='boolean')throw Error('主题无效');if(bubbleDark!==dark){bubbleDark=dark;syncMode();}return{ok:true,dark};}
 let openChat = {id:''};
 const notices = [];
 export const petPresentation = ({companion=false,cu=false}={}) => ({visible:companion||cu,companion,cu,outline:cu});
-function mode() {return {...petPresentation({companion:users.has('companion'),cu:users.has('cu')}),dshExe:shellExe,readerUntil,bubbleDark};}
+function mode() {return {...petPresentation({companion:users.has('companion'),cu:users.has('cu')}),dshExe:shellExe,readerUntil,bubbleDark,cuMode,spacePreview};}
 function syncMode() {if(record)fs.writeFileSync(path.join(record.directory,'mode.json'),JSON.stringify(mode()));}
 export function updateDesktopPetFocus(until) {readerUntil=Number.isFinite(until)?until:0;syncMode();}
 export function companionPetEvents() {
@@ -56,6 +58,10 @@ function run(file, args) {
 
 /** Cache by source hash, so updates cannot launch a stale native executable. */
 export async function compileDesktopPet() {
+  if(process.platform==='darwin'){
+    const source=path.join(here,'desktop-pet-darwin.swift'),hash=crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex').slice(0,20),directory=path.join(root,'bin',hash),executable=path.join(directory,'newmark-desktop-pet');fs.mkdirSync(directory,{recursive:true,mode:0o700});
+    if(!fs.existsSync(executable)){const candidate=executable+'.'+process.pid+'.tmp';try{await run('/usr/bin/xcrun',['swiftc','-parse-as-library',source,'-o',candidate,'-framework','AppKit','-framework','CoreGraphics']);fs.chmodSync(candidate,0o700);fs.renameSync(candidate,executable);}finally{fs.rmSync(candidate,{force:true});}}return executable;
+  }
   const source = path.join(here, 'desktop-pet.cs');
   const menuSource = path.join(here, 'desktop-menu.cs');
   const vendor = path.resolve(here, '../vendor/webview2');
@@ -143,7 +149,7 @@ export function releaseDesktopPet(reason = 'lease_released', usage = 'cu') {
 }
 
 export async function startDesktopPet({ ownerPid = process.pid, desktop = 'Default', userRoot, usage = 'cu', dshExe = '' } = {}) {
-  if (process.platform !== 'win32') return { ok: false, error: 'unsupported_platform' };
+  if (!['win32','darwin'].includes(process.platform)) return { ok: false, error: 'unsupported_platform' };
   if(dshExe)shellExe=dshExe;
   users.set(usage,true);syncMode();
   if (record && record.desktop === desktop && desktopPetState().running) return { ok: true, already_running: true, ...desktopPetState() };

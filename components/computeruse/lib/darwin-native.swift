@@ -8,27 +8,167 @@ import Darwin
 
 struct CuFailure: Error { let code: String; let message: String }
 final class CuBorder: NSView {
-    override func draw(_ dirtyRect: NSRect) { NSColor.systemBlue.setStroke(); let line=NSBezierPath(rect:bounds.insetBy(dx:2,dy:2));line.lineWidth=3;line.stroke() }
+    var phase=false
+    override func draw(_ dirtyRect: NSRect) { (phase ? NSColor.white:NSColor.black).setStroke(); let line=NSBezierPath(rect:bounds.insetBy(dx:2,dy:2));line.lineWidth=3;line.stroke() }
 }
 @main @MainActor struct NativeCU {
     static var owner="", lockFD:Int32 = -1
-    static var border:NSPanel?
+    static var borders:[NSPanel]=[],borderTimer:Timer?,screenObserver:NSObjectProtocol?
+    static func refreshBorders(){for panel in borders{panel.orderOut(nil)};borders.removeAll();guard lockFD>=0,spaceHandle.isEmpty else{return};for screen in NSScreen.screens{let panel=NSPanel(contentRect:screen.frame,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false);panel.isOpaque=false;panel.backgroundColor = .clear;panel.hasShadow=false;panel.ignoresMouseEvents=true;panel.level = .screenSaver;panel.collectionBehavior=[.canJoinAllSpaces,.stationary,.fullScreenAuxiliary];panel.contentView=CuBorder(frame:NSRect(origin:.zero,size:screen.frame.size));panel.orderFrontRegardless();panel.display();borders.append(panel)}}
+    static func startBorders(){refreshBorders();guard spaceHandle.isEmpty else{return};borderTimer=Timer.scheduledTimer(withTimeInterval:0.5,repeats:true){_ in MainActor.assumeIsolated{for panel in borders{if let view=panel.contentView as? CuBorder{view.phase.toggle();view.needsDisplay=true}}}};screenObserver=NotificationCenter.default.addObserver(forName:NSApplication.didChangeScreenParametersNotification,object:nil,queue:.main){_ in MainActor.assumeIsolated{refreshBorders()}}}
+    static var spaceHandle=""
+    static var operationRevision:[UInt32]?
+    static let agentSource:CGEventSource? = {let source=CGEventSource(stateID:.privateState);source?.localEventsSuppressionInterval=0;return source}()
+    static let inputEvents:[CGEventType]=[.mouseMoved,.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp,.leftMouseDragged,.rightMouseDragged,.otherMouseDragged,.scrollWheel,.keyDown,.keyUp,.flagsChanged,.tabletPointer,.tabletProximity]
+    static func physicalRevision()->[UInt32]{inputEvents.map{CGEventSource.counterForEventType(.hidSystemState,eventType:$0)}}
+    static func physicalIdle()->Double{inputEvents.map{CGEventSource.secondsSinceLastEventType(.hidSystemState,eventType:$0)}.min() ?? 0}
+    static func physicalHeld()->Bool{
+        if [CGMouseButton.left,.right,.center].contains(where:{CGEventSource.buttonState(.hidSystemState,button:$0)}){return true}
+        return (0..<128).contains{CGEventSource.keyState(.hidSystemState,key:CGKeyCode($0))}
+    }
+    static func waitForUserIdle()async throws->[UInt32]{
+        guard CGPreflightListenEventAccess() else{try fail("input_monitoring_permission_required","Input Monitoring is required to yield to user activity; no agent input was sent")}
+        let started=ProcessInfo.processInfo.systemUptime
+        while true {
+            let idle=physicalIdle();guard idle.isFinite,idle>=0 else{try fail("user_input_state_unavailable","Cannot reliably measure user activity; agent input is paused")}
+            if idle>=0.1 && !physicalHeld(){return physicalRevision()}
+            if ProcessInfo.processInfo.systemUptime-started>=5{try fail("user_input_busy","User input has not been idle for 100ms; action was not sent at this checkpoint")}
+            try await Task.sleep(nanoseconds:20_000_000)
+        }
+    }
+    static func inputCheckpoint(_ revision:[UInt32])throws{
+        guard CGPreflightListenEventAccess(),physicalRevision()==revision,physicalIdle()>=0.1,!physicalHeld() else{try fail("user_input_preempted","User activity resumed; stop agent delivery and re-observe before retrying")}
+    }
+    static func deliveryCheckpoint()throws{guard let revision=operationRevision else{try fail("input_guard_required","No protected input operation is active")};try inputCheckpoint(revision)}
+    struct UserContext {let app:NSRunningApplication;let window:AXUIElement;let mouse:CGPoint;let revision:[UInt32]}
+    static func userContext(_ revision:[UInt32])throws->UserContext{
+        guard let app=NSWorkspace.shared.frontmostApplication,let mouse=CGEvent(source:nil)?.location,let window=axElement(axAttribute(AXUIElementCreateApplication(app.processIdentifier),kAXFocusedWindowAttribute)) else{try fail("context_snapshot_unavailable","Cannot snapshot exact user focus and cursor; no agent action is sent")}
+        return UserContext(app:app,window:window,mouse:mouse,revision:revision)
+    }
+    static func restoreUserContext(_ saved:UserContext,_ targetPID:pid_t?)async->[String:Any]{
+        if physicalRevision() != saved.revision || physicalHeld(){return["cursor_restored":false,"focus_restored":false,"user_preempted":true,"reason":"new_user_input_preserved"]}
+        let current=NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if current != saved.app.processIdentifier && current != targetPID {return["cursor_restored":false,"focus_restored":false,"user_preempted":true,"reason":"unexpected_new_focus_preserved"]}
+        var focus=false,cursor=false
+        if !saved.app.isTerminated {
+            let focused=axElement(axAttribute(AXUIElementCreateApplication(saved.app.processIdentifier),kAXFocusedWindowAttribute))
+            if current==saved.app.processIdentifier && focused.map({CFEqual($0,saved.window)})==true {focus=true}
+            else if physicalRevision()==saved.revision,saved.app.activate(options:[.activateIgnoringOtherApps]) {
+                if physicalRevision()==saved.revision {focus=AXUIElementPerformAction(saved.window,kAXRaiseAction as CFString) == .success}
+                // Allow the public activation request to settle; stop restoring if user input resumes.
+                for _ in 0..<10 {if physicalRevision() != saved.revision {break};let active=NSWorkspace.shared.frontmostApplication?.processIdentifier==saved.app.processIdentifier,window=axElement(axAttribute(AXUIElementCreateApplication(saved.app.processIdentifier),kAXFocusedWindowAttribute));if active && window.map({CFEqual($0,saved.window)})==true {focus=true;break};focus=false;try? await Task.sleep(nanoseconds:20_000_000)}
+            }
+        }
+        if physicalRevision() != saved.revision || physicalHeld(){return["cursor_restored":false,"focus_restored":focus,"user_preempted":true,"reason":"new_user_input_preserved"]}
+        if let point=CGEvent(source:nil)?.location {if abs(point.x-saved.mouse.x)<1 && abs(point.y-saved.mouse.y)<1 {cursor=true}else{cursor=CGWarpMouseCursorPosition(saved.mouse) == .success}}
+        return["cursor_restored":cursor,"focus_restored":focus,"user_preempted":false]
+    }
+    struct AXTarget { let element:AXUIElement; let window:AXUIElement; let pid:pid_t; let handle:String; let owner:String; let at:Date }
+    static var axTargets:[String:AXTarget]=[:]
+    static func axAttribute(_ element:AXUIElement,_ name:String)->CFTypeRef? {
+        var value:CFTypeRef?; return AXUIElementCopyAttributeValue(element,name as CFString,&value) == .success ? value:nil
+    }
+    static func axElement(_ value:CFTypeRef?)->AXUIElement? {
+        guard let value=value,CFGetTypeID(value)==AXUIElementGetTypeID() else{return nil};return unsafeBitCast(value,to:AXUIElement.self)
+    }
+    static func axRect(_ element:AXUIElement)->CGRect? {
+        guard let p=axAttribute(element,kAXPositionAttribute),let s=axAttribute(element,kAXSizeAttribute),CFGetTypeID(p)==AXValueGetTypeID(),CFGetTypeID(s)==AXValueGetTypeID() else{return nil}
+        let position=unsafeBitCast(p,to:AXValue.self),size=unsafeBitCast(s,to:AXValue.self);var point=CGPoint.zero,extent=CGSize.zero
+        guard AXValueGetType(position) == .cgPoint,AXValueGetType(size) == .cgSize,AXValueGetValue(position,.cgPoint,&point),AXValueGetValue(size,.cgSize,&extent) else{return nil};return CGRect(origin:point,size:extent)
+    }
+    static func axWindow(_ row:[String:Any])throws->AXUIElement {
+        guard AXIsProcessTrusted() else{try fail("accessibility_permission_required","Enable Accessibility for the helper/owning desktop in macOS System Settings")}
+        let app=AXUIElementCreateApplication(pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0));AXUIElementSetMessagingTimeout(app,0.05)
+        let rect=bounds(row),title=row[kCGWindowName as String] as? String ?? "",all=axAttribute(app,kAXWindowsAttribute) as? [AXUIElement] ?? []
+        var matches=all.filter{element in guard let frame=axRect(element) else{return false};return abs(frame.minX-rect.minX)<2 && abs(frame.minY-rect.minY)<2 && abs(frame.width-rect.width)<2 && abs(frame.height-rect.height)<2}
+        if matches.count>1 && !title.isEmpty {matches=matches.filter{(axAttribute($0,kAXTitleAttribute) as? String)==title}}
+        guard matches.count==1 else{try fail("accessibility_window_unavailable","No unique AX window matches the fresh window bounds; no arbitrary window is selected")};return matches[0]
+    }
+    static func axActions(_ element:AXUIElement)->[String] {var names:CFArray?;return AXUIElementCopyActionNames(element,&names) == .success ? (names as? [String] ?? []):[]}
+    static func axSecure(_ element:AXUIElement)->Bool {(axAttribute(element,kAXRoleAttribute) as? String)=="AXSecureTextField" || (axAttribute(element,kAXSubroleAttribute) as? String)=="AXSecureTextField"}
+    static func axInWindow(_ element:AXUIElement,_ window:AXUIElement,_ pid:pid_t)->Bool {
+        var actual:pid_t=0;guard AXUIElementGetPid(element,&actual) == .success,actual==pid else{return false}
+        return CFEqual(element,window) || axElement(axAttribute(element,kAXWindowAttribute)).map{CFEqual($0,window)}==true
+    }
+    static func accessibilitySnapshot(_ row:[String:Any],_ request:[String:Any])throws->[String:Any] {
+        let window=try axWindow(row),pid=pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0),handle="mac:\(row[kCGWindowNumber as String] as? UInt32 ?? 0):\(pid)",epoch=UUID().uuidString,started=Date();var elements:[[String:Any]]=[],seen:[AXUIElement]=[],truncated=false
+        axTargets.removeAll()
+        func visit(_ element:AXUIElement,_ depth:Int) {
+            if depth>8 || elements.count>=160 || Date().timeIntervalSince(started)>0.25 {truncated=true;return}
+            if seen.contains(where:{CFEqual($0,element)}){return};seen.append(element)
+            let id="ax:\(epoch):\(elements.count)",secure=axSecure(element);var item:[String:Any]=["target_id":id,"role":axAttribute(element,kAXRoleAttribute) as? String ?? "","depth":depth,"actions":axActions(element),"secure":secure]
+            if !secure {for name in [kAXTitleAttribute,kAXDescriptionAttribute] {if let text=axAttribute(element,name) as? String {item[name==kAXTitleAttribute ? "title":"description"]=String(text.prefix(160))}}}
+            if let enabled=axAttribute(element,kAXEnabledAttribute) as? Bool {item["enabled"]=enabled}
+            if let rect=axRect(element){item["bounds"]=["x":rect.minX,"y":rect.minY,"width":rect.width,"height":rect.height]}
+            elements.append(item);axTargets[id]=AXTarget(element:element,window:window,pid:pid,handle:handle,owner:request["ownerId"] as? String ?? "",at:started)
+            var childCount:CFIndex=0;guard AXUIElementGetAttributeValueCount(element,kAXChildrenAttribute as CFString,&childCount) == .success else{return};var values:CFArray?
+            if childCount>160 {truncated=true};guard AXUIElementCopyAttributeValues(element,kAXChildrenAttribute as CFString,0,min(childCount,160),&values) == .success else{return}
+            for child in values as? [AXUIElement] ?? [] {if elements.count>=160 || Date().timeIntervalSince(started)>0.25 {truncated=true;break};visit(child,depth+1)}
+        }
+        visit(window,0);return["available":true,"window_handle":handle,"elements":elements,"truncated":truncated,"target_lifetime_seconds":30,"values_omitted":true]
+    }
+    static func observeAccessible(_ row:[String:Any]?,_ request:[String:Any])async throws->[String:Any] {
+        if request["previewOnly"] as? Bool==true{var answer=try await capture(row,sparseOnly:request["sparseOnly"] as? Bool ?? false);answer["capture_available"]=true;return answer}
+        var accessibility:[String:Any]=["available":false,"error_code":"no_frontmost_window"]
+        if let row=row {do{accessibility=try accessibilitySnapshot(row,request)}catch let failure as CuFailure{accessibility=["available":false,"error_code":failure.code,"error":failure.message]}catch{accessibility=["available":false,"error_code":"accessibility_failed"]}}
+        var captureAvailable=CGPreflightScreenCaptureAccess();var answer:[String:Any]
+        if captureAvailable {do {answer=try await capture(request["action"] as? String=="observe" ? nil:row,sparseOnly:request["sparseOnly"] as? Bool ?? false)}catch {guard accessibility["available"] as? Bool==true else{throw error};captureAvailable=false;answer=["ok":true,"observation_route":"accessibility_only","capture_error":"Native pixel capture failed; AX observation retained"]}}
+        else {guard accessibility["available"] as? Bool==true else{try fail("macos_permissions_required","Accessibility or Screen Recording permission is needed for observation")};answer=["ok":true,"observation_route":"accessibility_only"]}
+        answer["accessibility"]=accessibility;answer["capture_available"]=captureAvailable;answer["permissions"]=permissions();return answer
+    }
+    static func selectedAX(_ row:[String:Any],_ request:[String:Any],_ point:CGPoint?=nil)throws->AXUIElement? {
+        let window=try axWindow(row),pid=pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0)
+        if let id=request["targetId"] as? String {
+            let handle="mac:\(row[kCGWindowNumber as String] as? UInt32 ?? 0):\(pid)"
+            guard let stored=axTargets[id],stored.handle==handle,stored.owner==request["ownerId"] as? String,Date().timeIntervalSince(stored.at)<=30,CFEqual(stored.window,window),axInWindow(stored.element,window,pid) else{try fail("stale_accessibility_target","Re-observe this window; AX target belongs to a different owner/window or has expired")};return stored.element
+        }
+        let app=AXUIElementCreateApplication(pid);var element:AXUIElement?
+        if let point=point {guard AXUIElementCopyElementAtPosition(app,Float(point.x),Float(point.y),&element) == .success else{return nil}}
+        else {element=axElement(axAttribute(app,kAXFocusedUIElementAttribute))}
+        guard let result=element,axInWindow(result,window,pid) else{try fail("accessibility_target_changed","AX target is outside the selected window")};return result
+    }
+    static func accessibilityInput(_ row:[String:Any],_ request:[String:Any],_ point:CGPoint)throws->[String:Any]? {
+        let action=request["action"] as? String ?? "",explicit=request["targetId"] != nil
+        guard action=="app_click" || action=="app_type" else {if explicit{try fail("unsupported_accessibility_action","AX target_id supports app_click/app_type only")};return nil}
+        var element:AXUIElement?
+        do{element=try selectedAX(row,request,action=="app_click" ? point:nil)}catch let failure as CuFailure {if !explicit && failure.code=="accessibility_window_unavailable" {return nil};throw failure}
+        guard var selected=element else {if explicit{try fail("stale_accessibility_target","AX target is no longer available")};return nil}
+        if axSecure(selected){try fail("secure_input_refused","Secure AX text fields are not read or edited")}
+        if action=="app_click" {
+            guard (request["button"] as? String ?? "left")=="left",(request["clickCount"] as? Int ?? 1)==1 else {if explicit{try fail("unsupported_accessibility_action","AXPress represents a single primary activation")};return nil}
+            for _ in 0..<6 {
+                if axActions(selected).contains(kAXPressAction) {
+                    if axAttribute(selected,kAXEnabledAttribute) as? Bool==false{try fail("accessibility_disabled","AX control is disabled")}
+                    try deliveryCheckpoint();let result=AXUIElementPerformAction(selected,kAXPressAction as CFString);guard result == .success else{try fail("accessibility_action_failed","AXPress failed (\(result.rawValue)); no event retry")};return["ok":true,"input_route":"accessibility","ax_action":"AXPress"]
+                }
+                if explicit {break};guard let parent=axElement(axAttribute(selected,kAXParentAttribute)),axInWindow(parent,try axWindow(row),pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0)) else{break};selected=parent
+            }
+        } else {
+            let focused=axElement(axAttribute(AXUIElementCreateApplication(pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0)),kAXFocusedUIElementAttribute))
+            guard focused.map({CFEqual($0,selected)})==true else{try fail("accessibility_focus_changed","Focus the selected text field before inserting text")}
+            var settable:DarwinBoolean=false
+            if AXUIElementIsAttributeSettable(selected,kAXSelectedTextAttribute as CFString,&settable) == .success && settable.boolValue {
+                try deliveryCheckpoint();let result=AXUIElementSetAttributeValue(selected,kAXSelectedTextAttribute as CFString,(request["text"] as? String ?? "") as CFString);guard result == .success else{try fail("accessibility_action_failed","AX selected-text insertion failed (\(result.rawValue)); no event retry")};return["ok":true,"input_route":"accessibility","ax_action":"AXSelectedText"]
+            }
+        }
+        if explicit {try fail("unsupported_accessibility_action","This observed AX control does not support the requested semantic action")};return nil
+    }
     static func fail(_ code:String,_ text:String)throws -> Never { throw CuFailure(code:code,message:text) }
-    static func windows()->[[String:Any]] {
-        let rows=CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []
+    static func windows(_ all:Bool=false)->[[String:Any]] {
+        let rows=CGWindowListCopyWindowInfo(all ? [.optionAll,.excludeDesktopElements]:[.optionOnScreenOnly,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []
         return rows.filter{($0[kCGWindowLayer as String] as? Int ?? 1)==0}
     }
     static func target(_ request:[String:Any])throws -> [String:Any] {
         let value=(request["windowHandle"] as? String ?? request["appTarget"] as? String ?? "").split(separator:":")
-        guard value.count==3,value[0]=="mac",let id=UInt32(value[1]),let pid=Int(value[2]),let row=windows().first(where:{($0[kCGWindowNumber as String] as? UInt32)==id && ($0[kCGWindowOwnerPID as String] as? Int)==pid}) else {try fail("stale_window","Use a fresh mac:<window-id>:<pid> handle from app_list")}
+        guard value.count==3,value[0]=="mac",let id=UInt32(value[1]),let pid=Int(value[2]),let row=windows(request["spaceMode"] as? Bool==true).first(where:{($0[kCGWindowNumber as String] as? UInt32)==id && ($0[kCGWindowOwnerPID as String] as? Int)==pid}) else {try fail("stale_window","Use a fresh mac:<window-id>:<pid> handle from app_list")}
         return row
     }
     static func bounds(_ row:[String:Any])->CGRect { CGRect(dictionaryRepresentation:row[kCGWindowBounds as String] as! CFDictionary) ?? .zero }
-    static func permissions()->[String:Bool] { ["accessibility":AXIsProcessTrusted(),"screenRecording":CGPreflightScreenCaptureAccess()] }
-    static func release() { border?.orderOut(nil);border=nil;if lockFD >= 0 {flock(lockFD,LOCK_UN);close(lockFD)};lockFD = -1;owner="" }
+    static func permissions()->[String:Bool] { ["accessibility":AXIsProcessTrusted(),"screenRecording":CGPreflightScreenCaptureAccess(),"inputMonitoring":CGPreflightListenEventAccess()] }
+    static func release() { borderTimer?.invalidate();borderTimer=nil;if let observer=screenObserver{NotificationCenter.default.removeObserver(observer)};screenObserver=nil;for panel in borders{panel.orderOut(nil)};borders.removeAll();axTargets.removeAll();spaceHandle="";if lockFD >= 0 {flock(lockFD,LOCK_UN);close(lockFD)};lockFD = -1;owner="" }
     static func lease(_ request:[String:Any])throws {
         guard lockFD >= 0,!owner.isEmpty,request["ownerId"] as? String==owner else {try fail("takeover_required","Acquire this caller's native takeover lease first")}
-        guard AXIsProcessTrusted() else {try fail("accessibility_permission_required","Grant Accessibility to the stable helper/owning desktop in macOS settings; no permission is requested automatically")}
+        guard AXIsProcessTrusted() else {try fail("accessibility_permission_required","Grant Accessibility to the requesting helper/owning desktop identified in macOS settings; no permission is requested automatically")}
     }
     static func capture(_ row:[String:Any]?,sparseOnly:Bool=false)async throws->[String:Any] {
         guard CGPreflightScreenCaptureAccess() else {try fail("screen_recording_permission_required","Grant screen recording in macOS settings; no automatic permission request")}
@@ -37,7 +177,7 @@ final class CuBorder: NSView {
         let output=directory.appendingPathComponent("mac-"+UUID().uuidString+".png")
         var image:CGImage?
         if #available(macOS 14.0,*) {
-            let content=try await SCShareableContent.excludingDesktopWindows(false,onScreenWindowsOnly:true)
+            let content=try await SCShareableContent.excludingDesktopWindows(false,onScreenWindowsOnly:false)
             let filter:SCContentFilter
             if let row=row,let id=row[kCGWindowNumber as String] as? UInt32,let window=content.windows.first(where:{$0.windowID==id}) {filter=SCContentFilter(desktopIndependentWindow:window)}
             else if row==nil,let display=content.displays.first(where:{$0.displayID==CGMainDisplayID()}) {filter=SCContentFilter(display:display,excludingWindows:[])}
@@ -61,41 +201,69 @@ final class CuBorder: NSView {
         context.draw(image,in:CGRect(x:0,y:0,width:32,height:18))
         var answer:[String:Any]=["ok":true,"width":image.width,"height":image.height,"sparse_grid":Array(UnsafeBufferPointer(start:pixels,count:576))];if !sparseOnly {answer["image_path"]=output.path;answer["image_mime"]="image/png"} else if FileManager.default.fileExists(atPath:output.path){try? FileManager.default.removeItem(at:output)};return answer
     }
-    static func dispatch(_ request:[String:Any])async throws->[String:Any] {
+    static func dispatch(_ input:[String:Any])async throws->[String:Any] {
+        var request=input;let action=request["action"] as? String ?? "",isSpace=request["spaceMode"] as? Bool==true || (!spaceHandle.isEmpty && request["ownerId"] as? String==owner)
+        if isSpace {request["spaceMode"]=true;if !spaceHandle.isEmpty {let explicit=request["windowHandle"] as? String;guard explicit==nil || explicit==spaceHandle else{try fail("space_target_mismatch","Cannot redirect a held Space lease to another window")};request["windowHandle"]=spaceHandle}}
+        let changing=["app_activate","app_click","app_type","app_scroll","app_key","click","move","type","scroll","key"].contains(action)
+        if !changing || request["dryRun"] as? Bool==true {return try await dispatchBody(request)}
+        try lease(request)
+        guard isSpace ? !spaceHandle.isEmpty:spaceHandle.isEmpty else{try fail("space_takeover_required","Input mode does not match the held native lease")}
+        if isSpace && !action.hasPrefix("app_"){try fail("unsafe_space_action","Space mode requires scoped app_* actions")}
+        let revision=try await waitForUserIdle(),saved=try userContext(revision),pid=(try? target(request)).map{pid_t($0[kCGWindowOwnerPID as String] as? Int ?? 0)}
+        var answer:[String:Any]
+        operationRevision=revision;defer{operationRevision=nil}
+        do {try inputCheckpoint(revision);answer=try await dispatchBody(request)}
+        catch let failure as CuFailure {answer=["ok":false,"error_code":failure.code,"error":failure.message,"delivery_state":"unconfirmed; do not automatically replay"]}
+        catch {answer=["ok":false,"error_code":"macos_action_failed","error":String(describing:error),"delivery_state":"unconfirmed; do not automatically replay"]}
+        let restored=await restoreUserContext(saved,pid);answer["context_restore"]=restored;answer["user_input_guard"]=["idle_ms":100,"user_input_blocked":false]
+        if answer["ok"] as? Bool==true,restored["user_preempted"] as? Bool != true,(restored["focus_restored"] as? Bool != true || restored["cursor_restored"] as? Bool != true){answer["ok"]=false;answer["error_code"]="context_restore_failed";answer["action_applied"]=true;answer["error"]="Action completed but exact context restoration failed; do not replay the action"}
+        return answer
+    }
+    static func dispatchBody(_ request:[String:Any])async throws->[String:Any] {
         let action=request["action"] as? String ?? ""
-        if action=="app_list" {return ["ok":true,"permissions":permissions(),"windows":windows().map{row in ["window_handle":"mac:\(row[kCGWindowNumber as String] as? UInt32 ?? 0):\(row[kCGWindowOwnerPID as String] as? Int ?? 0)","title":row[kCGWindowName as String] as? String ?? "","app":row[kCGWindowOwnerName as String] as? String ?? "","bounds":row[kCGWindowBounds as String] ?? [:]]}]}
-        if action=="observe" {return try await capture(nil,sparseOnly:request["sparseOnly"] as? Bool ?? false)}
-        if action=="app_observe" {return try await capture(try target(request),sparseOnly:request["sparseOnly"] as? Bool ?? false)}
+        if action=="app_list" {return ["ok":true,"permissions":permissions(),"windows":windows(true).map{row in ["window_handle":"mac:\(row[kCGWindowNumber as String] as? UInt32 ?? 0):\(row[kCGWindowOwnerPID as String] as? Int ?? 0)","title":row[kCGWindowName as String] as? String ?? "","app":row[kCGWindowOwnerName as String] as? String ?? "","on_screen":row[kCGWindowIsOnscreen as String] as? Bool ?? false,"bounds":row[kCGWindowBounds as String] ?? [:]]}]}
+        if action=="observe" {let pid=NSWorkspace.shared.frontmostApplication?.processIdentifier;return try await observeAccessible(windows().first(where:{($0[kCGWindowOwnerPID as String] as? Int)==pid.map{Int($0)}}),request)}
+        if action=="app_observe" {return try await observeAccessible(try target(request),request)}
         if action=="takeover_start" {
             guard let next=request["ownerId"] as? String,!next.isEmpty else {try fail("owner_required","DSH caller identity is required")}
             guard #available(macOS 14.0,*) else {try fail("macos_version_unverified","Interactive CU prototype requires macOS 14+; older macOS remains observation-only")}
-            guard AXIsProcessTrusted(),CGPreflightScreenCaptureAccess() else {return ["ok":false,"error_code":"macos_permissions_required","permissions":permissions()]}
+            guard AXIsProcessTrusted() else {return ["ok":false,"error_code":"accessibility_permission_required","permissions":permissions()]}
             guard NSScreen.main != nil else {try fail("desktop_unavailable","No interactive macOS display is available")}
-            if lockFD >= 0 {guard next==owner else {try fail("takeover_busy","Another DSH caller owns this helper")};return ["ok":true,"owner_id":owner,"lease_expiry":"none"]}
+            let proposed=request["spaceMode"] as? Bool==true ? (request["windowHandle"] as? String ?? ""):""
+            if !proposed.isEmpty {_ = try axWindow(try target(request))}
+            if request["spaceMode"] as? Bool==true && proposed.isEmpty {try fail("space_target_required","Select a window already placed in the Agent Space")}
+            if lockFD >= 0 {guard next==owner,proposed==spaceHandle else {try fail("takeover_busy","Another route or caller owns this helper")};return ["ok":true,"owner_id":owner,"lease_expiry":"none"]}
             let directory=FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/Newmark-CU",isDirectory:true)
             try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
             let fd=open(directory.appendingPathComponent("takeover.lock").path,O_CREAT|O_RDWR|O_NOFOLLOW,0o600)
             guard fd >= 0 else {try fail("lease_unavailable","Cannot open native lease file")}
             guard flock(fd,LOCK_EX|LOCK_NB)==0 else {close(fd);try fail("takeover_busy","Another native helper owns the kernel lease")}
-            lockFD=fd;owner=next
-            if let screen=NSScreen.main {let panel=NSPanel(contentRect:screen.frame,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false);panel.isOpaque=false;panel.backgroundColor = .clear;panel.ignoresMouseEvents=true;panel.level = .screenSaver;panel.collectionBehavior=[.canJoinAllSpaces,.stationary];panel.contentView=CuBorder(frame:NSRect(origin:.zero,size:screen.frame.size));panel.orderFrontRegardless();panel.display();border=panel}
-            return ["ok":true,"owner_id":owner,"lease_expiry":"none","native_border":border != nil,"user_input_blocked":false,"input_guard":"target focus validation; helper/session-exclusive lease"]
+            lockFD=fd;owner=next;spaceHandle=proposed
+            startBorders()
+            return ["ok":true,"owner_id":owner,"lease_expiry":"none","lease":["owner_id":owner,"mouse_mode":spaceHandle.isEmpty ? "real":"virtual","acquired_at":Date().timeIntervalSince1970*1000],"native_border":!borders.isEmpty,"user_input_blocked":false,"permissions":permissions(),"desktop_backend":spaceHandle.isEmpty ? "native":"mission_control_space","space_window_handle":spaceHandle,"independent_input":false,"input_guard":"100ms physical-user idle; exact context restoration; AX-first scoped targets"]
         }
-        if action=="takeover_stop" {guard owner.isEmpty || request["ownerId"] as? String==owner else {try fail("owner_mismatch","Cannot release another caller's lease")};release();return ["ok":true]}
+        if action=="takeover_stop" {guard owner.isEmpty || request["ownerId"] as? String==owner else {try fail("owner_mismatch","Cannot release another caller's lease")};let previous=owner;release();return ["ok":true,"released_owner":previous]}
         try lease(request)
         if request["dryRun"] as? Bool==true {return ["ok":true,"dry_run":true,"action":action]}
-        if action=="app_activate" {let row=try target(request);guard let app=NSRunningApplication(processIdentifier:pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0)),app.activate(options:[.activateIgnoringOtherApps]) else {try fail("activation_failed","Native application did not activate")};return ["ok":true]}
+        if action=="app_activate" {try deliveryCheckpoint();let row=try target(request),window=try axWindow(row);guard let app=NSRunningApplication(processIdentifier:pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0)),app.activate(options:[.activateIgnoringOtherApps]) else {try fail("activation_failed","Native application did not activate")};try deliveryCheckpoint();let raised=AXUIElementPerformAction(window,kAXRaiseAction as CFString);guard raised == .success else{try fail("accessibility_action_failed","AXRaise failed; re-observe the selected window")};return ["ok":true,"input_route":"accessibility","ax_action":"AXRaise"]}
         var point=CGPoint(x:(request["x"] as? NSNumber)?.doubleValue ?? 0,y:(request["y"] as? NSNumber)?.doubleValue ?? 0)
+        if request["spaceMode"] as? Bool==true && ["app_key","app_scroll"].contains(action){try deliveryCheckpoint();let row=try target(request),pid=pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0),window=try axWindow(row);guard let app=NSRunningApplication(processIdentifier:pid),app.activate(options:[.activateIgnoringOtherApps]) else{try fail("activation_failed","Cannot activate the bound Space target")};try deliveryCheckpoint();guard AXUIElementPerformAction(window,kAXRaiseAction as CFString) == .success else{try fail("activation_failed","Cannot raise the bound Space target")};for _ in 0..<25 {try deliveryCheckpoint();if NSWorkspace.shared.frontmostApplication?.processIdentifier==pid && windows().first?[kCGWindowNumber as String] as? UInt32==row[kCGWindowNumber as String] as? UInt32 {break};try await Task.sleep(nanoseconds:20_000_000)}}
+        if request["spaceMode"] as? Bool==true && ["app_click","app_type"].contains(action){let row=try target(request),rect=bounds(row);point.x+=rect.minX;point.y+=rect.minY;if action=="app_click" && !rect.contains(point){try fail("outside_target","Click leaves bound Space window")};if let answer=try accessibilityInput(row,request,point){return answer};try fail("space_ax_action_unavailable","This Space control has no supported AX action; no global input fallback")}
         if action.hasPrefix("app_") {let row=try target(request),pid=row[kCGWindowOwnerPID as String] as? Int ?? 0;guard NSWorkspace.shared.frontmostApplication?.processIdentifier==pid_t(pid) && windows().first?[kCGWindowNumber as String] as? UInt32==row[kCGWindowNumber as String] as? UInt32 else {try fail("focus_changed","Target is not the frontmost window; reacquire observation")};let rect=bounds(row);point.x+=rect.minX;point.y+=rect.minY;if (action=="app_click" || action=="app_scroll") && !rect.contains(point){try fail("outside_target","Click leaves target window")}}
-        if action=="click" || action=="app_click" || action=="move" {let right=request["button"] as? String=="right",button:CGMouseButton=right ? .right:.left;let down:CGEventType=action=="move" ? .mouseMoved:(right ? .rightMouseDown:.leftMouseDown);CGEvent(mouseEventSource:nil,mouseType:down,mouseCursorPosition:point,mouseButton:button)?.post(tap:.cghidEventTap);if action != "move" {CGEvent(mouseEventSource:nil,mouseType:right ? .rightMouseUp:.leftMouseUp,mouseCursorPosition:point,mouseButton:button)?.post(tap:.cghidEventTap)};return ["ok":true]}
-        if action=="type" || action=="app_type" {let units=Array((request["text"] as? String ?? "").utf16);var offset=0;while offset<units.count {var end=min(units.count,offset+100);if end<units.count && units[end-1]>=0xD800 && units[end-1]<=0xDBFF {end-=1};let part=Array(units[offset..<end]);offset=end;for down in [true,false] {let event=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:down);event?.keyboardSetUnicodeString(stringLength:part.count,unicodeString:part);event?.post(tap:.cghidEventTap)}};return ["ok":true]}
-        if action=="scroll" || action=="app_scroll" {let event=CGEvent(scrollWheelEvent2Source:nil,units:.pixel,wheelCount:2,wheel1:Int32(clamping:(request["scrollY"] as? Int ?? 0)),wheel2:Int32(clamping:(request["scrollX"] as? Int ?? 0)),wheel3:0);if action=="app_scroll"{event?.location=point};event?.post(tap:.cghidEventTap);return ["ok":true]}
-        if action=="key" || action=="app_key" {let codes:[String:CGKeyCode]=["a":0,"s":1,"d":2,"f":3,"h":4,"g":5,"z":6,"x":7,"c":8,"v":9,"b":11,"q":12,"w":13,"e":14,"r":15,"y":16,"t":17,"1":18,"2":19,"3":20,"4":21,"6":22,"5":23,"9":25,"7":26,"8":28,"0":29,"return":36,"enter":36,"l":37,"j":38,"k":40,"n":45,"m":46,"tab":48,"space":49,"backspace":51,"escape":53,"left":123,"right":124,"down":125,"up":126];let parts=(request["key"] as? String ?? "").lowercased().split(separator:"+").map{String($0)};guard let last=parts.last,let code=codes[last] else {try fail("unsupported_key","Key has no supported native mapping")};var flags:CGEventFlags=[];for modifier in parts.dropLast(){switch modifier {case "cmd","command","meta":flags.insert(.maskCommand);case "ctrl","control":flags.insert(.maskControl);case "alt","option":flags.insert(.maskAlternate);case "shift":flags.insert(.maskShift);default:try fail("unsupported_key","Unknown modifier")}};for down in [true,false] {let event=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:down);event?.flags=flags;event?.post(tap:.cghidEventTap)};return ["ok":true]}
+        if action.hasPrefix("app_"){if let result=try accessibilityInput(try target(request),request,point){return result}}
+        else if action=="click" || action=="type" {let pid=NSWorkspace.shared.frontmostApplication?.processIdentifier;if let row=windows().first(where:{($0[kCGWindowOwnerPID as String] as? Int)==pid.map{Int($0)}}),action=="type" || bounds(row).contains(point) {var scoped=request;scoped["action"]=action=="type" ? "app_type":"app_click";if let result=try accessibilityInput(row,scoped,point){return result}}}
+        else if request["targetId"] != nil {try fail("accessibility_window_required","Use AX target_id only with scoped app_click/app_type")}
+        if action=="click" || action=="app_click" || action=="move" {try deliveryCheckpoint();let right=request["button"] as? String=="right",button:CGMouseButton=right ? .right:.left;let down:CGEventType=action=="move" ? .mouseMoved:(right ? .rightMouseDown:.leftMouseDown);CGEvent(mouseEventSource:agentSource,mouseType:down,mouseCursorPosition:point,mouseButton:button)?.post(tap:.cghidEventTap);if action != "move" {CGEvent(mouseEventSource:agentSource,mouseType:right ? .rightMouseUp:.leftMouseUp,mouseCursorPosition:point,mouseButton:button)?.post(tap:.cghidEventTap)};return ["ok":true,"input_route":"coregraphics"]}
+        if action=="type" || action=="app_type" {let units=Array((request["text"] as? String ?? "").utf16);var offset=0;while offset<units.count {try deliveryCheckpoint();var end=min(units.count,offset+100);if end<units.count && units[end-1]>=0xD800 && units[end-1]<=0xDBFF {end-=1};let part=Array(units[offset..<end]);offset=end;for down in [true,false] {let event=CGEvent(keyboardEventSource:agentSource,virtualKey:0,keyDown:down);event?.keyboardSetUnicodeString(stringLength:part.count,unicodeString:part);event?.post(tap:.cghidEventTap)}};return ["ok":true,"input_route":"coregraphics"]}
+        if action=="scroll" || action=="app_scroll" {try deliveryCheckpoint();let event=CGEvent(scrollWheelEvent2Source:agentSource,units:.pixel,wheelCount:2,wheel1:Int32(clamping:(request["scrollY"] as? Int ?? 0)),wheel2:Int32(clamping:(request["scrollX"] as? Int ?? 0)),wheel3:0);if action=="app_scroll"{event?.location=point};event?.post(tap:.cghidEventTap);return ["ok":true,"input_route":"coregraphics"]}
+        if action=="key" || action=="app_key" {let codes:[String:CGKeyCode]=["a":0,"s":1,"d":2,"f":3,"h":4,"g":5,"z":6,"x":7,"c":8,"v":9,"b":11,"q":12,"w":13,"e":14,"r":15,"y":16,"t":17,"1":18,"2":19,"3":20,"4":21,"6":22,"5":23,"9":25,"7":26,"8":28,"0":29,"return":36,"enter":36,"l":37,"j":38,"k":40,"n":45,"m":46,"tab":48,"space":49,"backspace":51,"escape":53,"left":123,"right":124,"down":125,"up":126];let parts=(request["key"] as? String ?? "").lowercased().split(separator:"+").map{String($0)};guard let last=parts.last,let code=codes[last] else {try fail("unsupported_key","Key has no supported native mapping")};var flags:CGEventFlags=[];for modifier in parts.dropLast(){switch modifier {case "cmd","command","meta":flags.insert(.maskCommand);case "ctrl","control":flags.insert(.maskControl);case "alt","option":flags.insert(.maskAlternate);case "shift":flags.insert(.maskShift);default:try fail("unsupported_key","Unknown modifier")}};try deliveryCheckpoint();for down in [true,false] {let event=CGEvent(keyboardEventSource:agentSource,virtualKey:code,keyDown:down);event?.flags=flags;event?.post(tap:.cghidEventTap)};return ["ok":true,"input_route":"coregraphics"]}
         try fail("unsupported_action","This native prototype does not implement \(action); no fallback input is sent")
     }
-    static func main()async {
+    static func nextLine()async->String?{await withCheckedContinuation{continuation in DispatchQueue.global(qos:.utility).async{continuation.resume(returning:readLine())}}}
+    static func main(){let app=NSApplication.shared;app.setActivationPolicy(.prohibited);Task{await protocolLoop();app.terminate(nil)};app.run()}
+    static func protocolLoop()async {
         NSApplication.shared.setActivationPolicy(.prohibited)
         defer{release()}
-        while let line=readLine() {var answer:[String:Any];var id:Any=0;do {guard line.utf8.count<=64000,let bytes=line.data(using:.utf8),let request=try JSONSerialization.jsonObject(with:bytes) as? [String:Any] else {throw CuFailure(code:"invalid_request",message:"Invalid bounded JSON request")};id=request["requestId"] ?? 0;answer=try await dispatch(request)}catch let failure as CuFailure{answer=["ok":false,"error_code":failure.code,"error":failure.message]}catch{answer=["ok":false,"error_code":"macos_native_failure","error":String(describing:error)]};answer["requestId"]=id;if let data=try? JSONSerialization.data(withJSONObject:answer,options:[.sortedKeys]),let text=String(data:data,encoding:.utf8){print(text);fflush(stdout)}}
+        while let line=await nextLine() {var answer:[String:Any];var id:Any=0;do {guard line.utf8.count<=64000,let bytes=line.data(using:.utf8),let request=try JSONSerialization.jsonObject(with:bytes) as? [String:Any] else {throw CuFailure(code:"invalid_request",message:"Invalid bounded JSON request")};id=request["requestId"] ?? 0;answer=try await dispatch(request)}catch let failure as CuFailure{answer=["ok":false,"error_code":failure.code,"error":failure.message]}catch{answer=["ok":false,"error_code":"macos_native_failure","error":String(describing:error)]};answer["requestId"]=id;if let data=try? JSONSerialization.data(withJSONObject:answer,options:[.sortedKeys]),let text=String(data:data,encoding:.utf8){print(text);fflush(stdout)}}
     }
 }

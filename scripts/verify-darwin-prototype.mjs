@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';import {validateDarwinRequest,sparseDistance,runComputerUse,MODE_INVENTORY} from '../components/computeruse/lib/darwin.js';
+let checks=0;const check=(name,value)=>{assert.ok(value,name);console.log(`ok ${++checks} - ${name}`);};
+for(const input of [{action:'click',mode:'virtual'},{action:'click',mouseMode:'virtual'},{action:'takeover_start',desktop:'isolated'}])check('unscoped/unsupported virtual requests never fall through',Boolean(validateDarwinRequest(input)?.code));
+check('unsupported native action is explicitly refused',validateDarwinRequest({action:'process_pull'}).code==='unsupported_action');
+check('invalid coordinates cannot reach native input',validateDarwinRequest({action:'app_click',x:Infinity}).code==='invalid_coordinate');
+check('oversized input is rejected',validateDarwinRequest({action:'app_type',text:'a'.repeat(16001)}).code==='invalid_text');
+check('malformed nested sequence cannot reach a helper',validateDarwinRequest({action:'sequence',steps:[{action:'sequence',steps:[]}]}).code==='invalid_sequence');
+check('registered basic native actions survive validation',validateDarwinRequest({action:'app_observe',windowHandle:'mac:10:20'})===null);
+const black=Array(576).fill(0);check('identical 32x18 observations have zero distance',sparseDistance(black,black)===0);check('full grid change has normalized distance one',sparseDistance(black,Array(576).fill(255))===1);check('invalid grid never claims unchanged observation',sparseDistance([],black)===null);
+const report=JSON.parse(await runComputerUse({action:'mode_report'}));check('inventory discloses prototype, normal CU and shared Space input',report.modes.real.implementation.includes('pending')&&MODE_INVENTORY.virtual.independent_input===false&&MODE_INVENTORY.real.input_supported===true);
+if(process.platform!=='darwin')check('wrong platform never executes an alternative OS action',JSON.parse(await runComputerUse({action:'app_list'})).error_code==='unsupported_platform');
+console.log(`PASS ${checks} Darwin dispatch and sparse-measurement checks; no Mac SDK/hardware compilation or input claimed`);

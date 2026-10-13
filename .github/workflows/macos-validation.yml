@@ -1,0 +1,39 @@
+name: macOS candidate validation
+on:
+  push:
+    branches: [codex/macos-space-validation]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Record actual environment
+        run: |
+          sw_vers
+          uname -m
+          xcrun swiftc --version
+      - name: Run isolated Mac dispatch contracts
+        run: |
+          node scripts/verify-darwin-prototype.mjs
+          node scripts/verify-darwin-accessibility.mjs
+          node scripts/verify-darwin-space-input.mjs
+          node scripts/verify-darwin-pet-border.mjs
+      - name: Compile native CU and pet with macOS SDK
+        run: |
+          xcrun swiftc -parse-as-library components/computeruse/lib/darwin-native.swift -o "$RUNNER_TEMP/newmark-cu" -framework AppKit -framework ScreenCaptureKit
+          xcrun swiftc -parse-as-library components/computeruse/lib/desktop-pet-darwin.swift -o "$RUNNER_TEMP/newmark-pet" -framework AppKit -framework CoreGraphics
+      - name: Read-only native protocol smoke
+        env:
+          NEWMARK_NATIVE_BINARY: ${{ runner.temp }}/newmark-cu
+        run: node scripts/macos-native-readonly-smoke.mjs
