@@ -12,7 +12,7 @@ const beforeRestore=calls.length;const failed=await bridge.run({action:'app_scro
 await bridge.run({action:'takeover_stop',ownerId:'a'});check('stopping consumes the caller binding',bridge.size()===0);
 check('policy fixes 100ms idle and preserves physical user input',SPACE_INPUT_POLICY.idleMs===100&&SPACE_INPUT_POLICY.userInputBlocked===false&&SPACE_INPUT_POLICY.maxWaitMs===5000);
 const swift=fs.readFileSync(new URL('../components/computeruse/lib/darwin-native.swift',import.meta.url),'utf8');
-check('native gate uses hardware-state counters rather than mixed synthetic input',swift.includes('counterForEventType(.hidSystemState')&&swift.includes('secondsSinceLastEventType(.hidSystemState'));
+check('native user monitor excludes only owned tagged injections',swift.includes('options:.listenOnly')&&swift.includes('eventSourceUnixProcessID')&&swift.includes('eventSourceUserData')&&swift.includes('agentEventTag')&&swift.includes('startUserMonitor()'));
 check('mouse/key holds keep agent input paused',swift.includes('physicalHeld()')&&swift.includes('keyState(.hidSystemState')&&swift.includes('buttonState(.hidSystemState'));
 check('native guard waits at least 100ms with bounded polling',swift.includes('idle>=0.1')&&swift.includes('20_000_000')&&swift.includes('user_input_busy'));
 check('agent events use a private state and do not suppress physical input',swift.includes('stateID:.privateState')&&swift.includes('localEventsSuppressionInterval=0')&&!swift.includes('EventSource:nil'));
