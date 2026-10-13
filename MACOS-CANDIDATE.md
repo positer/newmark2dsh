@@ -1,9 +1,9 @@
-# macOS 0.3.12 candidate
+# macOS 0.3.12 source candidate
 
-Source candidate for Space + AX, 100ms user-idle gating, cursor/focus restoration, shared native pet preview and normal CU borders. Not installed or published.
+Apple Silicon only: macOS 14, 15, 26 ARM64. Not installed or published.
 
-[Native cloud validation](https://github.com/positer/newmark2dsh/actions/runs/38334868446) passed on macOS 14.8.9 and 15.7.9 ARM64: CU/pet SDK compilation, isolated contracts, read-only protocol, and AXPress against owned AppKit fixture windows. The original foreground fixture became active/key again; cursor restore was reported by the native helper. Normal border creation and Space border absence passed runtime checks. Tested runtime commit: 1a3082fbbe7fc36847174262c76a698fb07beb88.
+[Full render/operation matrix](https://github.com/positer/newmark2dsh/actions/runs/38353313760) passes 93 JS contracts, 45 native scenarios and 28 real React DOM Chromium/WebKit scenarios per OS. [Distinct Mission Control Space matrix](https://github.com/positer/newmark2dsh/actions/runs/38353318075) passes five additional actual two-Space groups per OS. Both tested runtime commit: cfa732271e729450c215972e1c9addbc6b967a65.
 
-Only owned fixture PIDs receive actions. No TCC edits, permission bypass, remote server/tunnel, paid larger runner or package publication. Public standard runners are free.
+Visual and AX routes work independently, with optional geometry cross-check. Off-Space AX binding is guarded by the native lease and 100ms user idle; validated window references survive AXWindows omission. Explicit activate_for_observation may briefly switch for pixels and restore the exact foreground window/cursor. Default observation and pet preview never activate a Space. Input/observation wait for Space transitions to settle and restore requires actual original window visibility. New user input always wins.
 
-Actual distinct Mission Control Spaces, physical user-input priority/100ms timing, pet click and DSH reopen, multi-screen visual geometry and Neo A18 Pro/8GB performance remain unverified. CI is not a permanent interactive Mac server.
+Native evidence covers pixels, AX effects, Unicode/scroll/key delivery, independent cursor sampling, shared pet/preview/menu, theme bubbles and normal border visual/click-through/teardown. Browser uses actual client.js + React, with explicit DSH backend/document-renderer/model fixtures. No actual Mac DSH container installation, physical keyboard/mouse timing, multi-screen/fullscreen combination or Neo minimum-hardware performance claim. No private Space API, TCC edits, remote server or paid runner. Historical Intel runs are retained only; future CI excludes Intel.
