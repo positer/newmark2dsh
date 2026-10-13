@@ -37,3 +37,7 @@ jobs:
         env:
           NEWMARK_NATIVE_BINARY: ${{ runner.temp }}/newmark-cu
         run: node scripts/macos-native-readonly-smoke.mjs
+      - name: Owned AppKit fixture native integration
+        env:
+          NEWMARK_NATIVE_BINARY: ${{ runner.temp }}/newmark-cu
+        run: node scripts/verify-darwin-native-fixture.mjs
