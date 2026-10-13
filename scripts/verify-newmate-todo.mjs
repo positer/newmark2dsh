@@ -2,7 +2,8 @@ import fs from 'node:fs';import os from 'node:os';import path from 'node:path';i
 import {createNewMate} from '../components/newmate/component.js';
 import {newMateCalls,createNewMateMcp} from '../components/newmate/lib/mcp.js';
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'newmate-todo-')),file=path.join(root,'newMate/state.json');let time=Date.parse('2026-10-13T10:00:00Z'),checks=0,calls=0;const notices=[];
-const make=()=>createNewMate({root,now:()=>time,onNotify:async m=>notices.push(m),tools:{execute(){calls++;throw Error('Reminder must not call a model');}},agents:()=>null});
+const make=()=>reminderOnly(createNewMate({root,now:()=>time,onNotify:async m=>notices.push(m),tools:{execute(){calls++;throw Error('Reminder must not call a model');}},agents:()=>null}));
+function reminderOnly(mate){const add=mate.todoAdd;mate.todoAdd=(input,...rest)=>add({...input,mode:'reminder'},...rest);return mate;}
 const change=fn=>{const s=JSON.parse(fs.readFileSync(file));fn(s);fs.writeFileSync(file,JSON.stringify(s));};const check=(name,value)=>{assert(value,name);console.log('ok '+(++checks)+' - '+name);},future=ms=>new Date(time+ms).toISOString();
 let mate=make();await mate.configure({companion:true,initiative:false,quietStart:0,quietEnd:0});
 check('legacy state gains a durable empty todo list',Array.isArray(mate.state().todos));

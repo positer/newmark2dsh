@@ -8,14 +8,14 @@ import Darwin
 
 struct CuFailure: Error { let code: String; let message: String }
 final class CuBorder: NSView {
-    var phase=false
-    override func draw(_ dirtyRect: NSRect) { (phase ? NSColor.white:NSColor.black).setStroke(); let line=NSBezierPath(rect:bounds.insetBy(dx:2,dy:2));line.lineWidth=3;line.stroke() }
+    var phase=0.0
+    override func draw(_ dirtyRect: NSRect) { for band in 0..<4{NSColor(white:(1-cos(phase+Double(band)*Double.pi/2))/2,alpha:1).setStroke();let line=NSBezierPath(rect:bounds.insetBy(dx:Double(band)+0.5,dy:Double(band)+0.5));line.lineWidth=1;line.stroke()} }
 }
 @main @MainActor struct NativeCU {
     static var owner="", lockFD:Int32 = -1
     static var borders:[NSPanel]=[],borderTimer:Timer?,screenObserver:NSObjectProtocol?
     static func refreshBorders(){for panel in borders{panel.orderOut(nil)};borders.removeAll();guard lockFD>=0,spaceHandle.isEmpty else{return};for screen in NSScreen.screens{let panel=NSPanel(contentRect:screen.frame,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false);panel.isOpaque=false;panel.backgroundColor = .clear;panel.hasShadow=false;panel.ignoresMouseEvents=true;panel.level = .screenSaver;panel.collectionBehavior=[.canJoinAllSpaces,.stationary,.fullScreenAuxiliary];panel.contentView=CuBorder(frame:NSRect(origin:.zero,size:screen.frame.size));panel.orderFrontRegardless();panel.display();borders.append(panel)}}
-    static func startBorders(){refreshBorders();guard spaceHandle.isEmpty else{return};borderTimer=Timer.scheduledTimer(withTimeInterval:0.5,repeats:true){_ in MainActor.assumeIsolated{for panel in borders{if let view=panel.contentView as? CuBorder{view.phase.toggle();view.needsDisplay=true}}}};screenObserver=NotificationCenter.default.addObserver(forName:NSApplication.didChangeScreenParametersNotification,object:nil,queue:.main){_ in MainActor.assumeIsolated{refreshBorders()}}}
+    static func startBorders(){refreshBorders();guard spaceHandle.isEmpty else{return};let started=ProcessInfo.processInfo.systemUptime;borderTimer=Timer(timeInterval:1.0/30,repeats:true){_ in MainActor.assumeIsolated{let phase=2*Double.pi*(ProcessInfo.processInfo.systemUptime-started)/3;for panel in borders{if let view=panel.contentView as? CuBorder{view.phase=phase;view.needsDisplay=true}}}};RunLoop.main.add(borderTimer!,forMode:.common);screenObserver=NotificationCenter.default.addObserver(forName:NSApplication.didChangeScreenParametersNotification,object:nil,queue:.main){_ in MainActor.assumeIsolated{refreshBorders()}}}
     static var spaceHandle=""
     static var operationRevision:[UInt32]?
     static let agentSource:CGEventSource? = {let source=CGEventSource(stateID:.privateState);source?.localEventsSuppressionInterval=0;return source}()

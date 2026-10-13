@@ -20,4 +20,7 @@ check('Space preview does not replace Agent AX target IDs',cu.includes('if reque
 check('preview capture is bounded and only active while expanded',backend.includes('viewer_expanded')&&backend.includes('previewBusy')&&backend.includes('},500)')&&backend.includes('previewFiles.size>2'));
 check('normal takeover stop disposes border timer, observer and windows',cu.includes('borderTimer?.invalidate()')&&cu.includes('NotificationCenter.default.removeObserver(observer)')&&cu.includes('for panel in borders{panel.orderOut(nil)}'));
 check('failure to start pet releases the Space lease',backend.includes('desktop_pet_unavailable')&&backend.includes('lease_released:true'));
+check('pet outline uses cached alpha silhouette instead of a rectangular path',pet.includes('contourIndices')&&pet.includes('sprite[i+3]<16')&&pet.includes('alpha-contour-wave')&&!pet.includes('roundedRect:bounds'));
+check('both native animations use monotonic bounded common-mode timers',pet.includes('timeInterval:1.0/30')&&cu.includes('timeInterval:1.0/30')&&pet.includes('systemUptime')&&cu.includes('systemUptime')&&pet.includes('forMode:.common')&&cu.includes('forMode:.common'));
+check('pet animation timer is disposed with the control timer',pet.includes('animationTimer?.invalidate()'));
 console.log(`PASS ${checks} real JS routing/shared presentation and Mac native source contracts; no Mac rendering or clicking claimed`);

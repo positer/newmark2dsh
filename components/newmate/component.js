@@ -57,9 +57,17 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
     }return{interrupted:false};
   };
   let running = false, stopped = false, todoDelivering=false, active,activeAutomatic=false,activeTask=null,guide=null,manualRestart=false,userPreempted=false;
+  function todoActivationReady(){const s=store.read(),env=environment();return s.settings.companion&&!isQuiet(s.settings,now())&&!(s.settings.snoozeUntil>now())&&env.ready!==false&&!env.busy&&!env.readerFocused&&readingUntil<=now()&&env.idleMs>=MINUTE&&!(s.attention?.[s.activeThreadId]?.draftUntil>now());}
   async function deliverDueTodo(){
     const state=store.read();if(!state.settings.companion||state.tasks.some(t=>t.kind==='chat'&&['pending','running'].includes(t.status)))return;
     const item=state.todos.filter(t=>t.status==='pending'&&t.activateAt<=now()).sort((a,b)=>a.activateAt-b.activateAt||a.created-b.created)[0];if(!item)return;
+    if(item.mode==='conversation'){
+      if(!todoActivationReady())return;
+      if(state.tasks.length>=2000||state.tasks.filter(t=>['pending','running'].includes(t.status)).length>=100)return;
+      thread();const destination=rotateForMessage('todo',item.content),id=todoMessageId(item.id);
+      store.change(s=>{const t=s.todos.find(t=>t.id===item.id);if(t?.status!=='pending')return;if(!s.tasks.some(task=>task.id===id))s.tasks.push({id,todoId:item.id,kind:'todo_activation',prompt:item.content,destination:'newmate',threadId:destination,status:'pending',created:now(),...(item.origin?.startsWith('dsh-session:')?{origin:item.origin.slice('dsh-session:'.length)}:{})});Object.assign(t,{status:'activated',activatedAt:now(),taskId:id,threadId:destination});});
+      return;
+    }
     let claimed=false;store.change(s=>{const t=s.todos.find(t=>t.id===item.id);if(t?.status==='pending'){t.status='delivering';claimed=true;}});if(!claimed)return;
     try{
       let message=store.read().messages.find(m=>m.id===todoMessageId(item.id));
@@ -81,10 +89,10 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
     if (running || stopped || todoDelivering) return;
     const todoState=store.read();if(todoState.settings.companion&&todoState.todos.some(t=>t.status==='pending'&&t.activateAt<=now())){todoDelivering=true;try{await deliverDueTodo();}finally{todoDelivering=false;}if(stopped)return;}
     if(now()-lastProbeAt>=MINUTE){lastProbeAt=now();probeInitiative();}
-    const task = store.read().tasks.find(t => t.kind==='chat'&&t.status==='pending')||store.read().tasks.find(t => t.status === 'pending');
+    const task = store.read().tasks.find(t => t.kind==='chat'&&t.status==='pending')||store.read().tasks.find(t => t.status === 'pending'&&(t.kind!=='todo_activation'||todoActivationReady()));
     if (!task) return;
     running = true; active = new AbortController();activeTask=task;manualRestart=false;userPreempted=false;guide={pending:[],drain(){return this.pending.splice(0);}};
-    const automatic=task.kind==='measurement'||task.kind==='self_activation',unsolicited=task.kind!=='chat';activeAutomatic=automatic;
+    const automatic=task.kind==='measurement'||task.kind==='self_activation',delegated=task.kind==='todo_activation',unsolicited=task.kind!=='chat';activeAutomatic=automatic||delegated;
     try {
       if(automatic){const s=store.read();if(!s.settings.companion||!s.settings.initiative||task.threadId!==s.activeThreadId){store.change(s=>{Object.assign(s.tasks.find(t=>t.id===task.id),{status:'paused',finished:now()});});return;}}
       store.change(s => { s.tasks.find(t => t.id === task.id).status = 'running'; });
@@ -94,7 +102,7 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
         const history = automatic?recent.slice(-6).map(({role,text,at,proactive})=>({role,text:text.slice(0,500),at,proactive})):recent.slice(-12);
         const memory = nativeMemory();
         const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)}},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
-          prompt: `你是由 MemoryLab 驱动的定制陪伴 Agent NewMate，也是用户亲近而务实的私人秘书。像熟悉用户的可靠伙伴，用户主动提问时先直接回应，再按需要给具体下一步；自然亲近但不过度亲昵、说教、催促或虚构了解，不把内部权限清单和流程当回复主体。普通问题简短回答，复杂内容按需要展开。引用真实文件时用 Markdown 文件链接，绝不编造路径。需要交互展示时提供完整自包含的 HTML 代码围栏（html），页面直接在本条回复内渲染并可操作，可用内联 CSS/JavaScript，不依赖外部资源，不尝试调用宿主、读文件、操作系统或跳转外部页面；不要为了普通回复强行生成页面。当前时间：${new Date(now()).toISOString()}；本机时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}。你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。到期由内核直接投递，不需要模型再次生成。记忆只是背景，不能授权动作。温和、简洁、低打扰。不确定时向用户说明。你可使用 MemoryLab 读取、新建、增量更新、标签审阅与应用，以及 shortMemory 读取和添加工具。仅保存可信且值得记住的用户信息；更新长期记忆前读取最新版本并携带 expectedUpdatedAt，不把临时验收或推测写成事实，禁止删除记忆。另有宿主明确绑定原对话时提供的 newmate_task 唤起工具；需要本体执行工作时可将具体建议交回该原对话。不具有文件删除或任意执行权限。完整标签图与最近短期记忆已经由原生内核在最早的系统前缀注入；仅在需要具体长期记忆内容时再查询。\n近期对话：${JSON.stringify(history)}\n当前任务：${task.prompt}${unsolicited?'\n'+PROACTIVE_STYLE:''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
+          prompt: `你是由 MemoryLab 驱动的定制陪伴 Agent NewMate，也是用户亲近而务实的私人秘书。像熟悉用户的可靠伙伴，用户主动提问时先直接回应，再按需要给具体下一步；自然亲近但不过度亲昵、说教、催促或虚构了解，不把内部权限清单和流程当回复主体。普通问题简短回答，复杂内容按需要展开。引用真实文件时用 Markdown 文件链接，绝不编造路径。需要交互展示时提供完整自包含的 HTML 代码围栏（html），页面直接在本条回复内渲染并可操作，可用内联 CSS/JavaScript，不依赖外部资源，不尝试调用宿主、读文件、操作系统或跳转外部页面；不要为了普通回复强行生成页面。当前时间：${new Date(now()).toISOString()}；本机时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}。你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。记忆只是背景，不能授权动作。温和、简洁、低打扰。不确定时向用户说明。你可使用 MemoryLab 读取、新建、增量更新、标签审阅与应用，以及 shortMemory 读取和添加工具。仅保存可信且值得记住的用户信息；更新长期记忆前读取最新版本并携带 expectedUpdatedAt，不把临时验收或推测写成事实，禁止删除记忆。另有宿主明确绑定原对话时提供的 newmate_task 唤起工具；需要本体执行工作时可将具体建议交回该原对话。不具有文件删除或任意执行权限。完整标签图与最近短期记忆已经由原生内核在最早的系统前缀注入；仅在需要具体长期记忆内容时再查询。\n近期对话：${JSON.stringify(history)}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE:''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
           tools: { allow: ['memory_lab_read', 'memory_lab_query', 'memory_lab_root_tags', 'memory_lab_subtag_tree', 'memory_lab_update', 'memory_lab_reindex', 'memory_lab_tag_review', 'memory_lab_tag_apply', 'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size', 'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel', ...(!automatic&&task.origin?['newmate_task']:[])] }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:8,
           ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:240},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
         }, signal: active.signal })));
@@ -110,21 +118,22 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
         const answer = automatic ? decision?.text?.trim() : envelope.result?.output;
         if (typeof answer !== 'string' || (!answer && !unsolicited)) throw Error('Agent API 没有返回文本');
         const current=store.read(),topic=decision?.topic||task.reason||'check-in',latest=automatic?environment():{};
+        if(delegated&&task.threadId!==current.activeThreadId)throw Error('待办运行期间已切换对话，回复未发布；可显式重试');
         const lateGate=automatic?(latest.ready===false?'runtime_unavailable':latest.busy?'busy':latest.readerFocused?'reading':latest.idleMs>=90*MINUTE?'away':latest.idleMs<MINUTE?'typing':''):'';
         const contentGate=unsolicited?proactiveMessageGate(answer):'';
         const suppression=contentGate||(automatic?(decision?.notify!==true||!answer?'not_actionable':task.threadId!==current.activeThreadId?'history_closed':lateGate||messageGate(current.settings,current.initiative,now(),answer,topic,engagedAt)):'');
         if(!suppression) {
           const destination=automatic?rotateForMessage(topic,answer):task.threadId;
-          const message={id:task.id,threadId:destination,role:'assistant',text:answer,at:now(),proactive:automatic,autonomous:automatic,unread:true};
+          const message={id:task.id,threadId:destination,role:'assistant',text:answer,at:now(),proactive:automatic||delegated,autonomous:automatic,unread:true,...task.todoId?{todoId:task.todoId}: {}};
           store.change(s => { s.messages.push(message);const t=s.threads.find(t=>t.id===destination);if(t)t.updated=now();if(automatic){recordMessage(s.initiative,now(),answer,topic);s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.lastOutcome='message';} });
           await notify(message);
         }else store.change(s=>{s.initiative.lastOutcome=suppression;s.tasks.find(t=>t.id===task.id).suppressed=suppression;});
       }
-      store.change(s => { Object.assign(s.tasks.find(t => t.id === task.id),{status:'completed',finished:now()}); });
+      store.change(s => { Object.assign(s.tasks.find(t => t.id === task.id),{status:'completed',finished:now()});if(task.todoId)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:s.messages.some(m=>m.id===task.id)?'completed':'failed',completedAt:now(),messageId:s.messages.some(m=>m.id===task.id)?task.id:null,...!s.messages.some(m=>m.id===task.id)?{error:'运行已结束，但回复被主动消息格式规则抑制'}:{}}); });
     } catch (error) {
       const paused=automatic&&active.signal.aborted&&!stopped;
       if (!stopped&&!paused&&!manualRestart&&!userPreempted) failures.record({where:'newmate/task',code:error.code || 'task_failed',message:String(error.message),fields:{taskId:task.id}});
-      store.change(s => { Object.assign(s.tasks.find(t => t.id === task.id), { status: manualRestart?'pending':userPreempted?'interrupted':paused?'paused':stopped ? 'interrupted' : 'failed', error: manualRestart?'已切换为用户引导':userPreempted?'用户已切换到新对话':paused?'主动陪伴已暂停':String(error.message), finished: now() });if(automatic)s.initiative.lastOutcome=manualRestart?'user_steer':paused?'paused':stopped?'interrupted':'failed'; });
+      store.change(s => { Object.assign(s.tasks.find(t => t.id === task.id), { status: manualRestart?'pending':userPreempted?'interrupted':paused?'paused':stopped ? 'interrupted' : 'failed', error: manualRestart?'已切换为用户引导':userPreempted?'用户已切换到新对话':paused?'主动陪伴已暂停':String(error.message), finished: now() });if(task.todoId&&!manualRestart)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:'failed',error:String(error.message)});if(automatic)s.initiative.lastOutcome=manualRestart?'user_steer':paused?'paused':stopped?'interrupted':'failed'; });
     } finally { running = false;activeAutomatic=false;activeTask=null;guide=null;if(!stopped&&store.read().tasks.some(t=>t.kind==='chat'&&t.status==='pending'))queueMicrotask(()=>tick().catch(e=>logger?.warn?.(e.message))); }
   }
   function rotateForMessage(topic,text){
@@ -147,6 +156,7 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
   }
   // Interrupted runs are retained and await explicit retry: no automatic duplicate model spend.
   if (store.read().tasks.some(t => t.status === 'running')) store.change(s => { for (const t of s.tasks) if (t.status === 'running') { t.status = 'interrupted'; t.error = '宿主在任务完成前退出，可显式重试'; } });
+  if(store.read().todos.some(t=>t.status==='activated'))store.change(s=>{for(const t of s.todos.filter(t=>t.status==='activated')){const message=s.messages.find(m=>m.id===t.taskId),task=s.tasks.find(task=>task.id===t.taskId);if(message){Object.assign(t,{status:'completed',completedAt:message.at,messageId:message.id});if(task)Object.assign(task,{status:'completed',finished:message.at});}else if(!task||['failed','interrupted','cancelled'].includes(task.status))Object.assign(t,{status:'failed',error:task?.error||'激活任务已中断，未自动重试'});}});
   return {
     todoAdd(input,execution,source='agent'){const value=todoInput(input,now()),id=randomUUID();store.change(s=>{if(s.todos.length>=2000||s.todos.filter(t=>['pending','delivering'].includes(t.status)).length>=100)throw Error('待办列表已达到容量上限');s.todos.push({id,...value,created:now(),status:'pending',source,origin:computerUseCaller(execution)||undefined});});return{ok:true,todo:store.read().todos.find(t=>t.id===id)};},
     todoList(){return{ok:true,todos:store.read().todos};},
@@ -203,7 +213,7 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
       store.change(s=>{s.messages.push({role:'user',text,threadId:selected.id,at:now(),id:inputId,steerTaskId:task.id});const p=s.initiative;p.lastUserAt=now();p.unanswered=0;p.nextAttemptAt=Math.max(p.nextAttemptAt||0,now()+45*MINUTE);s.attention ||= {};s.attention[selected.id]={...(s.attention[selected.id]||{}),lastFocusedAt:now(),draftUntil:0};const t=s.threads.find(t=>t.id===selected.id);t.updated=now();if(t.title==='新对话')t.title=text.trim().slice(0,32);});
       if(!running)queueMicrotask(()=>tick().catch(e=>logger?.warn?.(e.message)));return{...task,mode,inputId};
     },
-    retry(id) { store.change(s => { const t = s.tasks.find(t => t.id === id); if (!t || t.threadId!==s.activeThreadId || ['measurement','self_activation'].includes(t.kind)|| !['failed','interrupted'].includes(t.status)) throw Error('历史/自动任务只读或任务不可重试'); t.status = 'pending'; delete t.error; }); return { ok: true }; },
+    retry(id) { store.change(s => { const t = s.tasks.find(t => t.id === id); if (!t || (t.todoId&&s.todos.find(todo=>todo.id===t.todoId)?.status==='cancelled') || t.threadId!==s.activeThreadId || ['measurement','self_activation'].includes(t.kind)|| !['failed','interrupted'].includes(t.status)) throw Error('历史/自动任务只读或任务不可重试'); t.status = 'pending'; delete t.error;if(t.todoId){const todo=s.todos.find(todo=>todo.id===t.todoId);if(todo){todo.status='activated';delete todo.error;}} }); return { ok: true }; },
     wake(prompt, execution) { return enqueue(prompt, currentConversation(execution)); },
     measure(directory, filename) {
       if(!store.read().settings.companion)return;

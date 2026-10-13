@@ -40,6 +40,7 @@ jobs:
           node scripts/verify-darwin-pet-border.mjs
           node scripts/verify-darwin-channels.mjs
           node scripts/verify-newmate-todo.mjs
+          node scripts/verify-newmate-todo-activation.mjs
           node scripts/verify-short-memory-mcp.mjs
       - name: Compile native CU and pet with macOS SDK
         run: |
@@ -76,7 +77,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/newmark-packed"
           npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/newmark-packed" --json > "$RUNNER_TEMP/newmark-packed/pack.json"
-          tar -xf "$RUNNER_TEMP/newmark-packed/newmark2dsh-0.3.13.tgz" -C "$RUNNER_TEMP/newmark-packed"
+          tar -xf "$RUNNER_TEMP/newmark-packed/newmark2dsh-0.3.14.tgz" -C "$RUNNER_TEMP/newmark-packed"
           node --input-type=module -e 'import fs from "node:fs";fs.writeFileSync(process.env.RUNNER_TEMP+"/newmark-packed/test.mjs",fs.readFileSync("scripts/verify-newmate-todo.mjs","utf8").replaceAll("../components/","./package/components/"));'
           node "$RUNNER_TEMP/newmark-packed/test.mjs"
       - name: Preserve owned window render evidence

@@ -6,6 +6,7 @@ export function todoInput(input,now){
   const [,year,month,day,hour,minute,second='0']=parts.map((v,i)=>i===0?v:Number(v));
   if(month<1||month>12||day<1||day>new Date(Date.UTC(year,month,0)).getUTCDate()||hour>23||minute>59||second>59)throw Error('激活时间的日期或时分秒无效');
   const activateAt=Date.parse(input.activateAt);if(!Number.isFinite(activateAt)||activateAt<=now)throw Error('激活时间须晚于现在');
-  return{content:input.content.trim(),activateAt};
+  const mode=input.mode??'conversation';if(!['reminder','conversation'].includes(mode))throw Error('待办方式无效');
+  return{content:input.content.trim(),activateAt,mode};
 }
 export const todoMessageId=id=>`todo:${id}`;

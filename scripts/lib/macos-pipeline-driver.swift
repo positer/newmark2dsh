@@ -12,7 +12,14 @@ import CoreGraphics
         let allowed=Set((ProcessInfo.processInfo.environment["NEWMARK_OWNED_PIDS"] ?? "").split(separator:",").compactMap{Int($0)})
         var result:[String:Any]=[:]
         if action=="cursor"{let p=CGEvent(source:nil)!.location;result=["x":p.x,"y":p.y]}
-        else if action=="image" {
+        else if action=="image_compare" {
+            func pixels(_ file:String)->(Int,Int,[UInt8]){let source=CGImageSourceCreateWithURL(URL(fileURLWithPath:file) as CFURL,nil)!,image=CGImageSourceCreateImageAtIndex(source,0,nil)!;precondition(image.width<=8192 && image.height<=8192);var data=[UInt8](repeating:0,count:image.width*image.height*4);let ctx=CGContext(data:&data,width:image.width,height:image.height,bitsPerComponent:8,bytesPerRow:image.width*4,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue)!;ctx.draw(image,in:CGRect(x:0,y:0,width:image.width,height:image.height));return(image.width,image.height,data)}
+            let (w,h,a)=pixels(input["first"] as! String),(w2,h2,b)=pixels(input["second"] as! String);guard w==w2 && h==h2 else{throw NSError(domain:"image_size_changed",code:9)};var changed=0,transparentCorners=true;let corners=[0,w-1,(h-1)*w,w*h-1];for p in corners{if a[p*4+3]>0 || b[p*4+3]>0{transparentCorners=false}}
+            for i in stride(from:0,to:a.count,by:4){if abs(Int(a[i])-Int(b[i]))+abs(Int(a[i+1])-Int(b[i+1]))+abs(Int(a[i+2])-Int(b[i+2]))+abs(Int(a[i+3])-Int(b[i+3]))>12{changed+=1}}
+            var addedAlpha=0,detachedAlpha=0
+            if input["contourOfSecond"] as? Bool==true{let radius=max(2,Int(ceil(Double(w)/88*3)));for y in 0..<h{for x in 0..<w{let i=(y*w+x)*4;if a[i+3]>=32 && b[i+3]<16{addedAlpha+=1;var adjacent=false;for dy in -radius...radius{for dx in -radius...radius{let px=x+dx,py=y+dy;if px>=0 && py>=0 && px<w && py<h && b[(py*w+px)*4+3]>=32{adjacent=true;break}};if adjacent{break}};if !adjacent{detachedAlpha+=1}}}}}
+            result=["width":w,"height":h,"changed_pixels":changed,"transparent_corners":transparentCorners,"added_alpha_pixels":addedAlpha,"detached_alpha_pixels":detachedAlpha]
+        }else if action=="image" {
             let url=URL(fileURLWithPath:input["path"] as! String),source=CGImageSourceCreateWithURL(url as CFURL,nil)!,image=CGImageSourceCreateImageAtIndex(source,0,nil)!
             var pixels=[UInt8](repeating:0,count:32*32*4)
             let ctx=CGContext(data:&pixels,width:32,height:32,bitsPerComponent:8,bytesPerRow:128,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue)!

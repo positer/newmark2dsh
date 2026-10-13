@@ -5,7 +5,7 @@ export const MCP_ROUTE='/newmark-newmate/mcp';
 export function newMateCalls(mate) {
   const output={schema:{type:'object'},render:(_,v)=>[{type:'text',text:JSON.stringify(v)}]};
   return [
-    {name:'newmate_todo_add',description:'Create a persistent one-shot NewMate reminder with an explicit activation time and the exact message to send. Any conversation or NewMate may create it. Use an ISO timestamp with time zone; ask for a missing time. At due time current attention is protected and the normal NewMate thread-handoff/bubble rules apply; companion off postpones delivery.',parameters:{type:'object',properties:{activateAt:{type:'string',description:'Future ISO timestamp with explicit Z or UTC offset.'},content:{type:'string',minLength:1,maxLength:16000}},required:['activateAt','content'],additionalProperties:false},execute:(a,e)=>mate.todoAdd(a,e)},
+    {name:'newmate_todo_add',description:'Create a persistent one-shot NewMate reminder with an explicit activation time and content. By default activate one NewMate conversation turn after attention/quiet/input guards clear. Use mode=reminder for exact saved text without a model call. Any conversation or NewMate may create it. Use an ISO timestamp with time zone; ask for a missing time. At due time current attention is protected and the normal NewMate thread-handoff/bubble rules apply; companion off postpones delivery.',parameters:{type:'object',properties:{mode:{type:'string',enum:['conversation','reminder'],description:'conversation (default) activates one NewMate turn at a suitable time; reminder sends exact saved text without a model call.'},activateAt:{type:'string',description:'Future ISO timestamp with explicit Z or UTC offset.'},content:{type:'string',minLength:1,maxLength:16000}},required:['activateAt','content'],additionalProperties:false},execute:(a,e)=>mate.todoAdd(a,e)},
     {name:'newmate_todo_list',description:'Read NewMate reminders with activation time, exact content and pending/delivered/cancelled state.',parameters:{type:'object',properties:{},additionalProperties:false},execute:()=>mate.todoList()},
     {name:'newmate_todo_cancel',description:'Cancel an undelivered NewMate reminder; retains its audit entry and does not delete files or messages.',parameters:{type:'object',properties:{id:{type:'string'}},required:['id'],additionalProperties:false},execute:a=>mate.todoCancel(a.id)},
     {name:'newmate_chat',description:'Ask the persistent NewMate companion. Returns a task ID; poll newmate_task_status for the response. Native tag graph and recent short memories are already injected.',parameters:{type:'object',properties:{prompt:{type:'string',minLength:1,maxLength:16000}},required:['prompt'],additionalProperties:false},execute:(a,execution)=>mate.chat(a.prompt,execution)},
@@ -14,7 +14,7 @@ export function newMateCalls(mate) {
     {name:'newmate_memory_context',description:'Read the native MemoryLab tag graph and latest ten short memories used by NewMate.',parameters:{type:'object',properties:{},additionalProperties:false},execute:()=>({ok:true,...mate.memoryContext()})},
   ].map(tool=>({...tool,output}));
 }
-export function createNewMateMcp({root,mate,version='0.3.13'}) {
+export function createNewMateMcp({root,mate,version='0.3.14'}) {
   const tokenFile=path.join(root,'newMate','mcp-token');
   const definitions=newMateCalls(mate);
   const token=()=>{try{return fs.readFileSync(tokenFile,'utf8').trim();}catch(e){if(e.code==='ENOENT')return '';throw e;}};
