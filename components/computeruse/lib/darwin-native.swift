@@ -38,7 +38,7 @@ final class CuBorder: NSView {
                 if type == .keyDown{NativeCU.userKeys.insert(key)};if type == .keyUp{NativeCU.userKeys.remove(key)}
                 if [.leftMouseDown,.rightMouseDown,.otherMouseDown].contains(type){NativeCU.userButtons.insert(button)}
                 if [.leftMouseUp,.rightMouseUp,.otherMouseUp].contains(type){NativeCU.userButtons.remove(button)}
-                if type == .flagsChanged {let flags:CGEventFlags=key==55 || key==54 ? .maskCommand:key==56 || key==60 ? .maskShift:key==58 || key==61 ? .maskAlternate:key==59 || key==62 ? .maskControl:[];if !flags.isEmpty && event.flags.contains(flags){NativeCU.userKeys.insert(key)}else{NativeCU.userKeys.remove(key)}}
+                if type == .flagsChanged {NativeCU.userKeys.subtract([54,55,56,60,58,61,59,62,63]);if event.flags.contains(.maskCommand){NativeCU.userKeys.insert(55)};if event.flags.contains(.maskShift){NativeCU.userKeys.insert(56)};if event.flags.contains(.maskAlternate){NativeCU.userKeys.insert(58)};if event.flags.contains(.maskControl){NativeCU.userKeys.insert(59)};if event.flags.contains(.maskSecondaryFn){NativeCU.userKeys.insert(63)}}
             };return Unmanaged.passUnretained(event)
         },userInfo:nil) else{try fail("user_input_state_unavailable","Cannot create listen-only user event monitor; no input was sent")}
         userTap=tap;userTapSource=CFMachPortCreateRunLoopSource(kCFAllocatorDefault,tap,0);CFRunLoopAddSource(CFRunLoopGetMain(),userTapSource,.commonModes);CGEvent.tapEnable(tap:tap,enable:true)
@@ -59,7 +59,7 @@ final class CuBorder: NSView {
         }
     }
     static func inputCheckpoint(_ revision:[UInt32])throws{
-        guard CGPreflightListenEventAccess(),physicalRevision()==revision,physicalIdle()>=0.1,!physicalHeld() else{try fail("user_input_preempted","User activity resumed; stop agent delivery and re-observe before retrying")}
+        guard CGPreflightListenEventAccess(),userTap.map({CGEvent.tapIsEnabled(tap:$0)})==true,physicalRevision()==revision,physicalIdle()>=0.1,!physicalHeld() else{try fail("user_input_preempted","User activity resumed; stop agent delivery and re-observe before retrying")}
     }
     static func deliveryCheckpoint()throws{guard let revision=operationRevision else{try fail("input_guard_required","No protected input operation is active")};try inputCheckpoint(revision)}
     struct UserContext {let app:NSRunningApplication;let window:AXUIElement;let mouse:CGPoint;let revision:[UInt32]}
@@ -187,7 +187,7 @@ final class CuBorder: NSView {
     }
     static func bounds(_ row:[String:Any])->CGRect { CGRect(dictionaryRepresentation:row[kCGWindowBounds as String] as! CFDictionary) ?? .zero }
     static func permissions()->[String:Bool] { ["accessibility":AXIsProcessTrusted(),"screenRecording":CGPreflightScreenCaptureAccess(),"inputMonitoring":CGPreflightListenEventAccess()] }
-    static func release() { borderTimer?.invalidate();borderTimer=nil;if let observer=screenObserver{NotificationCenter.default.removeObserver(observer)};screenObserver=nil;for panel in borders{panel.orderOut(nil)};borders.removeAll();axTargets.removeAll();spaceHandle="";if lockFD >= 0 {flock(lockFD,LOCK_UN);close(lockFD)};lockFD = -1;owner="" }
+    static func release() { if let tap=userTap{CGEvent.tapEnable(tap:tap,enable:false);CFMachPortInvalidate(tap)};if let source=userTapSource{CFRunLoopRemoveSource(CFRunLoopGetMain(),source,.commonModes)};userTap=nil;userTapSource=nil;userKeys.removeAll();userButtons.removeAll();borderTimer?.invalidate();borderTimer=nil;if let observer=screenObserver{NotificationCenter.default.removeObserver(observer)};screenObserver=nil;for panel in borders{panel.orderOut(nil)};borders.removeAll();axTargets.removeAll();spaceHandle="";if lockFD >= 0 {flock(lockFD,LOCK_UN);close(lockFD)};lockFD = -1;owner="" }
     static func lease(_ request:[String:Any])throws {
         guard lockFD >= 0,!owner.isEmpty,request["ownerId"] as? String==owner else {try fail("takeover_required","Acquire this caller's native takeover lease first")}
         guard AXIsProcessTrusted() else {try fail("accessibility_permission_required","Grant Accessibility to the requesting helper/owning desktop identified in macOS settings; no permission is requested automatically")}
