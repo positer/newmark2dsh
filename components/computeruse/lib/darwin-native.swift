@@ -135,6 +135,16 @@ final class CuBorder: NSView {
         visit(window,0);return["available":true,"window_handle":handle,"elements":elements,"truncated":truncated,"target_lifetime_seconds":30,"values_omitted":true]
     }
     static func observeAccessible(_ row:[String:Any]?,_ request:[String:Any])async throws->[String:Any] {
+        if let row=row,request["activateForObservation"] as? Bool==true,request["previewOnly"] as? Bool != true,row[kCGWindowIsOnscreen as String] as? Bool != true {
+            try lease(request);guard !spaceHandle.isEmpty,request["windowHandle"] as? String==spaceHandle else{try fail("space_takeover_required","Observation activation requires the bound Space lease")}
+            let revision=try await waitForUserIdle(),saved=try userContext(revision),pid=pid_t(row[kCGWindowOwnerPID as String] as? Int ?? 0);var answer:[String:Any]
+            do{try inputCheckpoint(revision);let window=try axWindow(row);guard let app=NSRunningApplication(processIdentifier:pid),app.activate(options:[]) else{try fail("activation_failed","Cannot activate selected Space for pixels")};try inputCheckpoint(revision);guard AXUIElementPerformAction(window,kAXRaiseAction as CFString) == .success else{try fail("activation_failed","Cannot raise selected observation window")};for _ in 0..<50 {try inputCheckpoint(revision);if windows().contains(where:{($0[kCGWindowNumber as String] as? UInt32)==row[kCGWindowNumber as String] as? UInt32}){break};try await Task.sleep(nanoseconds:20_000_000)};answer=try await observeAccessibleBody(try target(request),request)}catch let failure as CuFailure{answer=["ok":false,"error_code":failure.code,"error":failure.message]}catch{answer=["ok":false,"error_code":"space_observation_failed","error":String(describing:error)]}
+            let restored=await restoreUserContext(saved,pid);answer["context_restore"]=restored;answer["space_activated_for_observation"]=true
+            if restored["user_preempted"] as? Bool != true,(restored["focus_restored"] as? Bool != true || restored["cursor_restored"] as? Bool != true){answer["ok"]=false;answer["error_code"]="context_restore_failed"};return answer
+        }
+        return try await observeAccessibleBody(row,request)
+    }
+    static func observeAccessibleBody(_ row:[String:Any]?,_ request:[String:Any])async throws->[String:Any] {
         let channel=request["observationChannel"] as? String ?? "both"
         guard ["both","visual","accessibility"].contains(channel) else{try fail("invalid_observation_channel","Choose both, visual or accessibility")}
         if request["previewOnly"] as? Bool==true || channel=="visual"{var answer=try await capture(row,sparseOnly:request["sparseOnly"] as? Bool ?? false);answer["capture_available"]=true;answer["channels"]=["visual":["available":true,"included":true],"accessibility":["available":AXIsProcessTrusted(),"included":false]];answer["cross_validation_required"]=false;return answer}
