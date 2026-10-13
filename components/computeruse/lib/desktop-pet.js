@@ -148,7 +148,8 @@ export function releaseDesktopPet(reason = 'lease_released', usage = 'cu') {
   return { ok: true, stopping: !!previous, reason };
 }
 
-export async function startDesktopPet({ ownerPid = process.pid, desktop = 'Default', userRoot, usage = 'cu', dshExe = '' } = {}) {
+export async function startDesktopPet({ ownerPid = process.pid, desktop, userRoot, usage = 'cu', dshExe = '' } = {}) {
+  desktop ??= usage==='companion'&&users.has('cu') ? record?.desktop||starting?.desktop||'Default':'Default';
   if (!['win32','darwin'].includes(process.platform)) return { ok: false, error: 'unsupported_platform' };
   if(dshExe)shellExe=dshExe;
   users.set(usage,true);syncMode();
