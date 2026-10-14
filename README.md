@@ -198,7 +198,6 @@ newmark2dsh/
 ├── docs/                      公开技术说明
 ├── scripts/                   发布检查与专项验证
 ├── .github/workflows/         CI 与发布流程
-├── CHANGELOG-*.md             按版本保存的公开更新记录
 └── README.md / OVERVIEW.md / taste.md
 ```
 
@@ -214,9 +213,9 @@ node scripts/check-release-bundle.mjs .
 
 ## 当前版本与更新
 
-**当前版本：0.3.14；本文于 2026-10-14 核对。** 本版本带来 NewMate 待办的记忆驱动对话激活、Mac 包边与桌宠比例调整，以及 Windows 陪伴继承现有 CU 桌面。详细版本变化与验收说明见 [0.3.14 更新记录](https://github.com/positer/newmark2dsh/blob/main/CHANGELOG-0.3.14.md) 与 [GitHub Release](https://github.com/positer/newmark2dsh/releases/tag/v0.3.14)。
+**当前版本：0.3.14；本文于 2026-10-14 核对。** 本版本带来 NewMate 待办的记忆驱动对话激活、Mac 包边与桌宠比例调整，以及 Windows 陪伴继承现有 CU 桌面。详细版本变化与验收说明见 [0.3.14 Release](https://github.com/positer/newmark2dsh/releases/tag/v0.3.14)，其他版本可在 [GitHub Releases](https://github.com/positer/newmark2dsh/releases) 中查看。
 
-README 按当前功能维护；各次发布细节保存在版本记录中。文档更新不代表重新发布 npm 包或改变已经安装的版本。
+README 按当前功能维护；公开版本历史集中保存在 GitHub Releases，历史 CHANGELOG 留在本地归档中。文档更新不代表重新发布 npm 包或改变已经安装的版本。
 
 ## 许可与反馈
 
