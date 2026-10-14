@@ -34,3 +34,8 @@ components/newmate/lib/todo-list.js validates future zoned timestamps and durabl
 README.md 按定位、场景、五组件详解、Dev/rDev、快速开始、平台、数据协作、结构、版本、许可重构。taste.md 新增持续适用的 README 格式契约。旧首页中的组件数量、外置依赖安装和历史候选叙述不再作为当前使用说明；原文完整保存在本地 before 快照中。本次仅修改文档与 GitHub About，不改变 0.3.14 运行版本。
 
 README.md 负责当前用户介绍，taste.md 负责格式和验证约束，OVERVIEW.md 继续记录文件职责与状态；CHANGELOG-*.md 保存版本历史。开发操作档案不进入公开 Git 或 npm。
+
+
+## 2026-10-14 README 润色与远端读校验
+
+README 保留五组件首页结构，简化术语、完善工具全名，增加阅读导航；taste 补充导航、术语与推送后读校验要求。仅修改文档，运行版本保持 0.3.14。
