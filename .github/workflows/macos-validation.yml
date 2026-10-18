@@ -81,7 +81,12 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/newmark-packed"
           npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/newmark-packed" --json > "$RUNNER_TEMP/newmark-packed/pack.json"
-          tar -xf "$RUNNER_TEMP/newmark-packed/newmark2dsh-0.3.14.tgz" -C "$RUNNER_TEMP/newmark-packed"
+          # Derived, not hard-coded: this step named newmark2dsh-0.3.14.tgz and would have
+          # failed the whole macOS matrix the moment the version moved, for a reason that has
+          # nothing to do with macOS. The tarball npm just wrote is the one to unpack.
+          tgz="$(ls "$RUNNER_TEMP/newmark-packed"/newmark2dsh-*.tgz | head -1)"
+          echo "unpacking $tgz"
+          tar -xf "$tgz" -C "$RUNNER_TEMP/newmark-packed"
           node --input-type=module -e 'import fs from "node:fs";fs.writeFileSync(process.env.RUNNER_TEMP+"/newmark-packed/test.mjs",fs.readFileSync("scripts/verify-newmate-todo.mjs","utf8").replaceAll("../components/","./package/components/"));'
           node "$RUNNER_TEMP/newmark-packed/test.mjs"
       - name: Preserve owned window render evidence

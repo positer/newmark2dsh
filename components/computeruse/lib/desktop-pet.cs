@@ -650,6 +650,10 @@ internal sealed class DesktopPet : Form {
     protected override void WndProc(ref Message m) {
         if (m.Msg==0x02E0 && body!=null) { BuildBody((int)(m.WParam.ToInt64()&0xffff)); KeepVisible(); }
         base.WndProc(ref m);
+        // A DPI change rebuilds the body and resizes the window, and a layered window keeps
+        // no valid surface across that resize. Re-present once the base handler has applied
+        // the new bounds, so an idle companion pet cannot be left showing a stale surface.
+        if (m.Msg==0x02E0) Render();
     }
     private void KeepVisible() {
         Rectangle r=Screen.FromRectangle(Bounds).WorkingArea;
@@ -779,6 +783,11 @@ internal sealed class DesktopPet : Form {
             if(bubble!=null&&bubble.Visible)PetNative.Raise(bubble.Handle);
             if(dshMenu!=null && dshMenu.Open)PetNative.Raise(dshMenu.Handle);
             if (!pressed) KeepVisible();
+            // Nothing presents a layered window while the pet is at rest, so a single bad
+            // surface would stay on screen for as long as the pet stays idle
+            // (measured: an opaque white rect persisting for minutes). Re-present from the
+            // untouched source pixels on the same one-second cadence.
+            Render();
         }
     }
     private void Render() {
@@ -791,11 +800,20 @@ internal sealed class DesktopPet : Form {
         var bits=painted.LockBits(new Rectangle(Point.Empty,painted.Size),ImageLockMode.WriteOnly,PixelFormat.Format32bppArgb);
         try{Marshal.Copy(paintPixels,0,bits.Scan0,paintPixels.Length);}finally{painted.UnlockBits(bits);}
         double sx=Math.Max(.01,stretchX.Value),sy=Math.Max(.01,stretchY.Value);float w=(float)(body.Width*sx),h=(float)(body.Height*sy);
-        var g=surface.Graphics;g.Clear(Color.Transparent);g.DrawImage(painted,new RectangleF((Width-w)/2,(float)(Height-padding)-h,w,h));g.Flush(FlushIntention.Sync);
+        Compose(w,h);
         var location=new PetNative.Point(Left,Top);var origin=new PetNative.Point(0,0);
         double alpha=exitStarted<0?Math.Min(1,(clock.ElapsedMilliseconds-appearedAt)/180.0):Math.Max(0,1-(clock.ElapsedMilliseconds-exitStarted-90)/470.0);
         var size=new PetNative.Size(Width,Height);var blend=new PetNative.Blend{Alpha=(byte)Math.Round(Math.Max(0,Math.Min(1,alpha))*255),Format=1};
-        if(!PetNative.UpdateLayeredWindow(Handle,IntPtr.Zero,ref location,ref size,surface.DC,ref origin,0,ref blend,2))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        // A layered window that refuses its surface is not repaired by resending the same
+        // device context. Rebuild the surface once and present again, then report.
+        if(!PetNative.UpdateLayeredWindow(Handle,IntPtr.Zero,ref location,ref size,surface.DC,ref origin,0,ref blend,2)){
+            int error=Marshal.GetLastWin32Error();
+            surface.Dispose();surface=new PetSurface(Width,Height);Compose(w,h);
+            if(!PetNative.UpdateLayeredWindow(Handle,IntPtr.Zero,ref location,ref size,surface.DC,ref origin,0,ref blend,2))throw new System.ComponentModel.Win32Exception(error);
+        }
+    }
+    private void Compose(float w,float h) {
+        var g=surface.Graphics;g.Clear(Color.Transparent);g.DrawImage(painted,new RectangleF((Width-w)/2,(float)(Height-padding)-h,w,h));g.Flush(FlushIntention.Sync);
     }
     private void WriteStatus() {
         try { PetFiles.WriteJson(Path.Combine(config.directory,"status.json"),new {

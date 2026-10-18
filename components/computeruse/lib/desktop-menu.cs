@@ -99,8 +99,17 @@ internal sealed class DshPetMenu : Form {
         };
     }
     internal async void Warm() {
+        // Warming creates this window handle and lets WebView2 bring its environment up. That
+        // start-up can leave a HIDDEN menu host holding the desktop foreground, which silently
+        // moves the user's typing target: measured, the takeover's new pet put this window
+        // (title "NewMate · DSH 菜单", IsWindowVisible=false) in the foreground and
+        // scripts/verify-desktop-pet.mjs failed "virtual startup does not activate a desktop
+        // window" on every run. Restoring what the user was actually using costs nothing when
+        // the menu is not being presented, and the presented path is untouched.
+        IntPtr restore=PetNative.GetForegroundWindow();
         try { var handle=Handle; if(initialize==null)initialize=Initialize();await initialize;if(!closed)Reload(false); }
         catch(Exception ex){Error=ex.Message;loading=false;changed();}
+        finally { try { if(!closed&&!Visible&&PetNative.GetForegroundWindow()==Handle)PetNative.SetForegroundWindow(restore); } catch(ObjectDisposedException) { } }
     }
     internal async void Present(Point point,double selected,Rectangle bounds) {
         anchor=point;petBounds=bounds;scale=selected;loading=true;Opacity=0;Location=point;

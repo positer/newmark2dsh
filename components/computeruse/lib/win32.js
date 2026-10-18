@@ -65,6 +65,46 @@ export const SPARSE_DIGEST_HEIGHT = 18;
 export const SPARSE_CELL_THRESHOLD = 24;
 export const SPARSE_STRONG_THRESHOLD = 64;
 
+/**
+ * The `sweep` gesture: relative mouse motion described as direction, speed and duration.
+ *
+ * The shape is the caller's own - which way, how fast, for how long - because that is the
+ * question a held-motion gesture actually has, and an absolute start/end pair cannot express
+ * it: a turn that is longer than the screen, or repeated in the same direction, has no end
+ * point. Delivery is **relative injection** (mouse_event with MOUSEEVENTF_MOVE), the one path
+ * a raw-motion consumer sees; this module's absolute cursor path is SetCursorPos, which moves
+ * the pointer and produces no raw packets at all, which is exactly why an absolute drag can
+ * never steer a view.
+ */
+export const SWEEP_SPEED_MIN = 1;
+export const SWEEP_SPEED_MAX = 8000;
+export const SWEEP_DURATION_MIN_MS = 1;
+export const SWEEP_DURATION_MAX_MS = 15000;
+/** Cap on injected move records: one per ~16 ms is already a 60 Hz cadence. */
+export const SWEEP_STEPS_MAX = 240;
+/** The cadence a sweep's steps are spread over when the caller does not choose a count. */
+export const SWEEP_STEP_INTERVAL_MS = 16;
+/** Buttons a sweep may hold for the whole gesture; 'none' is motion without a button. */
+export const SWEEP_BUTTONS = Object.freeze(['none', 'left', 'right']);
+
+/**
+ * Direction names in SCREEN degrees: clockwise from the +x axis, with y growing downward.
+ *
+ * 0 is right and 90 is down, so "up" is 270 and resolves to a negative dy - which is where up
+ * is on a screen. A compass reading is offered as an alias for each name because that is how
+ * people describe a direction out loud.
+ */
+export const SWEEP_DIRECTIONS = Object.freeze({
+  right: 0, east: 0,
+  'down-right': 45, southeast: 45,
+  down: 90, south: 90,
+  'down-left': 135, southwest: 135,
+  left: 180, west: 180,
+  'up-left': 225, northwest: 225,
+  up: 270, north: 270,
+  'up-right': 315, northeast: 315,
+});
+
 export const LANES = Object.freeze([
   'action',
   'uia',
@@ -95,7 +135,7 @@ export const MODE_INVENTORY = Object.freeze({
 });
 
 export const DESKTOP_ACTIONS = Object.freeze([
-  'observe', 'move', 'click', 'drag', 'scroll', 'type', 'key', 'wait', 'takeover_start', 'takeover_stop',
+  'observe', 'move', 'click', 'drag', 'sweep', 'scroll', 'type', 'key', 'wait', 'takeover_start', 'takeover_stop',
 ]);
 
 export const APP_ACTIONS = Object.freeze([
@@ -135,6 +175,7 @@ export const ACTION_LANES = Object.freeze({
   move: Object.freeze(['action']),
   click: Object.freeze(['action']),
   drag: Object.freeze(['action']),
+  sweep: Object.freeze(['action']),
   scroll: Object.freeze(['action']),
   type: Object.freeze(['action']),
   key: Object.freeze(['action']),
@@ -223,6 +264,96 @@ function clampNumber(value, minimum, maximum, fallback) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
   return Math.min(maximum, Math.max(minimum, Math.floor(numeric)));
+}
+
+/** The eight names a resolved direction reports, indexed by octant. */
+const SWEEP_OCTANTS = Object.freeze(['right', 'down-right', 'down', 'down-left', 'left', 'up-left', 'up', 'up-right']);
+
+/** A direction name, a compass alias, or screen degrees, resolved to degrees and a reported name. */
+export function resolveSweepDirection(value) {
+  const raw = value === null || value === undefined ? '' : value;
+  const text = typeof raw === 'string' ? raw.trim().toLowerCase() : null;
+  if (text !== null) {
+    if (!text) {
+      return { ok: false, error_code: 'sweep_direction_required', error: `direction is required: a name such as "right" or "up", or screen degrees (0 = right, 90 = down).` };
+    }
+    if (Object.prototype.hasOwnProperty.call(SWEEP_DIRECTIONS, text)) {
+      const degrees = SWEEP_DIRECTIONS[text];
+      return { ok: true, degrees, name: SWEEP_OCTANTS[Math.round(degrees / 45) % 8], direction_source: 'name', direction_written: text };
+    }
+    if (!/^-?\d+(?:\.\d+)?$/.test(text)) {
+      return { ok: false, error_code: 'sweep_direction_unsupported', error: `direction "${String(raw)}" is not one of ${Object.keys(SWEEP_DIRECTIONS).join(', ')}, and it is not a number of screen degrees.` };
+    }
+  }
+  const degrees = Number(text !== null ? text : raw);
+  if (!Number.isFinite(degrees)) {
+    return { ok: false, error_code: 'sweep_direction_required', error: `direction is required: a name such as "right" or "up", or screen degrees (0 = right, 90 = down); received ${String(raw)}.` };
+  }
+  if (degrees < 0 || degrees > 360) {
+    return { ok: false, error_code: 'sweep_direction_unsupported', error: `direction ${degrees} is outside 0..360 screen degrees (0 = right, 90 = down).` };
+  }
+  const normalised = degrees % 360;
+  return { ok: true, degrees: normalised, name: SWEEP_OCTANTS[Math.round(normalised / 45) % 8], direction_source: 'degrees' };
+}
+
+/** The button a sweep holds for its whole length, or none. */
+export function resolveSweepButton(value) {
+  const text = value === null || value === undefined ? 'none' : String(value).trim().toLowerCase();
+  if (!text) return { ok: true, button: 'none' };
+  if (SWEEP_BUTTONS.includes(text)) return { ok: true, button: text };
+  return { ok: false, error_code: 'sweep_button_unsupported', error: `button "${String(value)}" is not one of ${SWEEP_BUTTONS.join(', ')}.` };
+}
+
+/**
+ * What a sweep will inject, before anything is delivered.
+ *
+ * Pure on purpose: the arithmetic is the part a gate can check without a desktop, and the
+ * displacement must be exactly `round(cos(theta) * speed * duration / 1000)` - never a
+ * per-step rounding that loses the remainder.
+ */
+export function planSweep(options = {}) {
+  const direction = resolveSweepDirection(options.direction);
+  if (direction.ok !== true) return direction;
+  const button = resolveSweepButton(options.button);
+  if (button.ok !== true) return button;
+  const speed = Number(options.speed);
+  if (!Number.isFinite(speed) || speed < SWEEP_SPEED_MIN || speed > SWEEP_SPEED_MAX) {
+    return { ok: false, error_code: 'sweep_speed_out_of_range', error: `speed is pixels per second along the direction and must be between ${SWEEP_SPEED_MIN} and ${SWEEP_SPEED_MAX}; received ${String(options.speed)}.` };
+  }
+  const durationMs = Number(options.durationMs !== undefined && options.durationMs !== null ? options.durationMs : options.duration_ms);
+  if (!Number.isFinite(durationMs) || durationMs < SWEEP_DURATION_MIN_MS || durationMs > SWEEP_DURATION_MAX_MS) {
+    return { ok: false, error_code: 'sweep_duration_out_of_range', error: `duration_ms must be between ${SWEEP_DURATION_MIN_MS} and ${SWEEP_DURATION_MAX_MS}; received ${String(options.duration_ms !== undefined ? options.duration_ms : options.durationMs)}.` };
+  }
+  // Named `inject_steps` rather than `steps` because `steps` is already the sequence
+  // argument, and one parameter name must not mean two things on one tool.
+  const requestedSteps = options.injectSteps !== undefined && options.injectSteps !== null ? options.injectSteps : options.inject_steps;
+  const steps = requestedSteps === undefined || requestedSteps === null || requestedSteps === ''
+    ? clampNumber(Math.round(durationMs / SWEEP_STEP_INTERVAL_MS), 1, SWEEP_STEPS_MAX)
+    : Number(requestedSteps);
+  if (!Number.isInteger(steps) || steps < 1 || steps > SWEEP_STEPS_MAX) {
+    return { ok: false, error_code: 'sweep_steps_out_of_range', error: `inject_steps must be a whole number between 1 and ${SWEEP_STEPS_MAX}; received ${String(requestedSteps)}.` };
+  }
+  const radians = (direction.degrees * Math.PI) / 180;
+  const dx = Math.round(Math.cos(radians) * speed * (durationMs / 1000));
+  const dy = Math.round(Math.sin(radians) * speed * (durationMs / 1000));
+  if (dx === 0 && dy === 0) {
+    return { ok: false, error_code: 'sweep_below_one_pixel', error: `direction ${direction.degrees} deg at ${speed} px/s for ${durationMs} ms is less than one pixel of travel, so nothing would be injected.` };
+  }
+  const restoreRequested = options.restoreCursor !== false && options.restore_cursor !== false;
+  return {
+    ok: true,
+    degrees: direction.degrees,
+    name: direction.name,
+    direction_source: direction.direction_source,
+    ...(direction.direction_written ? { direction_written: direction.direction_written } : {}),
+    speed,
+    durationMs,
+    steps,
+    dx,
+    dy,
+    button: button.button,
+    restoreCursor: restoreRequested,
+  };
 }
 
 function parseJsonArray(text) {
@@ -2935,6 +3066,81 @@ function realDragScript(startX, startY, endX, endY, button, expect) {
   ].join('\r\n');
 }
 
+/**
+ * The relative sweep, as one lane script.
+ *
+ * Every step is one mouse_event call carrying MOUSEEVENTF_MOVE and that step's dx/dy - a
+ * RELATIVE injection the raw-motion stack reports. It cannot go through MoveCursorSmooth: that path writes the
+ * cursor with SetCursorPos, which moves the pointer and tells no raw-motion consumer anything,
+ * and it stops at the edge of the screen besides. So this loop moves by DELTA, spreads the
+ * steps over the requested duration against a stopwatch, and lets the pointer land wherever
+ * the arithmetic puts it.
+ *
+ * The one SetCursorPos here is the restore, and choosing it is the point: putting the pointer
+ * back with the operation that produces no raw motion means a repeatable gesture (turn, turn,
+ * turn) does not accumulate a phantom turn out of its own cleanup.
+ *
+ * The button is released in this script's finally, and the lane-level release guard covers a
+ * killed or timed-out lane, so a cancelled sweep cannot leave a button held down.
+ */
+function realSweepScript(plan, expect = {}) {
+  const isRight = plan.button === 'right';
+  const down = isRight ? '0x0008' : '0x0002';
+  const up = isRight ? '0x0010' : '0x0004';
+  const holdButton = plan.button !== 'none';
+  const lines = [
+    '$ErrorActionPreference = "Stop"',
+    ...foregroundGuardLines(expect),
+    '$cursorBefore = [NewmarkCuNative]::CursorPosition()',
+    'if ($cursorBefore.Length -lt 2) { ' + psError('cursor_read_failed', 'The physical cursor position could not be read, so the sweep was refused instead of leaving the pointer somewhere unknown.') + ' }',
+    '$buttonDown = $false',
+    '$buttonHeldMs = 0',
+    '$stepsInjected = 0',
+    '$sentX = 0',
+    '$sentY = 0',
+    '$clock = [System.Diagnostics.Stopwatch]::StartNew()',
+    'try {',
+  ];
+  if (holdButton) {
+    lines.push(`  [NewmarkCuNative]::mouse_event(${down},0,0,0,[System.UIntPtr]::Zero)`);
+    lines.push('  $buttonDown = $true');
+  }
+  lines.push(
+    `  for ($step = 1; $step -le ${plan.steps}; $step++) {`,
+    `    $wantX = [int][Math]::Round(${plan.dx} * $step / ${plan.steps})`,
+    `    $wantY = [int][Math]::Round(${plan.dy} * $step / ${plan.steps})`,
+    '    $stepX = $wantX - $sentX',
+    '    $stepY = $wantY - $sentY',
+    '    if (($stepX -ne 0) -or ($stepY -ne 0)) {',
+    '      [NewmarkCuNative]::mouse_event(0x0001, $stepX, $stepY, 0, [System.UIntPtr]::Zero)',
+    '      $sentX = $wantX',
+    '      $sentY = $wantY',
+    '      $stepsInjected = $stepsInjected + 1',
+    '    }',
+    `    $due = [int](${plan.durationMs} * $step / ${plan.steps}) - [int]$clock.ElapsedMilliseconds`,
+    '    if ($due -gt 0) { Start-Sleep -Milliseconds $due }',
+    '  }',
+    '} finally {'
+  );
+  if (holdButton) lines.push(`  if ($buttonDown) { [NewmarkCuNative]::mouse_event(${up},0,0,0,[System.UIntPtr]::Zero); $buttonHeldMs = [int]$clock.ElapsedMilliseconds; $buttonDown = $false }`);
+  lines.push(
+    '}',
+    '$cursorMoved = [NewmarkCuNative]::CursorPosition()',
+    '$cursorMovedX = 0',
+    '$cursorMovedY = 0',
+    'if ($cursorMoved.Length -ge 2) { $cursorMovedX = [int]$cursorMoved[0]; $cursorMovedY = [int]$cursorMoved[1] }',
+    '$restoreRequested = ' + (plan.restoreCursor ? '$true' : '$false'),
+    '$cursorRestored = $false',
+    'if ($restoreRequested) { $cursorRestored = [NewmarkCuNative]::SetCursorPosPhysical($cursorBefore[0], $cursorBefore[1]) }',
+    '$cursorAfter = [NewmarkCuNative]::CursorPosition()',
+    '$cursorAfterX = 0',
+    '$cursorAfterY = 0',
+    'if ($cursorAfter.Length -ge 2) { $cursorAfterX = [int]$cursorAfter[0]; $cursorAfterY = [int]$cursorAfter[1] }',
+    `Write-Output (@{ ok=$true; mouse_mode="real"; delivery="physical-desktop"; mouse_motion="relative-injection"; direction_deg=${plan.degrees}; direction_name=${psQuote(plan.name)}; speed_px_per_s=${plan.speed}; duration_ms=${plan.durationMs}; elapsed_ms=([int]$clock.ElapsedMilliseconds); steps=${plan.steps}; injected_steps=[int]$stepsInjected; dx=${plan.dx}; dy=${plan.dy}; button=${psQuote(plan.button)}; button_held_ms=[int]$buttonHeldMs; cursor_before=@{ x=[int]$cursorBefore[0]; y=[int]$cursorBefore[1] }; cursor_displacement=@{ x=[int]($cursorMovedX - $cursorBefore[0]); y=[int]($cursorMovedY - $cursorBefore[1]) }; cursor_after=@{ x=[int]$cursorAfterX; y=[int]$cursorAfterY }; cursor_restore_requested=[bool]$restoreRequested; cursor_restored=[bool]$cursorRestored } | ConvertTo-Json -Compress)`
+  );
+  return lines.join('\r\n');
+}
+
 function realReleaseScript(button) {
   const up = button === 'right' ? '0x0010' : '0x0004';
   return [
@@ -4279,8 +4485,23 @@ async function hiddenDesktopAction(action, options, mode, header, route) {
   if (action === 'app_click' || action === 'app_type' || action === 'app_scroll' || action === 'app_key') {
     return await hiddenAppPhysicalAction(action, options, mode, header, route);
   }
+  /*
+   * `sweep` IS REFUSED ON A HIDDEN DESKTOP, and the refusal is a measurement rather than a
+   * policy choice. Relative motion is state of the desktop the system reads the pointer from,
+   * and the system never routes pointer motion to a hidden desktop: it keeps no pointer there
+   * to move and emits no raw-motion stream. Measured 2026-10-18 by a probe registered for
+   * raw packets, living on that desktop, live across the gesture (it published 15 -> 38 times) and
+   * registered for raw packets (registered=1): a routed
+   * sweep of dx 300 in 16 injected steps produced **0** raw packets and sums of (0,0), while the
+   * agent's own call returned success for all 16 steps. Shipping that as ok:true would be a
+   * gesture that reports success while nothing lands, which is the defect class this module
+   * exists to avoid - so the route refuses by name before it injects anything at all.
+   */
+  if (action === 'sweep') {
+    return failure(action, 'sweep_unsupported_on_hidden_desktop', 'sweep cannot be delivered on a hidden desktop: relative pointer motion belongs to the desktop the system reads the pointer from, and the system never routes it to a hidden desktop - it keeps no pointer there to move and emits no raw-motion stream. Measured on this station: a live probe registered for raw packets on that desktop received 0 of them from a 300 px, 16-step injection whose every call reported success. Use the real mouse mode; the hidden route stays for the posted-message app_* actions, which a hidden desktop can carry.', hiddenHeader(route, header, { queued: false, action_completed: false, desktop_name: route.desktopName, measured_raw_packets: 0 }));
+  }
   if (action === 'app_drag') {
-    return failure(action, 'hidden_agent_action_unsupported', 'The hidden-desktop agent has no drag primitive: it posts clicks, keys, characters and one wheel message. Use app_click, or the real mouse mode for a drag.', hiddenHeader(route, header, { queued: false, action_completed: false, desktop_name: route.desktopName }));
+    return failure(action, 'hidden_agent_action_unsupported', 'The hidden-desktop agent has no drag primitive: it posts clicks, keys, characters and one wheel message. A held relative gesture (sweep) is refused there too, because the system never routes pointer motion to a hidden desktop - measured: 0 raw packets. Use app_click, or the real mouse mode for a drag.', hiddenHeader(route, header, { queued: false, action_completed: false, desktop_name: route.desktopName }));
   }
   return null;
 }
@@ -5378,6 +5599,7 @@ async function dispatchComputerUse(action, options) {
   if (action === 'app_list') return await appListAction(action, options, mode, header);
   if (action === 'app_observe') return await appObserveAction(action, options, mode, header);
   if (action === 'app_activate') return await appActivateAction(action, options, mode, header);
+  if (action === 'sweep') return await sweepAction(action, options, mode, header);
   if (action === 'move' || action === 'click' || action === 'scroll' || action === 'drag' || action === 'type' || action === 'key') {
     return await desktopPhysicalAction(action, options, mode, header);
   }
@@ -5682,6 +5904,64 @@ export function previewVirtualKeyScript(application, key, targetHandle) {
   return virtualKeyScript(application, key, targetHandle);
 }
 
+/**
+ * `sweep`: hold (optionally) and move the pointer in a direction, at a speed, for a duration.
+ *
+ * This is the held-motion gesture `drag` cannot express. Three outcomes, and they are
+ * different on purpose:
+ *
+ *   - real mode: relative injection on this desktop;
+ *   - a hidden desktop: handled before this function by the routing block, which relays the
+ *     same plan to the resident agent and whose injection lands on THAT desktop;
+ *   - virtual mode without a hidden desktop: refused by name. A posted window message carries
+ *     no relative motion, so there is nothing to deliver, and a silent success would be the
+ *     one dishonest answer available.
+ *
+ * The gesture goes through the shared click/drag reservation queue because it moves the same
+ * pointer those actions move, and the button release is guarded at the lane level as well as
+ * in the script's own finally.
+ */
+async function sweepAction(action, options, mode, header) {
+  const plan = planSweep(options);
+  if (plan.ok !== true) return failure(action, plan.error_code, plan.error, { ...header });
+  const planned = {
+    direction_deg: plan.degrees,
+    direction_name: plan.name,
+    direction_source: plan.direction_source,
+    speed_px_per_s: plan.speed,
+    duration_ms: plan.durationMs,
+    steps: plan.steps,
+    dx: plan.dx,
+    dy: plan.dy,
+    button: plan.button,
+    restore_cursor: plan.restoreCursor,
+  };
+  if (mode.mode === 'virtual') {
+    return failure(action, 'sweep_requires_physical_delivery',
+      'sweep moves the pointer by relative injection, and a posted window message cannot carry that. Real mode delivers it on this desktop; a hidden desktop delivers it through the resident agent that lives there. Virtual mode without a hidden desktop has no path, so it is refused instead of reported as delivered.',
+      { ...header, fallback_to_real_delivery: false, physical_delivery_used: false, system_cursor_moved: false });
+  }
+  if (options.dryRun === true) {
+    return { ...header, ok: true, action, dry_run: true, mouse_mode: 'real', delivery: 'not-delivered', mouse_motion: 'relative-injection', sweep_plan: planned };
+  }
+  // The foreground is pinned only when the caller named a window: an unpinned sweep goes to
+  // whatever is in front, which is the same contract `key` and `type` carry.
+  let expect = {};
+  if (handleHex(options.windowHandle || options.window_handle) || options.appTarget || options.app_target) {
+    const resolved = await resolveApplication({ ...options, virtualScope: false });
+    if (resolved.ok !== true) {
+      return failure(action, resolved.error_code || 'app_target_not_found', resolved.error || 'The requested application window was not found.', { ...header, applications: (resolved.applications || []).slice(0, 20) });
+    }
+    expect = { handle: resolved.application.handle, processId: resolved.application.process_id };
+  }
+  const releaseScript = plan.button === 'none' ? null : realReleaseScript(plan.button);
+  const result = await dragWithRelease({ action, script: realSweepScript(plan, expect), releaseScript, options, reserved: true });
+  // The guard's own field is named for a drag; a sweep reports it under its own name so a
+  // reader is not told a drag guard ran for a gesture that never dragged anything.
+  const { drag_release_guard: guard, ...rest } = result;
+  return { ...header, ...rest, ...planned, action, raw_motion_delivery: 'relative-mouse-event', sweep_release_guard: guard === true };
+}
+
 async function desktopPhysicalAction(action, options, mode, header) {
   const target = options.targetId ? resolveTargetId(options.targetId, options.ownerId) : null;
   if (target && target.ok !== true) return failure(action, target.error_code, target.error, { ...header });
@@ -5752,8 +6032,17 @@ async function desktopPhysicalAction(action, options, mode, header) {
     if (built.error) return failure(action, 'key_unsupported', built.error, { ...header });
     return { ...header, ...(await realStep('key', built.script, options)) };
   }
-  if (!target && !Number.isFinite(Number(options.x))) return failure(action, 'point_required', 'x and y are required pixel coordinates or provide target_id.', { ...header });
-  if (!target && !Number.isFinite(Number(options.y))) return failure(action, 'point_required', 'x and y are required pixel coordinates or provide target_id.', { ...header });
+  /*
+   * `drag` is exempt from the point guard: its geometry is start_x/start_y/end_x/end_y and it
+   * carries its own `drag_points_required` check below. The guard used to run first for every
+   * action, so a drag with a complete rectangle and no x/y was refused as `point_required` and
+   * never reached the drag script - measured 2026-10-18, when the sweep gate could not run the
+   * absolute-drag control at all because the call was refused before delivery.
+   */
+  if (action !== 'drag') {
+    if (!target && !Number.isFinite(Number(options.x))) return failure(action, 'point_required', 'x and y are required pixel coordinates or provide target_id.', { ...header });
+    if (!target && !Number.isFinite(Number(options.y))) return failure(action, 'point_required', 'x and y are required pixel coordinates or provide target_id.', { ...header });
+  }
   const x = target ? target.x : Math.floor(Number(options.x));
   const y = target ? target.y : Math.floor(Number(options.y));
   if (action === 'move') return { ...header, ...(await realStep('move', realMoveScript(x, y, {}), options, false)) };
@@ -5879,6 +6168,9 @@ async function dragWithRelease({ action, script, releaseScript, options, reserve
   const release = async () => {
     if (released) return;
     released = true;
+    // A sweep with no button has nothing to release, and 0x0004 is the LEFT button up: running
+    // that script to guard a gesture that never pressed anything would post a stray key-up.
+    if (!releaseScript) return;
     await runInLane('action', releaseScript, 5000);
   };
   let result;
@@ -6026,6 +6318,12 @@ function modeReport(action, options) {
       move_curve_ms: MOVE_CURVE_MS,
       sparse_min_interval_ms: SPARSE_MIN_INTERVAL_MS,
       sparse_max_wait_ms: SPARSE_MAX_WAIT_MS,
+      sweep_speed_min: SWEEP_SPEED_MIN,
+      sweep_speed_max: SWEEP_SPEED_MAX,
+      sweep_duration_min_ms: SWEEP_DURATION_MIN_MS,
+      sweep_duration_max_ms: SWEEP_DURATION_MAX_MS,
+      sweep_steps_max: SWEEP_STEPS_MAX,
+      sweep_step_interval_ms: SWEEP_STEP_INTERVAL_MS,
     },
     lease: active
       ? { held: true, ...active, last_release_reason: lease.lastReleaseReason }
@@ -6063,6 +6361,7 @@ function modeReport(action, options) {
         'capture_screen, the whole-desktop capture behind screen_capture with target "desktop" (virtual mode refuses it: a screen capture is not a window-scoped read, so there is no target to scope it to)',
         'app_observe without app_target or window_handle (the foreground scene check)',
         'desktop move/click/drag/scroll/type/key without app_target, window_handle or a prior app_observe target (virtual_mode_requires_app_target)',
+        'sweep in virtual mode without a hidden desktop (sweep_requires_physical_delivery: relative motion has no window message to ride on, and a silent no-op is the one answer this module will not give)',
         'sequence (virtual mode refuses a scene-checked sequence: use app_observe followed by explicit app_* actions)',
       ],
       supports: [
@@ -6071,6 +6370,7 @@ function modeReport(action, options) {
         'app_activate with app_target or window_handle (binds the target; it never activates anything)',
         'app_click, app_drag, app_scroll, app_type, app_key with app_target or window_handle (posted window messages)',
         'the same actions against an agent-hosted hidden desktop, when the lease was armed with desktop "hidden": they are relayed to the resident agent on that desktop and nothing on this desktop is touched',
+        'sweep only on the real desktop: on an agent-hosted hidden desktop it is refused by name (sweep_unsupported_on_hidden_desktop), because the system never routes pointer motion to a hidden desktop',
       ],
       requires: ['app_target or window_handle'],
       never_falls_back_to_real_delivery: true,
@@ -6086,11 +6386,12 @@ function modeReport(action, options) {
     hidden_desktop: {
       arm_with: 'takeover_start with mouse_mode "virtual" and desktop "hidden" (optionally launch: "<command line>" to start a program on it)',
       routed_actions: ['app_list', 'app_observe', 'app_activate', 'app_click', 'app_type', 'app_scroll', 'app_key'],
-      not_routed: ['observe', 'capture_screen', 'sequence', 'move', 'click', 'drag', 'scroll', 'type', 'key', 'app_drag'],
+      not_routed: ['observe', 'capture_screen', 'sequence', 'move', 'click', 'drag', 'sweep', 'scroll', 'type', 'key', 'app_drag'],
+      refused_by_name: ['sweep (sweep_unsupported_on_hidden_desktop: the system keeps no pointer on a hidden desktop, so relative motion has nowhere to land; measured 0 raw packets from a 300 px injection)'],
       starts_a_process_when_asked: true,
       started_at_module_load: false,
       transport: 'json lines over the resident agent\'s own named pipe, one connection per request, relayed through the windows lane',
-      reach: 'the agent lives on the hidden desktop and posts its own messages there: no cross-desktop call is made by this module',
+      reach: 'the agent lives on the hidden desktop and acts only on that desktop by posting window messages: no cross-desktop call is made by this module and this desktop is never acted on. Relative pointer motion is never routed there by the system, so sweep is refused by name',
       ownership: 'the agent creates a job with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and assigns itself, so every process it launches is a member by inheritance',
       teardown: 'takeover_stop exits the agent, measures that the agent and every hosted pid are gone, and asks whether the desktop is still openable',
       cleanup_by_process_name: false,
