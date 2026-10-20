@@ -1,6 +1,6 @@
 # Package overview
 
-0.3.14 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
+0.3.19 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
 
 | Path | Purpose |
 |---|---|
@@ -44,3 +44,10 @@ README 保留五组件首页结构，简化术语、完善工具全名，增加�
 ## 2026-10-14 Historical changelog archival
 
 All 18 root CHANGELOG markdown files are preserved byte-identically under local archive/20261014-104450-changelogs/ and removed from Git tracking. archive/ remains ignored; README links GitHub Releases for public history. Existing tags and Git history remain intact; runtime version stays 0.3.14.
+
+
+## 0.3.19 (2026-10-20, published)
+
+The package line above advances from 0.3.14 to 0.3.19. MemoryLab's model-facing descriptions now state the two stores' division on every tool: `LONG_TERM_ROLE` opens the nine `memory_lab_*` tools (durable, tag-tree knowledge shared across conversations — a user profile and a knowledge graph; nothing there expires) and `SHORT_TERM_ROLE` opens the four `shortMemory_*` tools (a flat list that expires on its own, seven days by default, kept for cross-conversation task handoff). `memory_lab_read`'s instructions carry the same split. The memory-tool gate grew from 168 to 176 assertions, and five planted mutations were detected and restored byte-for-byte.
+
+Published to npm as 0.3.19 from tag v0.3.19 (publish run 39440904853): registry `latest` moved to 0.3.19, the downloaded tarball matched the published integrity, and 93 files checked out as 78 byte-identical plus 15 normalized to LF (zero substantive differences). Versions 0.3.15–0.3.18 were local-only and never published; 0.3.19 is the first release since 0.3.14 and carries their runtime fixes. This page keeps the public documentation policy: the release commit's package content is identical here, root changelogs stay archived, and version history stays in GitHub Releases.

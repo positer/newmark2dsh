@@ -809,6 +809,8 @@ export class MemoryLabStore {
   instructions() {
     return [
       `Newmark Memory Lab durable memory. Root: ${this.root}`,
+      'MEMORY SPLIT — this store is the LONG-TERM half: durable, stable, tag-tree structured knowledge kept on disk and shared across every conversation (a user profile, a knowledge graph, agreed project conventions). Nothing here expires: a component lives until memory_lab_delete removes it, and that removal is archived and reversible.',
+      'The SHORT-TERM half is shortMemory_*: a flat list whose items expire on their own, seven days by default, with expired rows kept and flagged. Use it for temporary notes and for handing a task across conversations (where the work stopped, what comes next). Do not file those here, and never treat an expired short-term item as a current fact.',
       'memory_lab_read inspects the index (tags, tagPaths, revisions) before deciding anything; memory_lab_read with a slug/name/path also returns that component core markdown.',
       'memory_lab_query is bounded task-relevant retrieval: prefer it over injecting the whole index.',
       'memory_lab_update creates or replaces a component; pass expectedUpdatedAt from the latest read so a stale write is rejected instead of overwriting newer memory.',

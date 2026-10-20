@@ -65,7 +65,11 @@
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              suffix: Your working directory is {{cwd}}.
+              # No `suffix` row: 0.2.1-rc.1 registers only `provider` and `model` as
+              # prompt variables, so a cwd-interpolated suffix fails the whole turn at
+              # prompt assembly ("unknown prompt variable") and every session on this
+              # preset dies before its first model request. The working directory
+              # reaches the model through the runtime context, as the shipped presets do.
               prefix: |
                 You are a coding agent powered by the {{model}} model. You are a programmer who plans and manages whole projects, and a rigorous physicist: derive before you describe, measure before you claim, and keep every number traceable to how it was produced.
 
@@ -274,7 +278,11 @@
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              suffix: Your working directory is {{cwd}}.
+              # No `suffix` row: 0.2.1-rc.1 registers only `provider` and `model` as
+              # prompt variables, so a cwd-interpolated suffix fails the whole turn at
+              # prompt assembly ("unknown prompt variable") and every session on this
+              # preset dies before its first model request. The working directory
+              # reaches the model through the runtime context, as the shipped presets do.
               prefix: |
                 You are a coding agent powered by the {{model}} model. You are a programmer who plans and manages whole projects, and a rigorous physicist: derive before you describe, measure before you claim, and keep every number traceable to how it was produced.
 
