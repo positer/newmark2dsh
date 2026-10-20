@@ -28,7 +28,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-import { overlayContractReport, overlayState as realOverlayState, releaseOverlay, startOverlay, stopOverlay } from './overlay-win32.js';
+import { overlayContractReport, overlayState as realOverlayState, pulseOverlay, releaseOverlay, startOverlay, stopOverlay } from './overlay-win32.js';
 import { desktopPetContract, desktopPetState, releaseDesktopPet, startDesktopPet, stopDesktopPet, prepareDesktopPetTransfer } from './desktop-pet.js';
 import { acquireTakeoverLock } from './takeover-lock.js';
 import { desktopTransfers, transferReport, findDesktopTransfer, inspectTransferSource, startDesktopTransfer, returnDesktopTransfer, transferCommand, cleanupTransferredDesktop, releaseDesktopTransfersSync, restoreVirtualTransfers } from './desktop-transfer.js';
@@ -5230,6 +5230,36 @@ function startTakeoverOverlay(ownerId, options = {}) {
   }
 }
 
+/**
+ * The ring the person at the machine is owed whenever this desktop is really acted on.
+ *
+ * The reference pulses a short overlay for `OVERLAY_PULSE_MS` (2500 ms) when a *mutating*
+ * action runs and no takeover overlay is already on screen (docs/00-governance.md **F-2.14c**).
+ * Without it, a caller that never took a lease - or could not take one, because another DSH
+ * host holds this mode - drives the real desktop with **no visible sign at all**, while the
+ * lease path does draw the ring. `pulseOverlay` is the whole mechanism and already refuses to
+ * start a second window, so what was missing was the call: `OVERLAY_PULSE_MS` was a constant
+ * nothing read.
+ *
+ * Two facts decide what may pulse. It is keyed on the receipt's own `delivery`, so only a
+ * receipt that says `physical-desktop` can pulse: a hidden-desktop answer
+ * (`hidden-desktop-agent`) and a virtual-mode answer (`posted-window-messages`) describe work
+ * that never touched this desktop, and pulsing for them would claim otherwise. And it is not
+ * awaited - the action is already delivered, the window is a side effect, and a slow start
+ * must not slow a click down; a failure lands in `lastOverlayError`, which `mode_report`
+ * already reports.
+ */
+const PULSE_ACTIONS = new Set(['click', 'drag', 'sweep', 'scroll', 'type', 'key', 'app_click', 'app_drag', 'app_scroll', 'app_type', 'app_key']);
+function pulseIndicatorFor(action, options, result) {
+  if (!IS_WINDOWS) return;
+  if (!result || result.ok !== true || result.dry_run === true) return;
+  if (result.delivery !== 'physical-desktop') return;
+  if (!PULSE_ACTIONS.has(action)) return;
+  pulseOverlay({ ownerId: String(options.ownerId || 'direct'), ownerPid: process.pid, action })
+    .then(pulse => { if (pulse && pulse.ok === false) leases.real.lastOverlayError = pulse.error || 'indicator_pulse_failed'; })
+    .catch(error => { leases.real.lastOverlayError = error instanceof Error ? error.message : String(error); });
+}
+
 function releaseLease(reason, mode) {
   if (!mode) { releaseLease(reason, 'real'); releaseLease(reason, 'virtual'); return {released:true,reason}; }
   const lease = leases[mode];
@@ -5521,6 +5551,7 @@ export async function runComputerUse(options = {}) {
       }
     }
     const result = await dispatchComputerUse(action, options || {});
+    pulseIndicatorFor(action, options || {}, result);
     return stringifyResult(result);
   } catch (error) {
     return stringifyResult(failure(action, 'internal_error', error instanceof Error ? error.message : String(error)));

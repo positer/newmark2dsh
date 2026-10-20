@@ -13,7 +13,7 @@
  */
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { createShortMemory } from './lib/short-memory.js';
+import { createShortMemory, SHORT_TERM_ROLE } from './lib/short-memory.js';
 import { MemoryLabStore, MemoryLabStoreError, TAG_DECISION_KINDS, DEFAULT_ROOT_LIMIT, MAX_ROOT_LIMIT, DEFAULT_TREE_MAX_TAGS, MAX_TREE_MAX_TAGS, DEFAULT_TREE_MAX_COMPONENTS, MAX_TREE_MAX_COMPONENTS } from './lib/memory-store.js';
 // The presence probe belongs to the component that owns the tool being probed, and it works
 // whether or not that component is mounted — which is the whole reason it can answer "is a judge
@@ -29,6 +29,28 @@ import { agentApiPresence, AGENT_API_PRESENCE_TOOL } from '../agent-api/lib/pres
 // This component owns two of the failures the user asked to have persisted: the deterministic
 // rebuild, and every judgement that is not a verdict.
 import { causeChain, createErrorLog, describeError } from '../../lib/errors.js';
+
+/**
+ * What this store IS, at the head of every model-facing description.
+ *
+ * The two memory stores in this bundle are one decision a caller makes before it writes
+ * anything, so it is stated on every tool rather than once in the panel: a tool description is
+ * read one tool at a time, and a model that reaches `memory_lab_query` without having read
+ * `memory_lab_read` must still know that durable knowledge lives here and that temporary notes
+ * do not. `shortMemory_*` is the other half of that decision and states its own role the same
+ * way (`lib/short-memory.js`, `SHORT_TERM_ROLE`).
+ *
+ * The sentence is REPEATED thirteen times in this bundle's tool surface, so its length is a
+ * context tax paid on every request. The gate caps it at 320 characters for that reason — it has
+ * to stay a signpost, not become a manual. Anything longer belongs in `instructions()`: the text
+ * a caller reads once, on demand, through `memory_lab_read`.
+ *
+ * "Nothing here expires" is not decoration. A caller that files a two-day-old status note here
+ * expecting it to age out is wrong in a way this store cannot report: nothing will ever remove it.
+ * The expiry it is thinking of lives in `shortMemory_*`.
+ */
+export const LONG_TERM_ROLE =
+  'Long-term memory (MemoryLab): durable, stable, tag-tree knowledge kept on disk and shared across every conversation — the store for a user profile and a knowledge graph. Nothing here expires. Temporary notes and task handoff belong to shortMemory_*.';
 
 /**
  * The decisions that ARE a judgement, as opposed to a reversal of one.
@@ -1048,7 +1070,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_read',
           description:
-            'Read the Memory Lab index, its path and its usage instructions. Optionally pass a component slug or name to read that component core markdown.',
+            `${LONG_TERM_ROLE} Read the Memory Lab index, its path and its usage instructions. Optionally pass a component slug or name to read that component core markdown.`,
           parameters: {
             type: 'object',
             properties: {
@@ -1066,7 +1088,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_query',
           description:
-            'Retrieve a bounded, task-relevant Memory Lab set with deterministic scoring and adaptive early stopping. Prefer this over loading the complete index when a focused query is enough.',
+            `${LONG_TERM_ROLE} Retrieve a bounded, task-relevant Memory Lab set with deterministic scoring and adaptive early stopping. Prefer this over loading the complete index when a focused query is enough.`,
           parameters: {
             type: 'object',
             properties: {
@@ -1084,7 +1106,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_root_tags',
           description:
-            'List the ROOT parent tags — every tag with no parent — with the numbers that decide which branch to descend into, so a caller can choose one WITHOUT reading the whole index: each root carries its direct child count, the components carrying it directly, and the size of the subtree beneath it in tags and in components. Aliases are included when the store has them. Ordered by subtree size, largest first, ties by tag name. Read-only: it writes nothing, rebuilds nothing and judges nothing. Descend with memory_lab_subtag_tree.',
+            `${LONG_TERM_ROLE} List the ROOT parent tags — every tag with no parent — with the numbers that decide which branch to descend into, so a caller can choose one WITHOUT reading the whole index: each root carries its direct child count, the components carrying it directly, and the size of the subtree beneath it in tags and in components. Aliases are included when the store has them. Ordered by subtree size, largest first, ties by tag name. Read-only: it writes nothing, rebuilds nothing and judges nothing. Descend with memory_lab_subtag_tree.`,
           parameters: {
             type: 'object',
             properties: {
@@ -1101,7 +1123,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_subtag_tree',
           description:
-            "Read ONE tag's subtree: the structure level by level (each tag's name, depth, parent, child count and how many components carry it directly, depth-first and in a stable order), every component name in the subtree deduplicated and reachable afterwards with memory_lab_read — each saying whether it carries the tag itself, a descendant, or both — and the statistics that size it (tags, components, depth reached). The leading '#' is optional; an unknown tag is NOT_FOUND naming the tag. Bounded: the payload respects max_tags and max_components, states every limit it respected and lists everything it dropped, so a short answer is never mistaken for a small subtree. Read-only: it writes nothing, rebuilds nothing and judges nothing.",
+            `${LONG_TERM_ROLE} Read ONE tag's subtree: the structure level by level (each tag's name, depth, parent, child count and how many components carry it directly, depth-first and in a stable order), every component name in the subtree deduplicated and reachable afterwards with memory_lab_read — each saying whether it carries the tag itself, a descendant, or both — and the statistics that size it (tags, components, depth reached). The leading '#' is optional; an unknown tag is NOT_FOUND naming the tag. Bounded: the payload respects max_tags and max_components, states every limit it respected and lists everything it dropped, so a short answer is never mistaken for a small subtree. Read-only: it writes nothing, rebuilds nothing and judges nothing.`,
           parameters: {
             type: 'object',
             properties: {
@@ -1128,7 +1150,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_update',
           description:
-            'Create or incrementally patch one Memory Lab component. Creating requires name and content; patching requires component plus only the changed fields, and should carry expectedUpdatedAt from the latest read. prefer contentAppend or oldText/newText for small body edits. The previous revision is archived and a stale write fails closed. Reports success only after the index rebuild and read-back verification return a completed receipt.',
+            `${LONG_TERM_ROLE} Create or incrementally patch one Memory Lab component. Creating requires name and content; patching requires component plus only the changed fields, and should carry expectedUpdatedAt from the latest read. prefer contentAppend or oldText/newText for small body edits. The previous revision is archived and a stale write fails closed. Reports success only after the index rebuild and read-back verification return a completed receipt.`,
           parameters: {
             type: 'object',
             properties: {
@@ -1164,7 +1186,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_delete',
           description:
-            'Remove one obsolete durable memory component. Use it only for an explicit user request to forget or remove memory: the final revision is archived, the active component is removed, the tag graph is rebuilt, and a verified receipt is returned.',
+            `${LONG_TERM_ROLE} Remove one obsolete durable memory component. Use it only for an explicit user request to forget or remove memory: the final revision is archived, the active component is removed, the tag graph is rebuilt, and a verified receipt is returned.`,
           parameters: {
             type: 'object',
             properties: {
@@ -1190,7 +1212,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_reindex',
           description:
-            'Rebuild the index and the tag graph from every component tags/tagPaths: the deterministic normalizer. It folds the bilingual spellings its built-in table names, keeps the other spellings as aliases, keeps every tagPath, drops tags no component references, and repeated rebuilds are graph-idempotent. It never merges a near-synonym the table does not name, never re-parents a root tag and never repairs a mis-parsed tag name: memory_lab_tag_review reports those, and memory_lab_tag_apply records the decisions you make from it.',
+            `${LONG_TERM_ROLE} Rebuild the index and the tag graph from every component tags/tagPaths: the deterministic normalizer. It folds the bilingual spellings its built-in table names, keeps the other spellings as aliases, keeps every tagPath, drops tags no component references, and repeated rebuilds are graph-idempotent. It never merges a near-synonym the table does not name, never re-parents a root tag and never repairs a mis-parsed tag name: memory_lab_tag_review reports those, and memory_lab_tag_apply records the decisions you make from it.`,
           parameters: { type: 'object', properties: {}, required: [] },
           output: { schema: { type: 'object' }, render: (args, value) => toolText(store.formatWrite(value)) },
           async execute() {
@@ -1232,6 +1254,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_tag_review',
           description:
+            LONG_TERM_ROLE + ' ' +
             'Report the tag-graph repairs that need judgement rather than a rule: a root tag whose memories are already filed under another tag, near-synonym tags, a name that may be a collapsed path, a chain that may be one tag, stored values a rebuild does not reproduce, and the cycles — a cycle the stored graph really holds (`stored-cycle`, read from index.json before the normalizer drops its second edge) or two roots that each name the other as candidate parent (`candidate-mutual`); the finding says which shape it is and carries what makes a direction logical, or says plainly that nothing does. Read-only — it rewrites nothing. Every finding carries the facts to decide it and the decision shape to pass to memory_lab_tag_apply. ' +
               'This result also carries the judgement envelope: whether a run can be asked for right now, the request that says what is being judged, where it runs and what shape the answer takes, and `prompt` — the same ask as the prose you would send a model, ready to hand to a run as it stands. It is the SAME text the panel\'s 重建索引 dispatches when it runs the judgement itself, so a run you start by hand and a run started from the panel are asked the same thing. ' +
               'THE SEQUENCE IS AGENT-DRIVEN AND IT IS TWO CALLS: this tool gives you the evidence and the request; YOU decide; memory_lab_tag_apply applies and records your decisions. Nothing here judges. When you want a run to make the decision for you, obtain one from agent-api through its agent_api_send tool — that is also what the panel does, through this component.',
@@ -1274,7 +1297,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
         {
           name: 'memory_lab_tag_apply',
           description:
-            'Apply the tag-graph decisions you made from memory_lab_tag_review: merge folds tags into one canonical tag, reparent continues a root tag under a parent, split turns a collapsed name into a chain, join turns a chain into one tag, cut removes one parent -> child edge from the component tagPaths that assert it (the way a cycle is broken: reparent cannot break one, because moving a node of a cycle under another node of it is refused as a cycle and moving it outside leaves the cycle intact), and set-tags/unfold restore previous tags exactly. Before it writes, the current index is archived under archive/ and one policy.jsonl line records the decisions, every affected component previous tags and an undo list that restores the previous graph. A judgement decision (merge, reparent, split, join, cut) requires the agent-api component and is refused while it is switched off; a reversal still applies.',
+            `${LONG_TERM_ROLE} Apply the tag-graph decisions you made from memory_lab_tag_review: merge folds tags into one canonical tag, reparent continues a root tag under a parent, split turns a collapsed name into a chain, join turns a chain into one tag, cut removes one parent -> child edge from the component tagPaths that assert it (the way a cycle is broken: reparent cannot break one, because moving a node of a cycle under another node of it is refused as a cycle and moving it outside leaves the cycle intact), and set-tags/unfold restore previous tags exactly. Before it writes, the current index is archived under archive/ and one policy.jsonl line records the decisions, every affected component previous tags and an undo list that restores the previous graph. A judgement decision (merge, reparent, split, join, cut) requires the agent-api component and is refused while it is switched off; a reversal still applies.`,
           parameters: {
             type: 'object',
             properties: {
