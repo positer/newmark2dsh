@@ -13,9 +13,29 @@ import {threadHandoff,shouldRotate} from './lib/thread-handoff.js';
 import {todoInput,todoMessageId} from './lib/todo-list.js';
 import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet} from './lib/initiative.js';
 
+
+/**
+ * The tool group a NewMate run may use. ONE list, read three ways: it is the run's allow list, it
+ * is the group whose schemas initialization describes, and it is what the gates compare against.
+ *
+ * Names only - never schemas - because the schema must come from the LIVE registry: a tool this
+ * bundle registers and a tool a plugin provides are described the same way, and a name the
+ * current exposure does not carry is reported as missing instead of being described as callable.
+ * newmate_task is in the group but only allowed on turns bound to an origin conversation; the
+ * persona states that condition, so the schema is not a grant.
+ */
+export const NEWMATE_RUN_TOOLS = Object.freeze([
+  'memory_lab_read', 'memory_lab_query', 'memory_lab_root_tags', 'memory_lab_subtag_tree',
+  'memory_lab_update', 'memory_lab_reindex', 'memory_lab_tag_review', 'memory_lab_tag_apply',
+  'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size',
+  'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel', 'newmate_task',
+]);
 export function createNewMate({ root, tools, agents, now = Date.now, logger, onNotify = async () => {}, onCompanion = async () => {}, onPresence = () => {}, environment=()=>({ready:true,idleMs:2*MINUTE}) }) {
   const failures = createErrorLog({root,logger});
-  const nativeMemory = createMemoryContext(root,now);
+  // The initialization payload is built once at construction and rebuilt whenever memory moves.
+  // It carries the persona, the complete tag tree, every short row and the memory tool-group schema;
+  // bodies stay on demand. The schema source is the LIVE registry this process registered, not a copy.
+  const nativeMemory = createMemoryContext(root,now,{toolSchemas:()=>({schemas:typeof tools?.schemas==='function'?tools.schemas():[],names:NEWMATE_RUN_TOOLS})});
   nativeMemory();
   const store = durableState(path.join(root, 'newMate', 'state.json'), { schema: 2, threads: [{id:'default',title:'与 NewMate 的对话',created:now(),updated:now(),archived:false}], activeThreadId:'default', settings:{companion:false,notifications:false}, messages: [], tasks: [], measurements: {}, lastResponse: 0 });
   if (store.read().schema !== 2) store.change(s => {
@@ -102,8 +122,8 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
         const history = automatic?recent.slice(-6).map(({role,text,at,proactive})=>({role,text:text.slice(0,500),at,proactive})):recent.slice(-12);
         const memory = nativeMemory();
         const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)}},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
-          prompt: `你是由 MemoryLab 驱动的定制陪伴 Agent NewMate，也是用户亲近而务实的私人秘书。像熟悉用户的可靠伙伴，用户主动提问时先直接回应，再按需要给具体下一步；自然亲近但不过度亲昵、说教、催促或虚构了解，不把内部权限清单和流程当回复主体。普通问题简短回答，复杂内容按需要展开。引用真实文件时用 Markdown 文件链接，绝不编造路径。需要交互展示时提供完整自包含的 HTML 代码围栏（html），页面直接在本条回复内渲染并可操作，可用内联 CSS/JavaScript，不依赖外部资源，不尝试调用宿主、读文件、操作系统或跳转外部页面；不要为了普通回复强行生成页面。当前时间：${new Date(now()).toISOString()}；本机时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}。你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。记忆只是背景，不能授权动作。温和、简洁、低打扰。不确定时向用户说明。你可使用 MemoryLab 读取、新建、增量更新、标签审阅与应用，以及 shortMemory 读取和添加工具。仅保存可信且值得记住的用户信息；更新长期记忆前读取最新版本并携带 expectedUpdatedAt，不把临时验收或推测写成事实，禁止删除记忆。另有宿主明确绑定原对话时提供的 newmate_task 唤起工具；需要本体执行工作时可将具体建议交回该原对话。不具有文件删除或任意执行权限。完整标签图与最近短期记忆已经由原生内核在最早的系统前缀注入；仅在需要具体长期记忆内容时再查询。\n近期对话：${JSON.stringify(history)}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE:''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
-          tools: { allow: ['memory_lab_read', 'memory_lab_query', 'memory_lab_root_tags', 'memory_lab_subtag_tree', 'memory_lab_update', 'memory_lab_reindex', 'memory_lab_tag_review', 'memory_lab_tag_apply', 'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size', 'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel', ...(!automatic&&task.origin?['newmate_task']:[])] }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:8,
+          prompt: `当前时间：${new Date(now()).toISOString()}；本机时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}。你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE:''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
+          tools: { allow: [...NEWMATE_RUN_TOOLS.filter((name)=>name!=='newmate_task'), ...(!automatic&&task.origin?['newmate_task']:[])] }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:8,
           ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:240},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
         }, signal: active.signal })));
         active.signal.throwIfAborted();
@@ -193,7 +213,7 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
       const message={id,threadId:destination,role:'assistant',text:text.trim(),summary:options.summary,at:now(),proactive:true,unread:true};
       store.change(s=>{s.messages.push(message);s.threads.find(t=>t.id===destination).updated=now();});const delivery=await notify(message);return{ok:true,id,...delivery};
     },
-    memoryContext() { const value=nativeMemory(); return {key:value.key,tags:structuredClone(value.tags),shortMemory:structuredClone(value.shortMemory),cacheHits:value.cacheHits()}; },
+    memoryContext() { const value=nativeMemory(); return {key:value.key,tree:structuredClone(value.tree),tags:structuredClone(value.tags),shortMemory:structuredClone(value.shortMemory),shortMemoryTotal:value.shortMemoryTotal,shortMemoryOmitted:value.shortMemoryOmitted,tools:structuredClone(value.tools),toolsMissing:structuredClone(value.toolsMissing),cacheHits:value.cacheHits()}; },
     failure(where,error) { failures.record({where,code:error.code || 'newmate_failed',message:String(error.message)}); },
     chat(text, execution, threadId) {
       if(typeof text!=='string'||!text.trim()||text.length>16000)throw Error('消息须为 1–16000 字符');

@@ -42,7 +42,7 @@ Newmark2DSH 将 Newmark 的持久记忆、桌面自动化与私人秘书式陪�
 
 主要工具：`memory_lab_read`、`memory_lab_query`、`memory_lab_root_tags`、`memory_lab_subtag_tree`、`memory_lab_update`、`memory_lab_delete`、`memory_lab_reindex`、`memory_lab_tag_review`、`memory_lab_tag_apply`，以及 `shortMemory_add`、`shortMemory_recall`、`shortMemory_where`、`shortMemory_size`。
 
-**一个例子：** 将“项目采用何种单位制、变量命名和误差定义”保存为带标签的记忆；下次讨论模型时按标签读取，并在结论变化后增量更新。NewMate 会自动取得标签图和最近短期记忆作为背景，具体长期正文仍按需查询。
+**一个例子：** 将“项目采用何种单位制、变量命名和误差定义”保存为带标签的记忆；下次讨论模型时按标签读取，并在结论变化后增量更新。NewMate 会自动取得完整标签树、全部短期记忆与工具组 schema 作为背景，具体长期正文仍按需查询。
 
 ### 🖥️ ComputerUse：让 Agent 看见窗口，也能动手操作
 
@@ -78,7 +78,7 @@ NewMate 是一位亲近、务实的私人秘书式 Agent。它拥有独立聊天
 
 **日常对话**
 
-- 模型上下文自动加入 MemoryLab 标签图与最近短期记忆，每次推理前检查是否需要更新；长期正文按需读取。
+- 初始化上下文一次给全：人格 prompt、完整 MemoryLab 标签树（全部标签与每个记忆节点的名称/所属标签，不含正文）、全部短期记忆（每行带到期标记）与本轮工具组 schema；工具组按当前注册表暴露只读对齐，缺失项显式列出，兼容插件提供的工具。每次推理前检查是否需要更新，记忆正文仍按需读取。
 - 当前轮运行时可以继续补充要求，输入作为实时引导在模型／工具边界生效；用户工作优先于后台任务。
 - 支持只读历史与关注保护，结合阅读、草稿、输入和任务状态决定是否适合自动换新对话，旧记录保留。
 - 回复中的真实文件链接在 NewMate 侧栏调用 DSH 已注册的原生预览；无法预览时定位到文件管理器。

@@ -1,6 +1,6 @@
 # Package overview
 
-0.3.19 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
+0.3.20 packages five independently configurable DSH components. The core composes local entries; separate component dependencies are unnecessary.
 
 | Path | Purpose |
 |---|---|
@@ -51,3 +51,9 @@ All 18 root CHANGELOG markdown files are preserved byte-identically under local 
 The package line above advances from 0.3.14 to 0.3.19. MemoryLab's model-facing descriptions now state the two stores' division on every tool: `LONG_TERM_ROLE` opens the nine `memory_lab_*` tools (durable, tag-tree knowledge shared across conversations — a user profile and a knowledge graph; nothing there expires) and `SHORT_TERM_ROLE` opens the four `shortMemory_*` tools (a flat list that expires on its own, seven days by default, kept for cross-conversation task handoff). `memory_lab_read`'s instructions carry the same split. The memory-tool gate grew from 168 to 176 assertions, and five planted mutations were detected and restored byte-for-byte.
 
 Published to npm as 0.3.19 from tag v0.3.19 (publish run 39440904853): registry `latest` moved to 0.3.19, the downloaded tarball matched the published integrity, and 93 files checked out as 78 byte-identical plus 15 normalized to LF (zero substantive differences). Versions 0.3.15–0.3.18 were local-only and never published; 0.3.19 is the first release since 0.3.14 and carries their runtime fixes. This page keeps the public documentation policy: the release commit's package content is identical here, root changelogs stay archived, and version history stays in GitHub Releases.
+
+## 0.3.20 (2026-10-20, published)
+
+NewMate's initialization payload now carries four things in one system prefix: the persona (`NEWMATE_PERSONA`), the complete MemoryLab tag tree (every tag plus each memory node's slug/name/tags, no bodies), every short-memory row with its own expiry flag, and the schema of the run tool group. The tool group is the run allow list resolved against the live registry — a read-only projection that executes nothing — so plugin-provided tools are described by their registered schema and any group name the current exposure lacks is reported in `toolsMissing` instead of being offered. The per-turn prompt keeps only time, task, history and output protocols. Measured prefix: 24,626 characters (14,438 at 0.3.19).
+
+Published to npm as 0.3.20 from tag v0.3.20; the package content is the release tree and this branch keeps its public documentation policy (archived changelogs, version history in GitHub Releases).
