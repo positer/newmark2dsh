@@ -96,6 +96,8 @@ function buildTools(source) {
   const schemas = Array.isArray(payload?.schemas) ? payload.schemas : Array.isArray(payload) ? payload : [];
   const byName = new Map(schemas.filter((entry) => entry && entry.name).map((entry) => [String(entry.name), entry]));
   const names = Array.isArray(payload?.names) ? payload.names.map(String) : [...byName.keys()];
+  const privateTools = globalThis[Symbol.for('newmark.newmate.privateTools')] || {};
+  for (const name of names) { if (!byName.has(name) && privateTools[name]) byName.set(name, privateTools[name]); }
   const tools = names
     .filter((name) => byName.has(name))
     .sort()

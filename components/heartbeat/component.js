@@ -57,13 +57,45 @@ export const DELIVERY_FAILURE_LIMIT = 3;
  * already carries an "error" field on a task that keeps retrying, so a reader must be able to tell
  * "this failed once and may still be delivered" from "this is over, and here is why". */
 const TERMINATED_STATUS = 'failed(final)';
+/* A restart performed OUTSIDE this component (a manual relaunch, an operator script) never runs the
+ * barrier's commit, so every registered continuation stays status:"waiting" forever and the user is
+ * told "已重启" while their conversation silently does not continue — measured 2026-10-26. Such a
+ * task is adopted on the next boot: it was created by a DIFFERENT process, it is older than a minute
+ * (so a continuation registered moments ago is never stolen), and at most ADOPT_LIMIT are adopted so
+ * a stale queue cannot turn one boot into a flood. */
+const ADOPT_MIN_AGE_MS = 60000;
+const ADOPT_LIMIT = 8;
 
 export function createHeartBeat({ root, core, agents, goals = () => null, controller = createRestartController(root), probe = probeDesktop, pid = process.pid, version, logger, now = Date.now }) {
   const failures = createErrorLog({root,logger});
+  /**
+   * The version a restart should end up running: the one ON DISK, not the one this process was
+   * built from. "Install the new package, then restart" is the normal path, and preparing with the
+   * running version made the restart controller refuse with 安装版本未通过核验 every time the two
+   * differed — which is exactly when a restart matters.
+   */
+  const installedVersion = () => {
+    try { return JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version || version; }
+    catch { return version; }
+  };
   const store = durableState(path.join(root, 'heartBeat', 'state.json'), { schema: 3, tasks: [], receipts: [], terminated: [], intent: null, intents: [] });
   // Retire the previous delivered marker into a permanent consumption receipt.
   if(store.read().tasks.some(t=>t.status==='delivered')) store.change(s=>{s.receipts ||= [];for(const t of s.tasks.filter(t=>t.status==='delivered'))if(!s.receipts.some(r=>r.id===t.id))s.receipts.push({id:t.id,delivered:t.delivered||Date.now()});s.tasks=s.tasks.filter(t=>t.status!=='delivered');s.schema=3;});
   let pumping = false, stopped = false;
+  // A continuation registered by an earlier process is evidence that a restart was intended. If this
+  // process is that restart (whatever performed it), the task must be delivered here instead of
+  // waiting for a helper that will never report.
+  const adopted = [];
+  store.change(s => {
+    for (const task of s.tasks) {
+      if (task.status !== 'waiting' || task.creatorPid === pid) continue;
+      if (Date.now() - (Number(task.created) || 0) < ADOPT_MIN_AGE_MS) continue;
+      if (adopted.length >= ADOPT_LIMIT) break;
+      Object.assign(task, { status: 'armed', restartPid: null, folder: null, adoptedAt: Date.now() });
+      adopted.push(task.id);
+    }
+    s.schema = 3;
+  });
 
   /* ------------------------------------------------------------------ participants --- */
   // "Running conversation" is read from the host, never from a caller's argument: a barrier whose
@@ -106,6 +138,13 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
   const enqueue = (prompt, destination, agent) => {
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000) throw Error('重启任务须为 1–16000 字符');
     if (typeof destination !== 'string' || !destination) throw Error('重启任务需要目标对话');
+    // ONE pending continuation per (destination, prompt). The barrier's auto registration and the
+    // update route's wokenByUpdate both enqueue the SAME continuation text for the same session;
+    // measured 2026-10-26 20:32: that produced two identical continuation messages for one restart,
+    // and the conversation was woken twice for it. A second registration with identical content is
+    // the same promise, not a new one.
+    const duplicate = store.read().tasks.find(t => t.destination === destination && t.prompt === prompt && (t.status === 'waiting' || t.status === 'armed'));
+    if (duplicate) return { ok: true, id: duplicate.id, destination, duplicate: true };
     const modelSelection=conversationModel(agent);
     const id = randomUUID(); store.change(s => { if(s.tasks.length >= 2000) throw Error('heartBeat 任务队列已达容量上限'); s.tasks.push({ id, prompt, destination, status: 'waiting', created: Date.now(), creatorPid: pid,...modelSelection?{modelSelection}:{} }); }); return { ok: true, id, destination };
   };
@@ -290,7 +329,7 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
     const acks = ackedOf(store.read().intent);
     let prepared, helper;
     try {
-      prepared = await controller.prepare(version);
+      prepared = await controller.prepare(installedVersion());
       helper = await controller.restart(prepared.ticket);
     } catch (error) {
       // The launch failed, so the run must be exactly as it was: still preparing, still abortable.
@@ -454,13 +493,31 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
       // An open barrier is a promise to other conversations; an immediate restart would break it.
       const running = activeIntent();
       if (running) throw Error('已有一个进行中的两阶段重启准备（intentId=' + running.id + '），请先提交或等它结束');
-      const prepared = await controller.prepare(version); return this.restart(prepared.ticket);
+      const prepared = await controller.prepare(installedVersion()); return this.restart(prepared.ticket);
     },
     beginBarrier, commitBarrier, cancelBarrier, acknowledge, barrierState,
     async tick() {
       if (pumping || stopped) return; pumping = true;
       const delivered = [];
       try {
+        /* Adopted continuations have no restart helper behind them: this boot IS the new process.
+         * Deliver once, then consume the record; a failure is counted like any other and the task is
+         * terminated after DELIVERY_FAILURE_LIMIT so a destination that can never be resumed does not
+         * retry for the life of the machine. */
+        for (const task of store.read().tasks.filter(t => t.status === 'armed' && !t.folder)) {
+          try {
+            if (task.destination === 'newmate') {
+              if (!core()?.newMate) continue;
+              core().newMate.enqueue(task.prompt, 'newmate', task.id);
+            } else await deliverConversation(agents(), task.destination, task);
+            delivered.push(task.id);
+            store.change(s => { s.receipts ||= []; if (!s.receipts.some(r => r.id === task.id)) s.receipts.push({ id: task.id, delivered: Date.now(), adopted: true }); s.tasks = s.tasks.filter(t => t.id !== task.id); s.schema = 3; });
+          } catch (error) {
+            const attempts = (task.failures || 0) + 1;
+            if (attempts >= DELIVERY_FAILURE_LIMIT) { terminateTask(task, String(error?.message ?? error), attempts); continue; }
+            store.change(s => { const target = s.tasks.find(t => t.id === task.id); if (target) { target.error = String(error?.message ?? error); target.failures = attempts; } s.schema = 3; });
+          }
+        }
         for (const task of store.read().tasks.filter(t => t.status === 'armed' && t.restartPid !== pid)) {
           /* One FAILED delivery attempt, counted in the durable record. At DELIVERY_FAILURE_LIMIT the
            * task is terminated instead of retried: either the restart happened and the delivery keeps

@@ -2,36 +2,85 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { durableState } from '../../lib/durable-state.js';
-import { currentConversation, deliverConversation } from '../../lib/conversation-delivery.js';
+import { currentConversation, deliverConversation, conversationPaused, conversationModel } from '../../lib/conversation-delivery.js';
 import { classifyToolResult } from '../agent-api/lib/contract.js';
 import { createErrorLog } from '../../lib/errors.js';
 import { withNewMateContext } from '../../lib/newmate-context.js';
 import { createMemoryContext } from './lib/memory-context.js';
-import { computerUseCaller, withComputerUseCaller } from '../../lib/cu-caller.js';
+import { computerUseCaller, withComputerUseCaller, withComputerUseOwner } from '../../lib/cu-caller.js';
+import { createLoopStatus } from './lib/agent-loop.js';
+import { NEWMATE_SEARCH_TOOL } from './lib/web-search.js';
+import { NEWMATE_ASK_TOOL, ASK_MIN_OPTIONS, ASK_MAX_OPTIONS, ASK_QUESTION_MAX_CHARS, ASK_LABEL_MAX_CHARS } from './lib/ask.js';
 import {PROACTIVE_STYLE,proactiveMessageGate} from './lib/proactive-message.js';
 import {threadHandoff,shouldRotate} from './lib/thread-handoff.js';
 import {todoInput,todoMessageId} from './lib/todo-list.js';
-import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet} from './lib/initiative.js';
+import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet,paceThreshold,paceTimeWeight} from './lib/initiative.js';
+import { MONITOR_DEFAULTS, evaluateWorkspaces, settle } from './lib/workspace-diff.js';
 
 
 /**
- * The tool group a NewMate run may use. ONE list, read three ways: it is the run's allow list, it
- * is the group whose schemas initialization describes, and it is what the gates compare against.
+ * The tool group a NewMate run may use. ONE list, read four ways: it is the group a run's allow
+ * list is drawn from, it is the group whose schemas initialization describes, it is the source of
+ * the ComputerUse names the lease rule keys on, and it is what the gates compare against.
  *
  * Names only - never schemas - because the schema must come from the LIVE registry: a tool this
  * bundle registers and a tool a plugin provides are described the same way, and a name the
  * current exposure does not carry is reported as missing instead of being described as callable.
- * newmate_task is in the group but only allowed on turns bound to an origin conversation; the
- * persona states that condition, so the schema is not a grant.
+ *
+ * TWO NAMES ARE CONDITIONAL, and both conditions come from the persona rather than from the
+ * registry:
+ *   newmate_task                    only on turns bound to an origin conversation
+ *   computer_use / screen_capture / newmate_search   only on a run a person asked for - a
+ *                                   chat turn, or a todo activation the user scheduled -
+ *                                   because an autonomous check-in has no request behind it and
+ *                                   neither a desktop takeover nor a web lookup belongs to it.
+ * The schema projection still describes both, because the group is the whole surface NewMate may
+ * ever use; a schema is not a grant, and `newMateRunTools` is what one run is offered.
  */
 export const NEWMATE_RUN_TOOLS = Object.freeze([
   'memory_lab_read', 'memory_lab_query', 'memory_lab_root_tags', 'memory_lab_subtag_tree',
   'memory_lab_update', 'memory_lab_reindex', 'memory_lab_tag_review', 'memory_lab_tag_apply',
   'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size',
-  'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel', 'newmate_task',
+  'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel',
+  'computer_use', 'screen_capture', NEWMATE_SEARCH_TOOL, NEWMATE_ASK_TOOL, 'compact_context', 'newmate_task',
+  'newmate_conversation_new', 'newmate_conversation_send', 'newmate_conversation_read',
 ]);
-export function createNewMate({ root, tools, agents, now = Date.now, logger, onNotify = async () => {}, onCompanion = async () => {}, onPresence = () => {}, environment=()=>({ready:true,idleMs:2*MINUTE}) }) {
+
+/** The two ComputerUse tools, and the owner label every NewMate lease carries. */
+export const NEWMATE_CU_TOOLS = Object.freeze(['computer_use', 'screen_capture']);
+/**
+ * The group members a PERSON must have asked for: a desktop takeover and a web lookup are both
+ * actions against the outside world, not background bookkeeping. A run constructor withholds
+ * them from every autonomous check, and the persona states the same boundary.
+ */
+export const NEWMATE_REQUEST_TOOLS = Object.freeze([...NEWMATE_CU_TOOLS, NEWMATE_SEARCH_TOOL, NEWMATE_ASK_TOOL]);
+/**
+ * The ComputerUse owner a NewMate run binds for its whole duration.
+ *
+ * Not the requesting conversation's session id, and not the shared 'dsh' fallback. A lease has no
+ * expiry and is released only by its own owner, so a stable NewMate label is what makes the
+ * release path safe: NewMate can release a lease it took, and cannot release - or be confused
+ * with - the lease of the conversation that asked it to work.
+ */
+export const NEWMATE_CU_OWNER = 'newmate';
+/** The bound on one lease-release call; a stuck backend must not hold the task queue open. */
+export const NEWMATE_CU_RELEASE_TIMEOUT_MS = 8000;
+
+/**
+ * The exact allow list one run is offered.
+ *
+ * `automatic` is the run a scheduled self-check starts (self_activation / measurement); it gets
+ * no ComputerUse tools and no `newmate_task`. `origin` is the DSH conversation the task is bound
+ * to, and only a user-initiated turn can carry `newmate_task` back to it.
+ */
+export function newMateRunTools({ automatic = false, origin } = {}) {
+  const offered = NEWMATE_RUN_TOOLS.filter((name) => name !== 'newmate_task' && (!automatic || !NEWMATE_REQUEST_TOOLS.includes(name)));
+  return !automatic && origin ? [...offered, 'newmate_task'] : offered;
+}
+export function createNewMate({ root, tools, agents, goals = () => null, now = Date.now, logger, onNotify = async () => {}, onCompanion = async () => {}, onPresence = () => {}, environment=()=>({ready:true,idleMs:2*MINUTE}) }) {
   const failures = createErrorLog({root,logger});
+  // The live view of the run in flight: what the page, newmate_state and the MCP status read.
+  const live = createLoopStatus(now);
   // The initialization payload is built once at construction and rebuilt whenever memory moves.
   // It carries the persona, the complete tag tree, every short row and the memory tool-group schema;
   // bodies stay on demand. The schema source is the LIVE registry this process registered, not a copy.
@@ -47,6 +96,20 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
   if(!initial.initiative||initial.initiative.enabledAt===undefined||Object.keys(INITIATIVE_DEFAULTS).some(k=>initial.settings[k]===undefined))store.change(s=>{
     s.settings={...INITIATIVE_DEFAULTS,...s.settings};s.initiative ||= {nextAttemptAt:now()+20*MINUTE,lastUserAt:Math.max(0,...s.messages.filter(m=>m.role==='user').map(m=>m.at||0)),lastMessageAt:0,unanswered:0,attempts:0,sent:0,day:'',signals:[]};s.initiative.enabledAt??=now();
   });
+  /**
+   * The workspace monitor's durable half: the last snapshot per workspace and the accumulator that
+   * survives a restart. It lives in the same state file as everything else, so the start-up
+   * comparison (the first of the user's five requirements) compares against what the PREVIOUS run
+   * saw, not against nothing.
+   */
+  if(!store.read().watch||typeof store.read().watch!=='object')store.change(s=>{s.watch={snapshots:{},acc:0,runs:0,lastRunAt:0,lastScore:0,lastDescription:'',lastEvent:null};});
+  // The monitor's knobs are NewMate settings (the user's requirement 5: configurable in the plugin
+  // settings). They are seeded once so the settings page reads a real value rather than a default
+  // it has to invent, and a missing key never changes behaviour.
+  // The threshold became the initiative level's business, so a value left in an old state file is
+  // removed rather than left visible as a setting nothing reads any more.
+  if(store.read().settings.watchThreshold!==undefined)store.change(s=>{delete s.settings.watchThreshold;});
+  if(['watchEnabled','watchIntervalMinutes','watchDepth','watchDshWeight'].some(key=>store.read().settings[key]===undefined))store.change(s=>{s.settings={watchEnabled:true,watchIntervalMinutes:MONITOR_DEFAULTS.intervalMinutes,watchDepth:MONITOR_DEFAULTS.depth,watchDshWeight:MONITOR_DEFAULTS.dshWeight,...s.settings};});
   const bootReadyAt=now()+2*MINUTE;
   if(!Array.isArray(store.read().todos))store.change(s=>{s.todos=[];});
   // Notification always follows the durable message receipt. Never notify it again on restart.
@@ -105,12 +168,92 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
     });
     return { ok: true, id };
   };
+  /** A durable task's outcome as the live view's phase. The task record is the authority. */
+  const liveOutcome = (status) => status === 'completed' ? 'done' : status === 'failed' ? 'failed' : status === 'paused' ? 'paused' : status === 'interrupted' ? 'interrupted' : status === 'pending' ? 'superseded' : 'done';
+
+  /**
+   * Release any ComputerUse lease this run took, before the task is reported settled.
+   *
+   * A lease has no expiry and only its own owner can release it, so a run that ends - answered,
+   * failed, cancelled, superseded - while holding one would leave the desktop in takeover with
+   * an overlay (or a hidden desktop) that nothing will reclaim. The persona tells the model to
+   * call `takeover_stop` itself, and this is the runtime half that does not depend on the model
+   * remembering: the same owner label the run bound, so it is the run's own lease or nothing.
+   *
+   * Both modes are asked because one call releases one slot, and a run may have used either.
+   * The stop is a no-op when no lease is held, a refusal when another owner holds it (that
+   * owner's lease is untouched), and it is bounded: a wedged backend must not hold the queue.
+   * The clock that settles the run is started after this, so the live view says 'releasing'
+   * while it runs rather than claiming the turn is over.
+   */
+  async function releaseComputerUse(taskId) {
+    if (!live.used('computer_use')) return;
+    live.note('releasing');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NEWMATE_CU_RELEASE_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      for (const mouse_mode of ['real', 'virtual']) {
+        try {
+          await withComputerUseOwner(NEWMATE_CU_OWNER, () => tools.execute({
+            callId: `newmate-release:${taskId}:${mouse_mode}`,
+            name: 'computer_use',
+            arguments: { action: 'takeover_stop', mouse_mode },
+            signal: controller.signal,
+          }));
+        } catch (error) {
+          failures.record({ where: 'newmate/computeruse-release', code: error.code || 'computeruse_release_failed', message: String(error.message), fields: { mouseMode: mouse_mode } });
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+      live.cleaned();
+    }
+  }
+
+  /**
+   * The conversation this run answers for, as the conversation tools read it.
+   *
+   * It is captured into the run's ALS context (not passed as tool arguments) because a tool call
+   * never carries the invoking conversation: the model must not be able to retarget a delivery or a
+   * new conversation by writing a different session id. `newmate_task` already works this way -
+   * identity comes from the host, never from model input - and these three tools follow it.
+   */
+  function conversationOf(task) {
+    const origin = typeof task?.origin === 'string' && task.origin ? task.origin : undefined;
+    if (!origin) return { origin: undefined };
+    let agent;
+    try { agent = agents()?.get?.(origin); } catch { agent = undefined; }
+    const header = agent?.session?.header;
+    let model;
+    try { model = agent ? conversationModel(agent) : null; } catch { model = null; }
+    return {
+      origin,
+      cwd: typeof header?.cwd === 'string' ? header.cwd : undefined,
+      preset: typeof header?.agentPreset === 'string' ? header.agentPreset : undefined,
+      ...model ? { model } : {},
+    };
+  }
+
   async function tick() {
     if (running || stopped || todoDelivering) return;
     const todoState=store.read();if(todoState.settings.companion&&todoState.todos.some(t=>t.status==='pending'&&t.activateAt<=now())){todoDelivering=true;try{await deliverDueTodo();}finally{todoDelivering=false;}if(stopped)return;}
     if(now()-lastProbeAt>=MINUTE){lastProbeAt=now();probeInitiative();}
     const task = store.read().tasks.find(t => t.kind==='chat'&&t.status==='pending')||store.read().tasks.find(t => t.status === 'pending'&&(t.kind!=='todo_activation'||todoActivationReady()));
     if (!task) return;
+    /**
+     * A wake (`newmate_task`) hands work back into a DSH conversation and the host runs a turn
+     * there. That turn is the user's, so a conversation the user PAUSED must not be woken - the same
+     * rule heartbeat already enforces for restart participants. The answer is asked before the run
+     * starts, not after: deferring needs no live view, and the task simply stays pending and is
+     * re-checked on the next tick, so resuming the goal releases the delivery without a new request.
+     * An unloaded conversation has no goal to read (agents.get is undefined), and that is not
+     * evidence of a pause: deliver.
+     */
+    if (task.destination !== 'newmate' && conversationPaused(goals(), agents()?.get?.(task.destination))) {
+      store.change(s => { Object.assign(s.tasks.find(t => t.id === task.id), { deferred: 'target_paused' }); });
+      return;
+    }
     running = true; active = new AbortController();activeTask=task;manualRestart=false;userPreempted=false;guide={pending:[],drain(){return this.pending.splice(0);}};
     const automatic=task.kind==='measurement'||task.kind==='self_activation',delegated=task.kind==='todo_activation',unsolicited=task.kind!=='chat';activeAutomatic=automatic||delegated;
     try {
@@ -118,14 +261,15 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
       store.change(s => { s.tasks.find(t => t.id === task.id).status = 'running'; });
       if (task.destination !== 'newmate') await deliverConversation(agents(), task.destination, task, active.signal);
       else {
+        live.start(task);
         const recent=store.read().messages.filter(m=>m.threadId===task.threadId);
         const history = automatic?recent.slice(-6).map(({role,text,at,proactive})=>({role,text:text.slice(0,500),at,proactive})):recent.slice(-12);
         const memory = nativeMemory();
-        const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)}},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
-          prompt: `当前时间：${new Date(now()).toISOString()}；本机时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}。你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE:''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
-          tools: { allow: [...NEWMATE_RUN_TOOLS.filter((name)=>name!=='newmate_task'), ...(!automatic&&task.origin?['newmate_task']:[])] }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:8,
+        const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseOwner(NEWMATE_CU_OWNER,()=>withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,conversation:conversationOf(task),steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)},onEvent:event=>live.event(event)},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
+          prompt: `当前时间：${new Date(now()).toISOString()}；本机时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}。你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：${store.read().watch?.lastDescription||'（本机尚无对比结果）'}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪些文件新增/改动、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。':''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
+          tools: { allow: newMateRunTools({automatic,origin:task.origin}) }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:0,
           ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:240},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
-        }, signal: active.signal })));
+        }, signal: active.signal }))));
         active.signal.throwIfAborted();
         // A guide arriving after the loop ended must never publish an obsolete answer.
         if(guide.pending.length){store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.status='pending';t.prompt=guide.pending.map(m=>m.content[0].text).join('\n');});return;}
@@ -149,12 +293,19 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
           await notify(message);
         }else store.change(s=>{s.initiative.lastOutcome=suppression;s.tasks.find(t=>t.id===task.id).suppressed=suppression;});
       }
-      store.change(s => { Object.assign(s.tasks.find(t => t.id === task.id),{status:'completed',finished:now()});if(task.todoId)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:s.messages.some(m=>m.id===task.id)?'completed':'failed',completedAt:now(),messageId:s.messages.some(m=>m.id===task.id)?task.id:null,...!s.messages.some(m=>m.id===task.id)?{error:'运行已结束，但回复被主动消息格式规则抑制'}:{}}); });
+      store.change(s => { const settled=s.tasks.find(t => t.id === task.id);Object.assign(settled,{status:'completed',finished:now()});delete settled.deferred;if(task.todoId)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:s.messages.some(m=>m.id===task.id)?'completed':'failed',completedAt:now(),messageId:s.messages.some(m=>m.id===task.id)?task.id:null,...!s.messages.some(m=>m.id===task.id)?{error:'运行已结束，但回复被主动消息格式规则抑制'}:{}}); });
     } catch (error) {
       const paused=automatic&&active.signal.aborted&&!stopped;
       if (!stopped&&!paused&&!manualRestart&&!userPreempted) failures.record({where:'newmate/task',code:error.code || 'task_failed',message:String(error.message),fields:{taskId:task.id}});
-      store.change(s => { Object.assign(s.tasks.find(t => t.id === task.id), { status: manualRestart?'pending':userPreempted?'interrupted':paused?'paused':stopped ? 'interrupted' : 'failed', error: manualRestart?'已切换为用户引导':userPreempted?'用户已切换到新对话':paused?'主动陪伴已暂停':String(error.message), finished: now() });if(task.todoId&&!manualRestart)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:'failed',error:String(error.message)});if(automatic)s.initiative.lastOutcome=manualRestart?'user_steer':paused?'paused':stopped?'interrupted':'failed'; });
-    } finally { running = false;activeAutomatic=false;activeTask=null;guide=null;if(!stopped&&store.read().tasks.some(t=>t.kind==='chat'&&t.status==='pending'))queueMicrotask(()=>tick().catch(e=>logger?.warn?.(e.message))); }
+      store.change(s => { const attempted=s.tasks.find(t => t.id === task.id);delete attempted.deferred;Object.assign(attempted, { status: manualRestart?'pending':userPreempted?'interrupted':paused?'paused':stopped ? 'interrupted' : 'failed', error: manualRestart?'已切换为用户引导':userPreempted?'用户已切换到新对话':paused?'主动陪伴已暂停':String(error.message), finished: now() });if(task.todoId&&!manualRestart)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:'failed',error:String(error.message)});if(automatic)s.initiative.lastOutcome=manualRestart?'user_steer':paused?'paused':stopped?'interrupted':'failed'; });
+    } finally {
+      // A lease outlives the turn that took it, so it is released HERE, before the task is
+      // reported settled: an unattended companion must not leave the desktop in takeover.
+      await releaseComputerUse(task.id);
+      const settled = store.read().tasks.find(t => t.id === task.id);
+      live.finish({ phase: liveOutcome(settled?.status), error: settled?.error ?? null });
+      running = false;activeAutomatic=false;activeTask=null;guide=null;if(!stopped&&store.read().tasks.some(t=>t.kind==='chat'&&t.status==='pending'))queueMicrotask(()=>tick().catch(e=>logger?.warn?.(e.message)));
+    }
   }
   function rotateForMessage(topic,text){
     const state=store.read(),env=environment();const reason=threadHandoff(state,now(),{topic,focused:readingUntil>now()||env.readerFocused,draft:state.attention?.[state.activeThreadId]?.draftUntil>now(),busy:state.tasks.some(t=>t.kind==='chat'&&['pending','running'].includes(t.status)),engagedAt});
@@ -177,14 +328,178 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
   // Interrupted runs are retained and await explicit retry: no automatic duplicate model spend.
   if (store.read().tasks.some(t => t.status === 'running')) store.change(s => { for (const t of s.tasks) if (t.status === 'running') { t.status = 'interrupted'; t.error = '宿主在任务完成前退出，可显式重试'; } });
   if(store.read().todos.some(t=>t.status==='activated'))store.change(s=>{for(const t of s.todos.filter(t=>t.status==='activated')){const message=s.messages.find(m=>m.id===t.taskId),task=s.tasks.find(task=>task.id===t.taskId);if(message){Object.assign(t,{status:'completed',completedAt:message.at,messageId:message.id});if(task)Object.assign(task,{status:'completed',finished:message.at});}else if(!task||['failed','interrupted','cancelled'].includes(task.status))Object.assign(t,{status:'failed',error:task?.error||'激活任务已中断，未自动重试'});}});
+  /**
+   * THE OPTION QUESTION: one at a time, blocking the run, answered from the page.
+   *
+   * Newmark's ask design is a tool-shaped question: the run stops at the call, the page renders an
+   * option block, and the answer is the tool result, so the SAME run continues with the user's
+   * choice. The heavy conversation kernel is deliberately not part of this: only the page
+   * presentation and this one waiting seam are reused. A question is never durable - a restart
+   * interrupts the run, so the page and the answer live in memory only.
+   */
+  let pendingAsk = null;
+  function settleAsk(result) {
+    const current = pendingAsk;
+    if (!current) return null;
+    pendingAsk = null;
+    current.removeAbort?.();
+    current.resolve(result);
+    return current;
+  }
+  async function ask(args, execution) {
+    if (pendingAsk) return { ok: false, code: 'question_already_pending', error: 'another question is already waiting for the user' };
+    const question = typeof args?.question === 'string' ? args.question.trim() : '';
+    const raw = Array.isArray(args?.options) ? args.options : [];
+    const options = raw.map((option) => ({ label: String(option?.label ?? '').trim(), ...(typeof option?.description === 'string' && option.description.trim() ? { description: option.description.trim() } : {}) }));
+    const problem = !question ? 'question is empty'
+      : question.length > ASK_QUESTION_MAX_CHARS ? 'question is too long'
+        : raw.length < ASK_MIN_OPTIONS ? 'at least ' + ASK_MIN_OPTIONS + ' options are required'
+          : raw.length > ASK_MAX_OPTIONS ? 'at most ' + ASK_MAX_OPTIONS + ' options are allowed'
+            : options.some((option) => !option.label || option.label.length > ASK_LABEL_MAX_CHARS) ? 'each option needs a non-empty label within the limit'
+              : new Set(options.map((option) => option.label)).size !== options.length ? 'option labels must be unique' : '';
+    if (problem) return { ok: false, code: 'invalid_question', error: problem };
+    if (execution?.signal?.aborted) return { ok: false, code: 'question_aborted', error: 'the run was cancelled before the question was shown', questionId: null };
+    const id = randomUUID();
+    return new Promise((resolve) => {
+      const onAbort = () => settleAsk({ ok: false, code: 'question_aborted', error: 'the run was cancelled before the user answered', questionId: id });
+      execution?.signal?.addEventListener?.('abort', onAbort, { once: true });
+      pendingAsk = { id, question, options, createdAt: now(), resolve, removeAbort: () => execution?.signal?.removeEventListener?.('abort', onAbort) };
+    });
+  }
+  function answerQuestion(input) {
+    if (!pendingAsk || pendingAsk.id !== String(input?.id ?? '')) return { ok: false, error: '没有等待回答的问题，或问题已过期' };
+    const label = typeof input?.label === 'string' ? input.label : '';
+    const text = typeof input?.text === 'string' ? input.text.trim() : '';
+    let answer = null;
+    if (label && pendingAsk.options.some((option) => option.label === label)) answer = { label };
+    else if (text) answer = { text };
+    else return { ok: false, error: '请选择一个选项或输入回答' };
+    const current = settleAsk({ ok: true, questionId: pendingAsk.id, answer });
+    return { ok: true, questionId: current.id, answer };
+  }
+  function pendingQuestion() {
+    return pendingAsk ? { id: pendingAsk.id, question: pendingAsk.question, options: pendingAsk.options, allowsManual: true, createdAt: pendingAsk.createdAt } : null;
+  }
+
+  /** The monitor's knobs, read from NewMate's own settings so the settings page and the file agree. */
+  function watchSettings(settings) {
+    return {
+      enabled: settings?.watchEnabled !== false,
+      intervalMinutes: Number.isInteger(settings?.watchIntervalMinutes) ? Math.min(Math.max(settings.watchIntervalMinutes, 5), 1440) : MONITOR_DEFAULTS.intervalMinutes,
+      // The threshold is not its own setting any more: it follows the initiative level, so "how
+      // active am I" is one choice instead of two that can contradict each other.
+      threshold: paceThreshold(settings?.pace),
+      depth: Number.isInteger(settings?.watchDepth) ? Math.min(Math.max(settings.watchDepth, 0), 6) : MONITOR_DEFAULTS.depth,
+      // How much a change made during a DSH turn still counts. 0 = ignore it entirely, 1 = no
+      // distinction; the default 0.1 is the user's "大幅降低".
+      dshWeight: typeof settings?.watchDshWeight === 'number' && Number.isFinite(settings.watchDshWeight) ? Math.min(Math.max(settings.watchDshWeight, 0), 1) : MONITOR_DEFAULTS.dshWeight,
+    };
+  }
+
+  /**
+   * ONE comparison pass: scan the workspaces, diff against the last snapshot, score, accumulate.
+   *
+   * Called once at start-up (the user's requirement 1) and on the interval (requirement 2). When the
+   * accumulated score crosses the threshold it pushes ONE signal and asks the initiative gate for a
+   * check-in - the same gate that governs every other unsolicited message, so quiet hours, pacing
+   * and the daily budget still decide whether anything is said. The accumulator resets only on a
+   * fire, so small changes add up (requirement 4).
+   */
+  function sweepWorkspaces(roots = []) {
+    const state = store.read(), settings = state.settings, watch = watchSettings(settings);
+    if (!watch.enabled) return { ok: true, skipped: 'disabled', intervalMinutes: watch.intervalMinutes };
+    if (!settings.companion) return { ok: true, skipped: 'companion_off', intervalMinutes: watch.intervalMinutes };
+    const monitored = (Array.isArray(roots) ? roots : []).filter((root) => typeof root === 'string' && path.isAbsolute(root)).slice(0, MONITOR_DEFAULTS.maxWorkspaces);
+    if (!monitored.length) return { ok: true, skipped: 'no_workspace', intervalMinutes: watch.intervalMinutes };
+    const previous = state.watch?.snapshots || {}, acc = Number(state.watch?.acc) || 0, at = now();
+    const windows = Array.isArray(state.watch?.dshWindows) ? state.watch.dshWindows : [];
+    const evaluated = evaluateWorkspaces({ roots: monitored, previous, settings: watch, at, windows });
+    /**
+     * TIME IS PART OF THE EVIDENCE, per the user's instruction to fuse "很久没有交流" with "文件变了".
+     * The file score answers "did work happen"; the time score answers "has it been quiet for long
+     * enough that a word is warranted". Each level decides how much an hour of quiet is worth
+     * (timeWeight) and how much total evidence is needed (threshold), and there is no daily quota.
+     */
+    const pace = PACES[settings.pace] || PACES.balanced;
+    const lastContact = Math.max(Number(state.initiative?.lastUserAt) || 0, Number(state.initiative?.lastMessageAt) || 0, Number(state.initiative?.lastReadAt) || 0, Number(state.initiative?.enabledAt) || 0);
+    // Saturated at one day: "quiet since 1970" on a fresh install is not evidence of anything.
+    const idleMs = Math.max(0, Math.min(DAY, at - lastContact));
+    const timeScore = Math.min(1, idleMs / pace.gap) * paceTimeWeight(settings.pace);
+    const score = Math.min(1, evaluated.score + timeScore);
+    const settled = settle(acc, score, { threshold: watch.threshold });
+    const fire = settled.fire && score > 0;
+    const notable = evaluated.perWorkspace.filter((entry) => entry.changedNames > 0 || entry.countDelta > 0 || entry.timeDelta > 0);
+    store.change((s) => {
+      s.watch = {
+        snapshots: evaluated.snapshots,
+        acc: settled.accumulated,
+        dshWindows: Array.isArray(s.watch?.dshWindows) ? s.watch.dshWindows : [],
+        runs: (s.watch?.runs || 0) + 1,
+        lastRunAt: at,
+        lastScore: score,
+        lastFileScore: evaluated.score,
+        lastTimeScore: timeScore,
+        lastIdleMs: idleMs,
+        lastDescription: evaluated.description || '',
+        lastEvent: fire ? { at, reached: settled.at, description: evaluated.description, workspaces: notable.map((entry) => ({ root: entry.root, added: entry.added, removed: entry.removed, changed: entry.changed, countDelta: entry.countDelta, timeDelta: entry.timeDelta })) } : (s.watch?.lastEvent || null),
+      };
+      if (fire) {
+        const signals = (s.initiative.signals || []).filter((signal) => signal?.kind !== 'workspace-diff');
+        signals.push({ kind: 'workspace-diff', at, score: Number(settled.at.toFixed(3)), fileScore: Number(evaluated.score.toFixed(3)), timeScore: Number(timeScore.toFixed(3)), idleMs, description: evaluated.description });
+        s.initiative.signals = signals.slice(-8);
+      }
+    });
+    if (fire) probeInitiative();
+    return {
+      ok: true, fired: fire, score: Number(score.toFixed(4)), fileScore: Number(evaluated.score.toFixed(4)), timeScore: Number(timeScore.toFixed(4)), idleMs,
+      accumulated: Number(settled.accumulated.toFixed(4)),
+      threshold: watch.threshold, at, description: evaluated.description,
+      workspaces: evaluated.perWorkspace.map((entry) => ({ root: entry.root, first: entry.first, added: entry.added, removed: entry.removed, changed: entry.changed, user: entry.user, dsh: entry.dsh, dshWeight: entry.dshWeight, countDelta: entry.countDelta, timeDelta: entry.timeDelta })),
+    };
+  }
+
+  /**
+   * Record that a DSH turn is running in these workspace roots right now.
+   *
+   * The monitor cannot see WHO wrote a file, but it can see WHEN: a file whose mtime falls inside a
+   * window when a turn was running is attributed to DSH and weighted down (default 0.1). Windows are
+   * extended while turns keep running and pruned after a day, so the table cannot grow without bound.
+   */
+  function noteDshActivity(roots = [], at = now()) {
+    const active = (Array.isArray(roots) ? roots : []).filter((root) => typeof root === 'string' && path.isAbsolute(root));
+    if (!active.length) return { ok: true, windows: 0 };
+    store.change((s) => {
+      const windows = Array.isArray(s.watch?.dshWindows) ? s.watch.dshWindows.filter((window) => at - (Number(window.to) || 0) < DAY) : [];
+      for (const root of active) {
+        const open = windows.find((window) => window.root === root && at - (Number(window.to) || 0) <= 10000);
+        if (open) open.to = Math.max(Number(open.to) || 0, at);
+        else windows.push({ root, from: at, to: at });
+      }
+      s.watch = { ...(s.watch || {}), dshWindows: windows.slice(-64), dshActiveAt: at };
+    });
+    return { ok: true, windows: active.length };
+  }
+
+  /** The monitor as data, for the state route and the settings page. */
+  function watchStatus() {
+    const state = store.read(), watch = watchSettings(state.settings), monitored = state.watch || {};
+    return {
+      enabled: watch.enabled, intervalMinutes: watch.intervalMinutes, threshold: watch.threshold, thresholdFromPace: true, pace: state.settings.pace || 'balanced', depth: watch.depth, dshWeight: watch.dshWeight,
+      companion: state.settings.companion === true, acc: Number(monitored.acc) || 0, runs: Number(monitored.runs) || 0,
+      lastRunAt: monitored.lastRunAt || 0, lastScore: monitored.lastScore || 0, lastDescription: monitored.lastDescription || '',
+      lastEvent: monitored.lastEvent || null, workspaces: Object.keys(monitored.snapshots || {}),
+    };
+  }
+
   return {
+    sweepWorkspaces, watchStatus, noteDshActivity,
     todoAdd(input,execution,source='agent'){const value=todoInput(input,now()),id=randomUUID();store.change(s=>{if(s.todos.length>=2000||s.todos.filter(t=>['pending','delivering'].includes(t.status)).length>=100)throw Error('待办列表已达到容量上限');s.todos.push({id,...value,created:now(),status:'pending',source,origin:computerUseCaller(execution)||undefined});});return{ok:true,todo:store.read().todos.find(t=>t.id===id)};},
     todoList(){return{ok:true,todos:store.read().todos};},
     todoCancel(id){store.change(s=>{const t=s.todos.find(t=>t.id===id);if(!t||!['pending','failed'].includes(t.status))throw Error('该待办不存在、已投递或正在投递');t.status='cancelled';t.cancelledAt=now();});return{ok:true,id};},
-    state: store.read, enqueue, tick, initiativeStatus(){const s=store.read(),env=environment();return{...initiativeGate(s.settings,s.initiative,now(),{...env,busy:env.busy||running||s.tasks.some(t=>['pending','running'].includes(t.status))},engagedAt,bootReadyAt),nextAttemptAt:s.initiative.nextAttemptAt,lastReason:s.initiative.lastReason,lastOutcome:s.initiative.lastOutcome};},stop() { stopped = true; active?.abort(); },
+    state: store.read, loopStatus: () => live.snapshot(), ask, answerQuestion, pendingQuestion, enqueue, tick, initiativeStatus(){const s=store.read(),env=environment();return{...initiativeGate(s.settings,s.initiative,now(),{...env,busy:env.busy||running||s.tasks.some(t=>['pending','running'].includes(t.status))},engagedAt,bootReadyAt),nextAttemptAt:s.initiative.nextAttemptAt,lastReason:s.initiative.lastReason,lastOutcome:s.initiative.lastOutcome};},stop() { stopped = true; settleAsk({ ok: false, code: 'question_aborted', error: 'the companion stopped before the user answered', questionId: null }); active?.abort(); },
     async configure(settings) {
-      if(!settings||Object.keys(settings).some(k=>!['companion','notifications',...Object.keys(INITIATIVE_DEFAULTS)].includes(k)))throw Error('陪伴设置无效');
-      for(const [key,value]of Object.entries(settings)){if(['companion','notifications','initiative'].includes(key)&&typeof value!=='boolean')throw Error('开关无效');if(key==='pace'&&(typeof value!=='string'||!Object.hasOwn(PACES,value)))throw Error('陪伴频率无效');if(['quietStart','quietEnd'].includes(key)&&(!Number.isInteger(value)||value<0||value>23))throw Error('静默时间无效');if(key==='snoozeUntil'&&(!Number.isFinite(value)||value<0||value>now()+7*DAY))throw Error('暂停期限无效');}
+      if(!settings||Object.keys(settings).some(k=>!['companion','notifications','watchEnabled','watchIntervalMinutes','watchDepth','watchDshWeight',...Object.keys(INITIATIVE_DEFAULTS)].includes(k)))throw Error('陪伴设置无效');
+      for(const [key,value]of Object.entries(settings)){if(['companion','notifications','initiative'].includes(key)&&typeof value!=='boolean')throw Error('开关无效');if(key==='pace'&&(typeof value!=='string'||!Object.hasOwn(PACES,value)))throw Error('陪伴频率无效');if(['quietStart','quietEnd'].includes(key)&&(!Number.isInteger(value)||value<0||value>23))throw Error('静默时间无效');if(key==='watchEnabled'&&typeof value!=='boolean')throw Error('监控开关无效');if(key==='watchIntervalMinutes'&&(!Number.isInteger(value)||value<5||value>1440))throw Error('监控间隔须为 5–1440 分钟');if(key==='watchThreshold')throw Error('监控阈值已并入主动性选择，请改 pace');if(key==='watchDepth'&&(!Number.isInteger(value)||value<0||value>6))throw Error('监控深度须为 0–6');if(key==='watchDshWeight'&&(!Number.isFinite(value)||value<0||value>1))throw Error('DSH 变动权重须在 0–1 之间');if(key==='snoozeUntil'&&(!Number.isFinite(value)||value<0||value>now()+7*DAY))throw Error('暂停期限无效');}
       const before=store.read().settings;store.change(s=>{Object.assign(s.settings,settings,{notifications:false});if(settings.companion===false||settings.initiative===false)for(const task of s.tasks)if(['measurement','self_activation'].includes(task.kind)&&task.status==='pending')task.status='paused';});
       if((settings.companion===true&&!before.companion)||(settings.initiative===true&&!before.initiative))store.change(s=>{s.initiative.enabledAt=now();s.initiative.nextAttemptAt=Math.max(s.initiative.nextAttemptAt||0,now()+20*MINUTE);});
       if((settings.companion===false||settings.initiative===false)&&activeAutomatic)active?.abort();
@@ -227,7 +542,7 @@ export function createNewMate({ root, tools, agents, now = Date.now, logger, onN
       }else{
         if(running&&activeTask?.destination==='newmate'&&activeTask.threadId!==selected.id){userPreempted=true;active.abort();}
         const pending=store.read().tasks.find(t=>t.kind==='chat'&&t.threadId===selected.id&&t.status==='pending');
-        if(pending){task={ok:true,id:pending.id};mode='steer';store.change(s=>{s.tasks.find(t=>t.id===pending.id).prompt=text;});}
+        if(pending){task={ok:true,id:pending.id};mode='steer';store.change(s=>{const t=s.tasks.find(t=>t.id===pending.id);t.prompt=[t.prompt,text].filter(Boolean).join('\n');});}
         else {task=enqueue(text,'newmate',randomUUID(),selected.id);store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='chat';if(origin)t.origin=origin;});}
       }
       store.change(s=>{s.messages.push({role:'user',text,threadId:selected.id,at:now(),id:inputId,steerTaskId:task.id});const p=s.initiative;p.lastUserAt=now();p.unanswered=0;p.nextAttemptAt=Math.max(p.nextAttemptAt||0,now()+45*MINUTE);s.attention ||= {};s.attention[selected.id]={...(s.attention[selected.id]||{}),lastFocusedAt:now(),draftUntil:0};const t=s.threads.find(t=>t.id===selected.id);t.updated=now();if(t.title==='新对话')t.title=text.trim().slice(0,32);});

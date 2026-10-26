@@ -244,7 +244,17 @@ export function apply(ctx, config) {
           const input = JSON.parse(raw);
           if (input.action === 'prepare') body = await restart().prepare(input.version);
           else if (input.action === 'restart') {
+            // The helper announces readiness before this response can be written, so a client that
+            // times out while we wait leaves a launched-but-unacknowledged restart behind: the
+            // close handler used to be registered only AFTER the await, so it never ran and the
+            // controller stayed in `starting` forever (measured 2026-10-26: the next prepare
+            // answered 502 "DSH 正在重启" until the process was restarted by hand).
+            let cancelled = false;
+            const onClose = () => { if (!res.writableFinished) cancelled = true; };
+            res.once('close', onClose);
             const helper = await restart().restart(input.ticket, true);
+            res.removeListener('close', onClose);
+            if (cancelled) { helper.cancel(); throw Error('重启响应未送达，DSH 保持运行'); }
             res.once('finish', helper.commit);
             res.once('close', () => { if (!res.writableFinished) helper.cancel(); });
             body = { ok: true, restarting: true };

@@ -216,6 +216,17 @@ export async function streamAssistantResponse(context, config, signal) {
     } else if (event.type === 'error') {
       final = event.error;
       current = final;
+    } else if (event.type === 'thinking') {
+      /**
+       * THE MODEL'S OWN REASONING, streamed while the turn is still running.
+       *
+       * The seam publishes the accumulating reasoning text as it arrives; the loop forwards it
+       * as an event so a caller that watches a run can show what the model is thinking. It is
+       * deliberately NOT part of the assistant message: the provider's reasoning blocks stay in
+       * the message the seam assembles, and this channel exists for the live view only.
+       * The turn is filled by the receiver, which knows it; this layer does not.
+       */
+      await emit(config, { type: 'thinking', turn: null, text: String(event.text ?? '') });
     } else if ('partial' in event) {
       current = event.partial;
     }
@@ -377,9 +388,32 @@ export async function executeToolCalls(toolCalls, context, config, signal, turn 
  * tally is keyed on the tool, the canonical arguments AND the failure text: a failure that
  * CHANGES is progress and resets the count.
  */
+/**
+ * The autonomous-compression tool's effect. It is applied by the loop, not by the tool: the
+ * model calls compact_context with its own summary, the loop keeps the most recent turns plus
+ * that summary, and the next model turn sees the shorter history. Returns null when the summary
+ * is missing (the caller turns that into an invalid_compaction result) and never mutates on null.
+ */
+export function applyCompaction(context, rawArguments, defaultKeep = 8) {
+  let args = rawArguments;
+  if (typeof args === 'string') { try { args = JSON.parse(args); } catch { return null; } }
+  const summary = typeof args?.summary === 'string' ? args.summary.trim() : '';
+  if (!summary) return null;
+  const keep = Math.max(2, Math.min(40, Math.floor(Number(args?.keepRecent) || defaultKeep)));
+  const before = context.messages.length;
+  const kept = context.messages.slice(-keep);
+  while (kept.length > 0 && kept[0] && kept[0].role === 'tool') kept.shift();
+  const note = { role: 'user', content: [{ type: 'text', text: '[上下文压缩] 之前工作的摘要：\n' + summary }] };
+  context.messages.length = 0;
+  context.messages.push(note, ...kept);
+  return { before, after: 1 + kept.length, kept: kept.length, summaryChars: summary.length };
+}
+
 async function runLoop(context, newMessages, config, signal) {
   let turns = 0;
-  const maxSteps = Number.isFinite(config.maxSteps) && config.maxSteps > 0 ? Math.floor(config.maxSteps) : 8;
+  // Infinity is the documented "no turn cap" (agent_api_send max_steps: 0). A missing or
+  // malformed cap still falls back to the default 8 rather than becoming unbounded.
+  const maxSteps = config.maxSteps === Infinity ? Infinity : Number.isFinite(config.maxSteps) && config.maxSteps > 0 ? Math.floor(config.maxSteps) : 8;
   const repeatLimit =
     Number.isFinite(config.repeatLimit) && config.repeatLimit > 0 ? Math.floor(config.repeatLimit) : DEFAULT_REPEAT_LIMIT;
   const callKey = typeof config.callKey === 'function' ? config.callKey : defaultCallKey;
@@ -440,8 +474,23 @@ async function runLoop(context, newMessages, config, signal) {
       let results = [];
       let refusedThisTurn = 0;
       if (keyed.length > 0) {
+        // The autonomous-compression tool is handled HERE: it changes the loop's own history,
+        // so it never reaches a registry that could not do that. Its call/result are still
+        // published as normal tool events, so a receipt shows the decision like any other call.
+        const compacted = new Map();
+        for (const entry of keyed) {
+          if (entry.refused || entry.call.name !== 'compact_context') continue;
+          await emit(config, { type: 'tool_execution_start', turn: turns, toolCallId: entry.call.id, toolName: entry.call.name, arguments: entry.call.arguments });
+          const applied = applyCompaction(context, entry.call.arguments);
+          const content = JSON.stringify(applied ? { ok: true, compacted: true, ...applied } : { ok: false, error: 'summary is required' });
+          const result = toolResult(entry.call, content, !applied, applied ? { compacted: true, ...applied } : { code: 'invalid_compaction' });
+          compacted.set(entry.call.id, result);
+          await emit(config, { type: 'tool_execution_end', turn: turns, toolCallId: entry.call.id, toolName: entry.call.name, isError: !applied, result: content });
+          if (applied) await emit(config, { type: 'context_compacted', turn: turns, ...applied });
+        }
         const runnable = [];
         for (const entry of keyed) {
+          if (compacted.has(entry.call.id)) continue;
           const tally = failures.get(entry.key);
           if (tally && tally.count >= repeatLimit) entry.refused = tally;
           else runnable.push(entry.call);
@@ -454,7 +503,7 @@ async function runLoop(context, newMessages, config, signal) {
             // `?? …` rather than a bare lookup: two calls sharing one id would collapse in the map,
             // and an `undefined` pushed into the history is a message the provider rejects — a
             // history that cannot be sent is worse than a result that says the result is missing.
-            merged.push(byId.get(entry.call.id) ?? toolResult(entry.call, 'the tool returned no result for this call', true, { code: 'no_result' }));
+            merged.push(compacted.get(entry.call.id) ?? byId.get(entry.call.id) ?? toolResult(entry.call, 'the tool returned no result for this call', true, { code: 'no_result' }));
             continue;
           }
           /* 3 — refused, not executed, and told why. `tool_execution_end` is emitted here too, so

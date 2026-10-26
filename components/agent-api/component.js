@@ -143,7 +143,9 @@
  *   workspace         string, optional. Absolute; defaults to `<newmarkRoot>/Work`. Created if
  *                     absent. See THE WORKSPACE below.
  *   timeout_ms        number, optional. Default 120000.
- *   max_steps         number, optional. Model turns before the run is stopped. Default 8.
+ *   max_steps         integer, optional. Model turns before the run is stopped. Default 8;
+ *                     0 means NO turn cap (the run still ends on timeout, repeated tool failure,
+ *                     or the model settling). NewMate's conversation uses 0.
  *   tool_filter       object, optional. `{ allow?: string[], deny?: string[] }`.
  *   require_workspace boolean, optional, default false.
  *
@@ -303,6 +305,16 @@ export const DEFAULT_CONTEXT_MAX_CHARS = 262144;
  */
 export const EVENT_TEXT_LIMIT = 240;
 
+/**
+ * How much of the model's accumulating reasoning the LIVE view carries.
+ *
+ * The receipt never keeps thinking events (see pushEvent): it is a diagnosis log for a run that
+ * looped, and a thought stream would push the tool events out of its two bounds. The live view
+ * does keep it, so it needs its own limit; past it the view keeps the TAIL, because the newest
+ * thought is what a watcher is reading and the tail is what visibly refreshes as it grows.
+ */
+export const THINKING_LIVE_LIMIT = 4000;
+
 /** How many events one run's receipt keeps, and the total characters they may spend. */
 export const EVENT_MAX_COUNT = 64;
 export const EVENT_MAX_CHARS = 16384;
@@ -399,6 +411,11 @@ export function eventView(event, stats = null) {
         : { result: boundedText(text) }),
       ...(Number.isFinite(event?.repeat) ? { repeat: event.repeat } : {}),
     };
+  }
+  if (type === 'thinking') {
+    const text = typeof event?.text === 'string' ? event.text : '';
+    const live = text.length > THINKING_LIVE_LIMIT ? `…(+${text.length - THINKING_LIVE_LIMIT} chars)\n${text.slice(-THINKING_LIVE_LIMIT)}` : text;
+    return { type, turn: null, text: live };
   }
   if (type === 'turn_end') {
     const results = Array.isArray(event?.toolResults) ? event.toolResults : [];
@@ -855,6 +872,36 @@ export function createAgentApi({
     // Both halves leave together: the tools the loop may offer, and the names the caller's
     // exposure showed that this layer does not carry. `withheld` is what the receipt reports, so
     // the difference is accounted for instead of being silently dropped.
+    // Private tools the companion contributes to its OWN runs and nowhere else: they are not in
+    // ctx.tools, so a DSH agent's catalog never lists them; the companion passes their definitions
+    // here at run time and its allow list is what admits each one.
+    const privateTools = globalThis[Symbol.for('newmark.newmate.privateTools')] || {};
+    const privateAllowed = (name) => {
+      const allow = Array.isArray(filter?.allow) ? filter.allow : null;
+      const deny = Array.isArray(filter?.deny) ? filter.deny : [];
+      return (!allow || allow.includes('*') || allow.includes(name)) && !deny.includes(name);
+    };
+    for (const [name, definition] of Object.entries(privateTools)) {
+      if (!definition || !privateAllowed(name) || tools.some((tool) => tool.name === name)) continue;
+      tools.push({
+        name,
+        description: String(definition.description ?? ''),
+        parameters: definition.parameters ?? { type: 'object' },
+        concurrencySafe: false,
+        prepareArguments(raw) {
+          const checked = toolCallArgumentsChecked(raw);
+          if (checked.ok) return checked.value;
+          const error = new Error('the arguments of this ' + name + ' call could not be read: ' + checked.reason + '.');
+          error.code = 'MALFORMED_TOOL_ARGUMENTS';
+          throw error;
+        },
+        async execute(callId, args) {
+          counters.toolCalls += 1;
+          const result = await definition.execute(args ?? {}, { signal });
+          return { content: await visualToolContent(name, result, view, selection, signal), details: { exit: EXIT_OK } };
+        },
+      });
+    }
     return { tools, withheld };
   }
 
@@ -891,8 +938,10 @@ export function createAgentApi({
       return envelope({ tool, exit: EXIT_INVALID, route: 'none', code: 'invalid_timeout', error: 'timeout_ms must be a positive finite number when present', extra: { model } });
     }
     const steps = args?.max_steps === undefined ? maxSteps : args.max_steps;
-    if (!(Number.isFinite(steps) && steps > 0)) {
-      return envelope({ tool, exit: EXIT_INVALID, route: 'none', code: 'invalid_max_steps', error: 'max_steps must be a positive finite number when present', extra: { model } });
+    // 0 is the documented "no turn cap" value: the run ends when the model settles, the
+    // timeout fires, or the repeated-failure bound trips - never on an arbitrary turn count.
+    if (!(Number.isInteger(steps) && steps >= 0)) {
+      return envelope({ tool, exit: EXIT_INVALID, route: 'none', code: 'invalid_max_steps', error: 'max_steps must be a non-negative integer when present (0 means no turn cap)', extra: { model } });
     }
     /* The tool selection. `tool_filter` is the argument this tool has always taken; `tools` is
      * the name the widening is documented under. Both are accepted, `tools` wins when present,
@@ -1000,6 +1049,33 @@ export function createAgentApi({
     const eventStats = { kept: 0, dropped: 0, chars: 0, truncated: false };
     const pushEvent = (event) => {
       const view_ = eventView(event, eventStats);
+      /**
+       * THE LIVE HALF: the same bounded view, handed to whoever is watching this run NOW.
+       *
+       * The receipt's event log is delivered when the run ends, which is exactly when nobody
+       * needs it any more. NewMate's own run is watched while it executes (its page, its state
+       * tool, the MCP status call), so the view is published through the NewMate context as
+       * each event is produced — before the receipt's two bounds are applied, because a live
+       * reader keeps its own ring and "the receipt dropped it" is not a reason for the live
+       * view to be blind.
+       *
+       * A context is present only while a NewMate run (or a caller that installed one) is on
+       * the async path; every ordinary agent-api run sees `undefined` here and behaves exactly
+       * as before. The call is guarded because a status reader is an OBSERVER: a throw from it
+       * must not end a run that is otherwise healthy.
+       */
+      const observer = newMateContext()?.onEvent;
+      if (typeof observer === 'function') {
+        try {
+          observer(view_);
+        } catch {
+          /* the run's own outcome does not depend on a status reader */
+        }
+      }
+      /* THINKING IS LIVE-ONLY. The receipt exists to say why a run looped, and a thought
+       * stream would push the tool events it needs out of the two bounds. It reaches the live
+       * reader above and stops here; the receipt never carries a thinking entry. */
+      if (view_.type === 'thinking') return;
       const size = JSON.stringify(view_).length;
       if (eventStats.kept >= EVENT_MAX_COUNT || eventStats.chars + size > EVENT_MAX_CHARS) {
         eventStats.dropped += 1;
@@ -1037,7 +1113,7 @@ export function createAgentApi({
           pollSteer: newMateContext()?.steer?.drain,
           hasSteer: newMateContext()?.steer?.hasPending,
           toolExecution: 'serial',
-          maxSteps: Math.floor(steps),
+          maxSteps: steps === 0 ? Infinity : steps,
           // THE RETRY BOUND, wired where the wire shape is known. `toolCallKey` canonicalises a
           // call's arguments through the same parse the tool boundary uses, so `{"a":1}` and
           // `{"a": 1}` are ONE call for the bound rather than two — a bound that could be evaded
@@ -1523,7 +1599,7 @@ export function createAgentApi({
               images: { type: 'array', maxItems: 4, description: 'Optional image uploads admitted by the DSH attachment store and passed as image blocks; requires verified image capability on the Core authorised model.', items: { type: 'object', properties: { data: { type: 'string' }, mediaType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] } }, required: ['data', 'mediaType'], additionalProperties: false } },
               workspace: { type: 'string', description: 'Absolute working directory for the run. Default <newmarkRoot>/Work, created if absent.' },
               timeout_ms: { type: 'number', description: 'Abort the run after this many milliseconds. Default 120000.' },
-              max_steps: { type: 'number', description: 'Model turns before the run is stopped and reported as max_steps. Default 8.' },
+              max_steps: { type: 'integer', minimum: 0, description: 'Model turns before the run is stopped and reported as max_steps. Default 8; 0 means NO turn cap (the run still ends on timeout, repeated tool failure, or the model settling).' },
               tools: {
                 type: 'object',
                 description:

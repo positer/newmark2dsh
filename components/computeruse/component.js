@@ -18,7 +18,7 @@
  */
 
 import { causeChain, createErrorLog, describeError } from '../../lib/errors.js';
-import { computerUseCaller } from '../../lib/cu-caller.js';
+import { computerUseOwner } from '../../lib/cu-caller.js';
 
 /** Newmark's action surface, exactly. */
 export const COMPUTER_USE_ACTIONS = [
@@ -422,7 +422,7 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
              */
             const translated = backendOptions(args);
             // Host-provided agent identity is authoritative, not a model-chosen owner label.
-            const caller = computerUseCaller(execution);
+            const caller = computerUseOwner(execution);
             const result = await runBackend(backend, {
               ...translated,
               imageDir: captionDir,
