@@ -2277,6 +2277,7 @@ function readPageGlobals() {
             const [busy,setBusy]=React.useState(false),[settingsView,setSettingsView]=React.useState(window.__NEWMARK_NEWMATE_OPEN_SETTINGS__===true),[search,setSearch]=React.useState(''),[historyOpen,setHistoryOpen]=React.useState(false),[viewedHistory,setViewedHistory]=React.useState(null);
 
             const [todoOpen,setTodoOpen]=React.useState(false), [todoRepeat,setTodoRepeat]=React.useState('none'), [todoEvery,setTodoEvery]=React.useState(1), [todoDays,setTodoDays]=React.useState([]),[todoContent,setTodoContent]=React.useState(''),[todoTime,setTodoTime]=React.useState(''),[todoMode,setTodoMode]=React.useState('conversation');
+            const [wechatOpen,setWechatOpen]=React.useState(false);
             const feed=React.useRef(null),follow=React.useRef(true),drafts=React.useRef(window.__NEWMARK_NEWMATE_DRAFTS__||= {}),revision=React.useRef(0);
             const readerClient=React.useRef(`newmate-page-${Math.random().toString(36).slice(2)}`),readerSequence=React.useRef(0);
             const threadId=state.activeThreadId||'',current=state.threads.find(t=>t.id===threadId),messages=state.messages.filter(m=>m.threadId===threadId),tasks=state.tasks.filter(t=>t.threadId===threadId);
@@ -2293,6 +2294,8 @@ function readPageGlobals() {
               return '调用工具';
             }
             /** The one-line live state of the agent loop, in the user-facing short form. */
+            /** 微信通道的一句话状态；按钮文案只由连接状态决定。 */
+            const wechatStatusLine=(w)=>{if(!w||!w.phase||w.phase==='disconnected')return '未连接';if(w.phase==='connected')return '已连接';if(w.phase==='waiting_scan')return '等待扫码…';if(w.phase==='error')return '出错 '+(w.error||'');return '未连接';};
             function loopStatusLine(loop, now = Date.now()) {
               if (!loop?.running) return 'NewMate 正在回复 · 可继续输入引导';
               const phases={starting:'正在准备',model:'正在思考',finishing:'正在收尾',releasing:'正在释放桌面接管'};
@@ -2391,8 +2394,19 @@ function readPageGlobals() {
                   h('p',{className:'nm-hint'},'启动时对比一次，之后按间隔重复；只比较文件数量、名称与最新修改时间，不读取文件内容。'),
                   h('div',{className:'nm-preference-row'},h('label',{htmlFor:'nm-watch-interval'},'对比间隔'),h('input',{id:'nm-watch-interval',type:'number',min:5,max:1440,step:5,value:state.settings.watchIntervalMinutes??30,disabled:busy,onChange:e=>act({action:'settings',settings:{watchIntervalMinutes:Number(e.target.value)}})}),h('span',{className:'nm-unit'},'分钟')),
                   h('p',{className:'nm-hint'},'范围 5–1440；改动从下一轮开始生效，不会打断正在进行的那一轮。'),
-                  h('p',{className:'nm-hint'},'扫描深度、DSH 自建改动权重等高级项保留默认值（3 层 / 0.1 倍），可在插件配置里调整；此处不再显示。')),
-                error&&h('p',{role:'alert',className:'nm-error'},error));
+                                    h('p',{className:'nm-hint'},'扫描深度、DSH 自建改动权重等高级项保留默认值（3 层 / 0.1 倍），可在插件配置里调整；此处不再显示。'),
+                  h('hr',{className:'nm-settings-divider'}),
+                  h('div',{className:'nm-preference-row'},h('span',null,'微信 ClawBot'),h('span',{className:'nm-unit'},wechatStatusLine(state.wechat)),h('button',{disabled:busy,onClick:async()=>{try{await act({action:'wechat-connect'});}finally{setWechatOpen(true);}}},(state.wechat&&state.wechat.connected)?'重新连接':'发起连接')),
+                  h('p',{className:'nm-hint'},(state.wechat&&state.wechat.connected)?'已连接。微信里发来的话等于你在页面上发信（运行中同样插入引导）；NewMate 的最终回复只以纯文字气泡发回微信，不转发思考、工具或主动消息。':'未连接。点「发起连接」弹出二维码；绑定信息只保存在本机，重启后自动恢复；点「重新连接」会清除旧登录并重新扫码。')),
+                error&&h('p',{role:'alert',className:'nm-error'},error),
+                (UpdateModal&&wechatOpen)?h(UpdateModal,{
+                  open:true,title:'连接微信 ClawBot',closeLabel:'取消',
+                  onClose:()=>setWechatOpen(false),
+                  description:(state.wechat&&state.wechat.connected)?'已连接。关闭这个窗口即可，无需再扫码。':(state.wechat&&state.wechat.waiting?'用手机微信扫描下面的二维码：我 → 设置 → 插件 → 微信 ClawBot → 扫描二维码。绑定成功后这里会自动变成已连接。':'正在向微信申请二维码…'),
+                  footer:h(React.Fragment,null,
+                    UpdateButton&&h(UpdateButton,{variant:'outline',onClick:()=>act({action:'wechat-connect'})},'重新生成二维码'),
+                    UpdateButton&&h(UpdateButton,{variant:'primary',onClick:()=>setWechatOpen(false)},(state.wechat&&state.wechat.connected)?'完成':'关闭')),
+                },(state.wechat&&state.wechat.qr&&state.wechat.qr.image)?h('div',{style:{display:'flex',justifyContent:'center',padding:12,background:'#fff',borderRadius:12,width:'fit-content',margin:'4px auto 0'}},h('img',{src:state.wechat.qr.image,alt:'微信 ClawBot 绑定二维码',width:260,height:260,style:{display:'block',imageRendering:'pixelated'}})):h('p',{style:{textAlign:'center',opacity:.7,minHeight:120,display:'flex',alignItems:'center',justifyContent:'center'}},'正在向微信申请二维码…')):null);
             }
             const history=state.threads.filter(t=>t.id!==threadId&&t.title.toLowerCase().includes(search.toLowerCase())).sort((a,b)=>b.updated-a.updated);
             if(historyOpen){const selected=state.threads.find(t=>t.id===viewedHistory),past=state.messages.filter(m=>m.threadId===viewedHistory);

@@ -1,0 +1,338 @@
+/**
+ * Login, receive loop and reply forwarding for the WeChat ClawBot channel.
+ *
+ * The channel is driven entirely from the NewMate settings page: connect() starts the QR
+ * handshake, status() is what the page renders, and the receive loop only exists while a token
+ * is stored. Nothing here reaches into NewMate's run: inbound goes through mate.chat(), which is
+ * the same function the page's POST arrives at, and outbound reads mate.state() and forwards the
+ * `plain` bubble of the assistant message whose id equals the task id.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { ILINK_BASE, createIlink, wechatStatePath } from './wechat-ilink.js';
+import { qrDataUrl } from './wechat-qr.js';
+import { bubbleText } from './reply-format.js';
+
+const LOGIN_POLL_MS = 1200;
+const LOGIN_TTL_MS = 8 * 60 * 1000;
+const REPLY_POLL_MS = 1000;
+const REPLY_TIMEOUT_MS = 15 * 60 * 1000;
+const MAX_DELIVERY_ATTEMPTS = 2;
+const RETRY_MS = 2000;
+const MAX_QR_REFRESH = 3;
+
+function emptyState() {
+  return {
+    schema: 1, phase: 'disconnected',
+    token: '', botId: '', baseUrl: ILINK_BASE, ilinkUserId: '',
+    cursor: '', ledger: {}, pending: [], awaiting: {}, sent: {},
+    qrcode: '', qrAt: 0, error: '', connectedAt: 0, updatedAt: 0,
+    stats: { inbound: 0, acked: 0, skipped: 0, replies: 0, sendFailed: 0 },
+  };
+}
+
+export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILINK_BASE }) {
+  const file = wechatStatePath(root);
+  const read = () => {
+    try {
+      const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+      return { ...emptyState(), ...value, ledger: value.ledger || {}, awaiting: value.awaiting || {}, sent: value.sent || {}, pending: Array.isArray(value.pending) ? value.pending : [] };
+    } catch (error) {
+      if (error.code === 'ENOENT') return emptyState();
+      log('wechat/state-read: ' + error.message);
+      return emptyState();
+    }
+  };
+  const freshState = !fs.existsSync(file);
+  let state = read();
+  // A brand-new state starts at the caller's base URL, so a gate can point this at a fake
+  // iLink server instead of the real one. A stored token keeps the base URL it was issued for.
+  if (freshState) state.baseUrl = baseUrl;
+  const save = () => {
+    state.updatedAt = Date.now();
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const temporary = file + '.' + process.pid + '.tmp';
+      fs.writeFileSync(temporary, JSON.stringify(state, null, 2), { mode: 0o600 });
+      fs.renameSync(temporary, file);
+    } catch (error) { log('wechat/state-write: ' + error.message); }
+  };
+  const ilink = createIlink({ getBaseUrl: () => state.baseUrl || ILINK_BASE, getToken: () => state.token, log });
+  let stopped = false;
+  let loginRun = null;
+  let loginGeneration = 0;
+  let receiveGeneration = 0;
+  let receiveRun = null;
+  let replyTimer = null;
+
+  /* --------------------------------------------------------------- status */
+
+  const status = () => ({
+    phase: state.phase,
+    connected: state.phase === 'connected' && Boolean(state.token),
+    botId: state.botId || '',
+    error: state.error || '',
+    connectedAt: state.connectedAt || 0,
+    waiting: state.phase === 'waiting_scan',
+    qr: state.phase === 'waiting_scan' && state.qrcode
+      ? { image: safeQr(state.qrcode), at: state.qrAt }
+      : null,
+    stats: state.stats,
+    pending: state.pending.length,
+    awaiting: Object.keys(state.awaiting).length,
+  });
+
+  function safeQr(payload) {
+    try { return qrDataUrl(payload, { scale: 7, margin: 3 }); } catch (error) { log('wechat/qr: ' + error.message); return ''; }
+  }
+
+  /* ---------------------------------------------------------------- login */
+
+  function finishLogin(reason) {
+    if (reason === 'connected') {
+      state.phase = 'connected';
+      state.connectedAt = Date.now();
+      state.error = '';
+      state.qrcode = '';
+      save();
+      log('wechat: connected as ' + (state.botId || '?').slice(0, 12));
+      startReceive();
+      return;
+    }
+    state.phase = 'error';
+    state.error = reason;
+    state.qrcode = '';
+    save();
+    log('wechat: login ended with ' + reason);
+  }
+
+  async function loginLoop(generation) {
+    const stale = () => stopped || generation !== loginGeneration;
+    const deadline = Date.now() + LOGIN_TTL_MS;
+    let refreshes = 0;
+    let qr = await ilink.qrcode();
+    if (!qr.ok) return finishLogin(qr.error || 'qrcode_failed');
+    let scanned = false;
+    for (;;) {
+      if (stale()) return;
+      state.phase = 'waiting_scan';
+      state.qrcode = qr.image;
+      state.qrAt = Date.now();
+      state.error = '';
+      save();
+      while (Date.now() < deadline) {
+        if (stale()) return;
+        const result = await ilink.qrStatus(qr.qrcode);
+        const name = result && result.status;
+        if (name === 'confirmed') {
+          if (!result.ilink_bot_id || !result.bot_token) return finishLogin('confirmed_without_credentials');
+          state.token = result.bot_token;
+          state.botId = result.ilink_bot_id;
+          state.ilinkUserId = result.ilink_user_id || '';
+          state.baseUrl = result.baseurl || ILINK_BASE;
+          state.cursor = state.cursor || '';
+          return finishLogin('connected');
+        }
+        if (name === 'scaned') { scanned = true; }
+        if (name === 'binded_redirect') return finishLogin('already_bound');
+        if (name === 'need_verifycode') return finishLogin('verify_code_required');
+        if (name === 'verify_code_blocked') return finishLogin('verify_code_blocked');
+        if (name === 'expired') break;
+        if (name === 'scaned_but_redirect' && result.redirect_host) {
+          state.baseUrl = 'https://' + result.redirect_host;
+          save();
+        }
+        await new Promise((resolve) => setTimeout(resolve, LOGIN_POLL_MS));
+      }
+      if (stale()) return;
+      refreshes += 1;
+      if (refreshes > MAX_QR_REFRESH) return finishLogin('qr_expired');
+      qr = await ilink.qrcode();
+      if (!qr.ok) return finishLogin(qr.error || 'qrcode_failed');
+    }
+  }
+
+  /* -------------------------------------------------------------- receive */
+
+  function queue(messages) {
+    let queued = 0;
+    for (const message of messages || []) {
+      const id = String(message.message_id !== undefined ? message.message_id : (message.seq !== undefined ? message.seq : ''));
+      if (Number(message.message_type) !== 1) { state.stats.skipped += 1; continue; }
+      const items = Array.isArray(message.item_list) ? message.item_list : [];
+      const textItem = items.find((item) => item && item.type === 1);
+      const text = textItem && textItem.text_item && typeof textItem.text_item.text === 'string' ? textItem.text_item.text : '';
+      if (!text) { state.stats.skipped += 1; continue; }
+      const known = id ? state.ledger[id] : null;
+      if (known && known.state === 'acked') { state.stats.skipped += 1; log('wechat: id ' + id + ' already confirmed, not delivered again'); continue; }
+      if (state.pending.some((item) => item.id === id)) continue;
+      state.pending.push({ id, text, peer: String(message.from_user_id || ''), contextToken: String(message.context_token || ''), at: Date.now(), attempts: 0 });
+      state.stats.inbound += 1;
+      queued += 1;
+    }
+    return queued;
+  }
+
+  async function drain(generation) {
+    for (const item of [...state.pending]) {
+      if (generation !== undefined && generation !== receiveGeneration) return;
+      if (item.lastAttempt && Date.now() - item.lastAttempt < RETRY_MS) continue;
+      item.attempts = Number(item.attempts || 0) + 1;
+      item.lastAttempt = Date.now();
+      let answer;
+      try {
+        // Exactly the call the page's POST reaches: chat(text, execution, threadId).
+        answer = mate.chat(item.text, undefined, undefined);
+      } catch (error) {
+        answer = { ok: false, error: error.message };
+      }
+      if (!answer || answer.ok !== true) {
+        if (item.attempts >= MAX_DELIVERY_ATTEMPTS) {
+          state.ledger[item.id] = { state: 'failed', attempts: item.attempts, error: String(answer && answer.error || 'unavailable'), at: Date.now() };
+          state.pending = state.pending.filter((entry) => entry.id !== item.id);
+          log('wechat: gave up delivering ' + item.id + ' after ' + item.attempts + ' attempts');
+        }
+        save();
+        continue;
+      }
+      // Receipt: from this line on, that WeChat message is never handed to NewMate again.
+      state.ledger[item.id] = { state: 'acked', attempts: item.attempts, taskId: String(answer.id || ''), mode: answer.mode, at: Date.now() };
+      state.pending = state.pending.filter((entry) => entry.id !== item.id);
+      state.stats.acked += 1;
+      if (answer.id) {
+        const previous = state.awaiting[answer.id];
+        state.awaiting[answer.id] = {
+          peer: item.peer,
+          contextToken: item.contextToken || (previous && previous.contextToken) || '',
+          at: (previous && previous.at) || Date.now(),
+          tries: (previous && previous.tries) || 0,
+        };
+      }
+      save();
+    }
+  }
+
+  function textOf(entry) { return bubbleText(entry); }
+
+  async function forwardReplies() {
+    const ids = Object.keys(state.awaiting);
+    if (!ids.length) return;
+    const snapshot = mate.state();
+    const messages = Array.isArray(snapshot.messages) ? snapshot.messages : [];
+    for (const taskId of ids) {
+      const entry = state.awaiting[taskId];
+      if (!entry) continue;
+      if (Date.now() - Number(entry.at || 0) > REPLY_TIMEOUT_MS) {
+        delete state.awaiting[taskId]; save();
+        log('wechat: no reply for task ' + taskId + ' within the window, dropped');
+        continue;
+      }
+      const reply = messages.find((message) => message && String(message.id) === String(taskId) && message.role === 'assistant');
+      if (!reply) continue;
+      const value = textOf(reply);
+      if (!value) { delete state.awaiting[taskId]; save(); continue; }
+      const sent = await ilink.sendText({ to: entry.peer, text: value, contextToken: entry.contextToken });
+      if (sent.ok) {
+        delete state.awaiting[taskId];
+        state.stats.replies += 1;
+        state.sent[taskId] = { at: Date.now(), messageId: sent.messageId, chars: value.length };
+        save();
+      } else {
+        state.stats.sendFailed += 1;
+        entry.tries = Number(entry.tries || 0) + 1;
+        if (entry.tries >= 3) delete state.awaiting[taskId];
+        save();
+      }
+    }
+  }
+
+  async function receiveLoop(generation) {
+    const stale = () => stopped || generation !== receiveGeneration;
+    await ilink.notify(true).catch(() => ({}));
+    let consecutive = 0;
+    while (!stopped && state.token && !stale()) {
+      if (state.pending.length) await drain(generation).catch((error) => log('wechat/drain: ' + error.message));
+      const poll = await ilink.updates(state.cursor || '');
+      if (stopped || stale()) break;
+      if (poll.timedOut) continue;
+      if (!poll.ok) {
+        consecutive += 1;
+        if (consecutive >= 5) { state.phase = 'error'; state.error = 'getupdates_failed'; save(); break; }
+        await new Promise((resolve) => setTimeout(resolve, 1000 * consecutive));
+        continue;
+      }
+      consecutive = 0;
+      const resp = poll.resp || {};
+      const code = resp.errcode !== undefined ? resp.errcode : resp.ret;
+      if (code === -14) { state.phase = 'error'; state.error = 'session_paused'; save(); break; }
+      if (code && code !== 0) { await new Promise((resolve) => setTimeout(resolve, 1000)); continue; }
+      queue(resp.msgs);
+      await drain(generation);
+      if (typeof resp.get_updates_buf === 'string' && resp.get_updates_buf) state.cursor = resp.get_updates_buf;
+      save();
+    }
+    if (!stale()) await ilink.notify(false).catch(() => ({}));
+  }
+
+  function startReceive() {
+    // A reconnect starts a new loop; the old one notices its generation is stale and exits at
+    // its next boundary, so two loops never drain the same queue item.
+    receiveGeneration += 1;
+    const generation = receiveGeneration;
+    receiveRun = receiveLoop(generation)
+      .catch((error) => log('wechat/receive: ' + error.message))
+      .finally(() => { if (generation === receiveGeneration) receiveRun = null; });
+    if (replyTimer) clearInterval(replyTimer);
+    replyTimer = setInterval(() => {
+      if (stopped || !Object.keys(state.awaiting).length) return;
+      forwardReplies().catch((error) => log('wechat/replies: ' + error.message));
+    }, REPLY_POLL_MS);
+    if (replyTimer.unref) replyTimer.unref();
+  }
+
+  /* ------------------------------------------------------------- lifecycle */
+
+  function logout() {
+    state.token = ''; state.botId = ''; state.ilinkUserId = '';
+    state.cursor = ''; state.ledger = {}; state.pending = []; state.awaiting = {}; state.sent = {};
+    state.phase = 'disconnected'; state.error = ''; state.qrcode = ''; state.connectedAt = 0;
+    // The base URL is deliberately kept: it is where this deployment's server lives, not a credential.
+    state.stats = emptyState().stats;
+    save();
+  }
+
+  async function connect() {
+    // 重新连接 = 清掉登录信息再走一遍，不是复用旧 token。An in-flight login is superseded,
+    // not joined: the user pressed the button again, so the newest QR is the one that counts.
+    loginGeneration += 1;
+    const generation = loginGeneration;
+    if (state.token || state.phase === 'connected' || Object.keys(state.sent).length) logout();
+    stopped = false;
+    state.phase = 'waiting_scan';
+    state.error = '';
+    state.qrcode = '';
+    save();
+    loginRun = loginLoop(generation)
+      .catch((error) => finishLogin('login_failed: ' + error.message))
+      .finally(() => { if (generation === loginGeneration) loginRun = null; });
+    return status();
+  }
+
+  async function stop() {
+    stopped = true;
+    if (replyTimer) { clearInterval(replyTimer); replyTimer = null; }
+    if (state.phase === 'waiting_scan') { state.phase = 'disconnected'; state.qrcode = ''; save(); }
+  }
+
+  /** Resume a stored session on mount: no QR, no user action. */
+  function resume() {
+    if (state.token) {
+      state.phase = 'connected';
+      state.error = '';
+      save();
+      startReceive();
+    }
+  }
+
+  return { status, connect, logout, stop, resume, statePath: file };
+}

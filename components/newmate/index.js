@@ -9,6 +9,7 @@ import { createNewMateMcp, MCP_ROUTE } from './lib/mcp.js';
 import { createNewMateSearch } from './lib/web-search.js';
 import { createAskTool } from './lib/ask.js';
 import { createConversationBridge } from './lib/conversations.js';
+import { createWechatChannel } from './lib/wechat-channel.js';
 import { MONITOR_DEFAULTS, dedupeRoots } from './lib/workspace-diff.js';
 import { readCoreSelection } from '../agent-api/lib/core-model.js';
 import { startDesktopPet, stopDesktopPet, companionPetEvents, notifyDesktopPet, updateDesktopPetFocus, claimDesktopPetNotice, updateDesktopPetTheme } from '../computeruse/lib/desktop-pet.js';
@@ -40,6 +41,12 @@ export function apply(ctx, config) {
   });
   const environment=()=>{const pet=companionPetEvents();let busy=false;try{const agents=ctx.get?.('agents')?.list?.()||[],jobs=ctx.get?.('jobs');busy=agents.some(a=>a.status==='running'||a.inbox?.nextTurn?.length>0||a.inbox?.nextStep?.length>0)||Boolean(jobs&&[undefined,...agents].some(a=>jobs.list(a?.id).some(j=>['running','stopping'].includes(j.status))));}catch{busy=true;}return{ready:pet.running&&pet.statusAgeMs<2000&&pet.window?.user_desktop_active===true,readerFocused:pet.window?.reader_focused===true,busy:busy||pet.window?.cu===true,idleMs:pet.window?.input_idle_ms??0};};
   const mate = createNewMate({ root: resolveRoot(config), tools: ctx.tools, agents: () => ctx.get?.('agents'), goals: () => ctx.get?.('goals'), logger:ctx.logger,onCompanion:companion,onNotify:notifyDesktopPet,onPresence:updateDesktopPetFocus,environment });
+  /**
+   * The WeChat ClawBot channel. Driven from the settings page (one button, two states) and
+   * independent of the companion switches: it only ever forwards the final reply of a run the
+   * WeChat message itself started, and it never sends a proactive message.
+   */
+  const wechat = createWechatChannel({ root: resolveRoot(config), mate, log: (line) => ctx.logger?.info?.(line) });
   ctx.effect(()=>{if(mate.state().settings.companion)companion(true).catch(e=>mate.failure('newmate/pet',e));return()=>{disposed=true;stopDesktopPet('companion_disposed','companion').catch(e=>ctx.logger?.warn?.(e.message));};},'newmate-companion-pet');
   /**
    * NewMate's own window onto DSH's native web search. Registered as a tool (not composed into a
@@ -178,7 +185,7 @@ export function apply(ctx, config) {
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/newmark-newmate', handler: async (req, res) => {
     let status = 200, body;
     try {
-      if (req.method === 'GET') body = { ok: true, ...mate.state(),pet:companionPetEvents(),initiativeStatus:mate.initiativeStatus(),interaction:mate.interaction(),agentLoop:mate.loopStatus(),question:mate.pendingQuestion(),compactionProbe:compactionProbe(),watch:mate.watchStatus() };
+      if (req.method === 'GET') body = { ok: true, ...mate.state(),pet:companionPetEvents(),initiativeStatus:mate.initiativeStatus(),interaction:mate.interaction(),agentLoop:mate.loopStatus(),question:mate.pendingQuestion(),compactionProbe:compactionProbe(),watch:mate.watchStatus(),wechat:wechat.status() };
       else if (req.method === 'POST') {
         if (req.headers['x-newmark-newmate'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site') throw Error('请求来源无效');
         const chunks=[];let bytes=0;for await(const chunk of req){const buffer=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);bytes+=buffer.length;if(bytes>64000)throw Error('请求过大');chunks.push(buffer);}const raw=Buffer.concat(chunks).toString('utf8');
@@ -194,6 +201,8 @@ export function apply(ctx, config) {
           case 'claim-notification':body=claimDesktopPetNotice(input.id);break;
           case 'retry':body=mate.retry(input.id);break;
           case 'chat':body=mate.chat(input.text,undefined,input.threadId);break;
+          case 'wechat-connect':body=await wechat.connect();break;
+          case 'wechat-logout':wechat.logout();body=wechat.status();break;
           case 'answer-question':body=mate.answerQuestion(input);break;
           case 'settings':body=await mate.configure(input.settings);break;
           case 'new-thread':body=mate.createThread();break;
