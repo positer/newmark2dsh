@@ -309,6 +309,21 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     receiveRun = receiveLoop(generation)
       .catch((error) => log('wechat/receive: ' + error.message))
       .finally(() => { if (generation === receiveGeneration) receiveRun = null; });
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    /**
+     * A loop can be alive on paper and dead in practice (a request stuck behind a network that
+     * changed under it). If no poll has completed for 90 s while a token is stored, restart it;
+     * startReceive() supersedes the old loop by generation.
+     */
+    watchdogTimer = setInterval(() => {
+      if (stopped || !state.token) return;
+      const last = Number(state.lastPollAt || state.receiveSince || 0);
+      if (last && Date.now() - last > 90000) {
+        log('wechat: no completed poll for ' + Math.round((Date.now() - last) / 1000) + 's, restarting the receive loop');
+        startReceive();
+      }
+    }, 30000);
+    if (watchdogTimer.unref) watchdogTimer.unref();
     if (replyTimer) clearInterval(replyTimer);
     let forwarding = false;
     replyTimer = setInterval(async () => {

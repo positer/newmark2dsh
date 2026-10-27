@@ -71,7 +71,13 @@ export function apply(ctx, config) {
   ctx.effect(()=>ctx.tools.register({name:'newmate_mcp_info',description:'Enable the NewMate MCP credential and return its endpoint path and local token file. The token is not returned in chat.',parameters:{type:'object',properties:{},additionalProperties:false},output:{schema:{type:'object'},render:(_,v)=>[{type:'text',text:JSON.stringify(v)}]},execute:mcp.info}),'newmate-mcp-info');
   ctx.effect(()=>ctx.webServer.register({kind:'exact',path:MCP_ROUTE,handler:mcp.handler}),'newmate-mcp');
   if (core) core.newMate = mate;
-  ctx.effect(() => () => { mate.stop(); conversations.stop().catch(e=>ctx.logger?.warn?.(e.message)); if (core?.newMate === mate) delete core.newMate; }, 'newmate-bridge');
+  ctx.effect(() => () => { mate.stop(); wechat.stop().catch(e=>ctx.logger?.warn?.(e.message)); conversations.stop().catch(e=>ctx.logger?.warn?.(e.message)); if (core?.newMate === mate) delete core.newMate; }, 'newmate-bridge');
+  /**
+   * A stored WeChat session resumes by itself after a boot or a plugin update: no QR, no user
+   * action. Without this the channel looks connected (the state file says so) while receiving
+   * nothing, which is exactly the silent failure a restart used to produce.
+   */
+  ctx.effect(() => { const timer = setTimeout(() => { try { wechat.resume(); } catch (e) { ctx.logger?.warn?.('newmate/wechat-resume: ' + e.message); } }, 4000); timer.unref?.(); return () => clearTimeout(timer); }, 'newmate-wechat-resume');
   ctx.effect(() => { const timer = setInterval(async()=>{try{const command=companionPetEvents().command;if(command?.id&&command.id!==lastPetCommand&&command.action==='stop-companion'){lastPetCommand=command.id;await mate.configure({companion:false});}await mate.tick();}catch(e){ctx.logger?.warn?.(e.message);}},1500); timer.unref?.(); return () => clearInterval(timer); }, 'newmate-worker');
   /**
    * Sparse measurement of the DSH workspaces themselves.
