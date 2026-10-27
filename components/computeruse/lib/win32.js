@@ -430,7 +430,9 @@ const SEND_KEYS_ALIASES = {
   backspace: 'BACKSPACE', bksp: 'BACKSPACE',
   delete: 'DELETE', del: 'DELETE',
   insert: 'INSERT', ins: 'INSERT',
-  tab: 'TAB', space: 'SPACE',
+  // A literal space, not {SPACE}: .NET SendKeys has no SPACE keyword, and passing one back
+  // produced `关键字“SPACE”无效` on 2026-10-27 when Ctrl+Space was delivered for real.
+  tab: 'TAB', space: ' ',
   up: 'UP', arrowup: 'UP', 'arrow-up': 'UP',
   down: 'DOWN', arrowdown: 'DOWN', 'arrow-down': 'DOWN',
   left: 'LEFT', arrowleft: 'LEFT', 'arrow-left': 'LEFT',
@@ -470,7 +472,7 @@ export function normalizeSendKeysKey(value) {
   if (!key) return undefined;
   const lower = key.toLowerCase();
   const singleAlias = SEND_KEYS_ALIASES[lower];
-  if (singleAlias) return `{${singleAlias}}`;
+  if (singleAlias) return singleAlias === ' ' ? ' ' : `{${singleAlias}}`;
   if (/^f(?:[1-9]|1[0-6])$/i.test(key)) return `{${key.toUpperCase()}}`;
 
   const chord = resolveKeyChord(key);
@@ -485,7 +487,7 @@ export function normalizeSendKeysKey(value) {
     if (/^[A-Z]$/.test(base) && !shift) shift = true;
     if (/^[A-Za-z]$/.test(base)) base = base.toLowerCase();
     const alias = SEND_KEYS_ALIASES[base.toLowerCase()];
-    if (alias) base = `{${alias}}`;
+    if (alias) base = alias === ' ' ? ' ' : `{${alias}}`;
     else if (/^f(?:[1-9]|1[0-6])$/i.test(base)) base = `{${base.toUpperCase()}}`;
     else if (base.length !== 1) return undefined;
     const prefix = `${modifiers.has('ctrl') ? '^' : ''}${shift ? '+' : ''}${modifiers.has('alt') ? '%' : ''}`;

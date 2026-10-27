@@ -19,7 +19,10 @@ export const CU_SHORTCUTS = Object.freeze([
   { chord: 'ctrl+a', label: 'Ctrl+A', note: '全选' },
   { chord: 'ctrl+z', label: 'Ctrl+Z', note: '撤销' },
   { chord: 'ctrl+s', label: 'Ctrl+S', note: '保存' },
-  { chord: 'ctrl+shift', label: 'Ctrl+Shift', note: '切换输入法（部分输入法）' },
+  // Measured 2026-10-27: real-mode delivery answers key_unsupported for this one, because
+  // SendKeys cannot express a chord made only of modifiers and the real path routes through it.
+  // The note says so instead of implying every chord works in every mode.
+  { chord: 'ctrl+shift', label: 'Ctrl+Shift', note: '切换输入法（部分输入法）；真实模式暂不支持，见 ctrl+space' },
   { chord: 'ctrl+f', label: 'Ctrl+F', note: '搜索' },
   { chord: 'win+up', label: 'Win+↑', note: '最大化当前窗口' },
   { chord: 'win+down', label: 'Win+↓', note: '最小化当前窗口' },
