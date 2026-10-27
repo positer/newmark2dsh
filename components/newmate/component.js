@@ -59,8 +59,7 @@ const localStamp = (ms) => {
  * bundle registers and a tool a plugin provides are described the same way, and a name the
  * current exposure does not carry is reported as missing instead of being described as callable.
  *
- * TWO NAMES ARE CONDITIONAL, and both conditions come from the persona rather than from the
- * registry:
+ * THE CONDITIONAL NAMES, whose conditions come from the persona rather than from the registry:
  *   newmate_task                    only on turns bound to an origin conversation
  *   computer_use / screen_capture / newmate_search   only on a run a person asked for - a
  *                                   chat turn, or a todo activation the user scheduled -
@@ -75,6 +74,7 @@ export const NEWMATE_RUN_TOOLS = Object.freeze([
   'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size',
   'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel',
   'computer_use', 'screen_capture', NEWMATE_SEARCH_TOOL, NEWMATE_ASK_TOOL, 'compact_context', 'newmate_task',
+  'newmate_wechat_send_file',
   'newmate_conversation_new', 'newmate_conversation_send', 'newmate_conversation_read',
 ]);
 
@@ -85,7 +85,13 @@ export const NEWMATE_CU_TOOLS = Object.freeze(['computer_use', 'screen_capture']
  * actions against the outside world, not background bookkeeping. A run constructor withholds
  * them from every autonomous check, and the persona states the same boundary.
  */
-export const NEWMATE_REQUEST_TOOLS = Object.freeze([...NEWMATE_CU_TOOLS, NEWMATE_SEARCH_TOOL, NEWMATE_ASK_TOOL]);
+/**
+ * The group members a PERSON must have asked for: a desktop takeover, a web lookup and a file the
+ * user is about to receive on their phone. All four are actions against the outside world rather than
+ * background bookkeeping, and a file can never be recalled once it has been sent - which is also why
+ * sending one is not something an unprompted self-check may decide to do.
+ */
+export const NEWMATE_REQUEST_TOOLS = Object.freeze([...NEWMATE_CU_TOOLS, NEWMATE_SEARCH_TOOL, NEWMATE_ASK_TOOL, 'newmate_wechat_send_file']);
 /**
  * The ComputerUse owner a NewMate run binds for its whole duration.
  *

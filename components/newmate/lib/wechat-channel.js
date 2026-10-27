@@ -9,9 +9,10 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { ILINK_BASE, createIlink, wechatStatePath } from './wechat-ilink.js';
+import { CDN_BASE, ILINK_BASE, createIlink, wechatStatePath } from './wechat-ilink.js';
 import { qrDataUrl } from './wechat-qr.js';
 import { bubbleText, toPlain } from './reply-format.js';
+import { inspectWechatFile } from './wechat-file.js';
 
 const LOGIN_POLL_MS = 1200;
 const LOGIN_TTL_MS = 8 * 60 * 1000;
@@ -27,16 +28,19 @@ function emptyState() {
     token: '', botId: '', baseUrl: ILINK_BASE, ilinkUserId: '',
     cursor: '', ledger: {}, pending: [], awaiting: {}, sent: {},
     qrcode: '', qrAt: 0, error: '', connectedAt: 0, updatedAt: 0,
-    stats: { inbound: 0, acked: 0, skipped: 0, replies: 0, sendFailed: 0 },
+    stats: { inbound: 0, acked: 0, skipped: 0, replies: 0, sendFailed: 0, files: 0, fileFailed: 0 },
   };
 }
 
-export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILINK_BASE }) {
+export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILINK_BASE, cdnBaseUrl = CDN_BASE }) {
   const file = wechatStatePath(root);
   const read = () => {
     try {
       const value = JSON.parse(fs.readFileSync(file, 'utf8'));
-      return { ...emptyState(), ...value, ledger: value.ledger || {}, awaiting: value.awaiting || {}, sent: value.sent || {}, pending: Array.isArray(value.pending) ? value.pending : [] };
+      // stats MERGE rather than replace: a state file written by an older version has no
+      // `files` counter, and copying it wholesale would answer `undefined` for a number the page
+      // and the tool report. The same reason keeps every other counter a number.
+      return { ...emptyState(), ...value, ledger: value.ledger || {}, awaiting: value.awaiting || {}, sent: value.sent || {}, pending: Array.isArray(value.pending) ? value.pending : [], stats: { ...emptyState().stats, ...(value.stats || {}) } };
     } catch (error) {
       if (error.code === 'ENOENT') return emptyState();
       log('wechat/state-read: ' + error.message);
@@ -59,7 +63,7 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
   };
   // Anything delivered before this moment is history, not something to replay on first run.
   if (!state.reminderWatermark) { state.reminderWatermark = Date.now(); save(); }
-  const ilink = createIlink({ getBaseUrl: () => state.baseUrl || ILINK_BASE, getToken: () => state.token, log });
+  const ilink = createIlink({ getBaseUrl: () => state.baseUrl || ILINK_BASE, getToken: () => state.token, getCdnBaseUrl: () => cdnBaseUrl, log });
   let stopped = false;
   let loginRun = null;
   let loginGeneration = 0;
@@ -88,6 +92,7 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     forwarded: Object.keys(state.sent || {}).length,
     pending: state.pending.length,
     awaiting: Object.keys(state.awaiting).length,
+    files: { count: Number(state.stats.files || 0), failed: Number(state.stats.fileFailed || 0), last: state.lastFile || null },
   });
 
   function safeQr(payload) {
@@ -321,6 +326,102 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     }
   }
 
+  /* ---------------------------------------------------------------- files */
+
+  /**
+   * Send ONE existing file to the bound WeChat user.
+   *
+   * This is the only outbound path that is not a reply: a caller asked for it, so it does not wait
+   * for a run, does not consult the companion switches, and does not touch the reminder watermark.
+   * What it DOES share with every other send is the recipient rule (the newest inbound peer, falling
+   * back to the user who scanned the QR) and the fact that accepted-by-the-server is the only claim
+   * the protocol supports. messageId is the one thing that makes a send identifiable afterwards, so
+   * the answer always says whether it was present instead of implying delivery.
+   *
+   * Every refusal is its own code, because a bare 文件没发出去 is useless to a caller: a missing
+   * file, a file over the bound, a forbidden type, an unconnected channel and a rejected recipient
+   * each need something different done about them.
+   */
+  async function sendFile({ path: target, caption = '', receiver = '', cwd } = {}) {
+    const inspected = inspectWechatFile({ path: target, cwd });
+    if (!inspected.ok) return inspected;
+    const file = inspected.file;
+    const described = { name: file.fileName, bytes: file.bytes, path: file.path };
+    if (!state.token) {
+      return { ok: false, code: 'wechat_not_connected', error: '微信 ClawBot 未连接：先在 NewMate 设置页「发起连接」并扫码，再发文件。', file: described };
+    }
+    if (state.phase === 'error' && state.error === 'session_paused') {
+      return { ok: false, code: 'wechat_session_paused', error: '微信侧会话已暂停（errcode=-14）：需要人工重新扫码，重启不会自动恢复。', file: described };
+    }
+    const to = String(receiver || '').trim() || (state.lastPeer && state.lastPeer.to) || state.ilinkUserId || '';
+    if (!to) {
+      return { ok: false, code: 'receiver_unavailable', error: '没有可用的微信接收者：还没收到过这个用户的消息，也没有登录用户 id。可以先让用户给 ClawBot 发一条消息。', file: described };
+    }
+    let bytes;
+    try { bytes = fs.readFileSync(file.path); } catch (error) {
+      return { ok: false, code: 'file_unreadable', error: '读取文件失败：' + error.message, path: file.path };
+    }
+    if (bytes.length !== file.bytes) {
+      // The file changed between the inspection and the read: the upload declaration would state
+      // one size and the ciphertext would carry another, so nothing is sent.
+      return { ok: false, code: 'file_changed', error: '文件在检查与读取之间发生了变化（' + file.bytes + ' → ' + bytes.length + ' 字节），未发送。', path: file.path };
+    }
+
+    const upload = await ilink.uploadFile({ to, bytes });
+    if (!upload.ok) {
+      state.stats.fileFailed = Number(state.stats.fileFailed || 0) + 1;
+      save();
+      log('wechat: file upload refused for ' + file.fileName + ' (' + (upload.code || 'upload_failed') + ')');
+      return { ok: false, ...upload, file: described };
+    }
+
+    const contextToken = (state.lastPeer && state.lastPeer.contextToken) || '';
+    const note = String(caption || '').trim().slice(0, 500);
+    let captionMessageId = null;
+    if (note) {
+      // One request carries one item, so the caption is its own message and goes first - a caption
+      // that arrived after its file reads as a correction rather than a description.
+      const sent = await ilink.sendText({ to, text: note, contextToken });
+      if (!sent.ok) {
+        state.stats.fileFailed = Number(state.stats.fileFailed || 0) + 1;
+        save();
+        return { ok: false, code: 'caption_failed', error: '说明文字发送失败：' + (sent.error || sent.errmsg || ('ret=' + sent.ret)), file: described };
+      }
+      captionMessageId = sent.messageId;
+    }
+
+    const sent = await ilink.sendItem({ to, item: ilink.fileItem({ fileName: file.fileName, upload }), contextToken });
+    if (!sent.ok) {
+      state.stats.fileFailed = Number(state.stats.fileFailed || 0) + 1;
+      save();
+      log('wechat: file send failed for ' + file.fileName + ' (' + (sent.code || 'send_failed') + ')');
+      return { ok: false, ...sent, captionMessageId, file: described };
+    }
+
+    state.stats.files = Number(state.stats.files || 0) + 1;
+    state.lastFile = { at: Date.now(), name: file.fileName, bytes: bytes.length, messageId: sent.messageId || null, caption: Boolean(note) };
+    save();
+    log('wechat: sent file ' + file.fileName + ' (' + bytes.length + ' bytes) as ' + (sent.messageId || 'no message id'));
+    return {
+      ok: true,
+      file: described,
+      receiver: to,
+      caption: note || null,
+      captionMessageId,
+      messageId: sent.messageId,
+      receipt: {
+        accepted: true,
+        serverMessageId: sent.messageId,
+        ret: sent.hasRet ? sent.ret : null,
+        // Accepted is the server's answer; nobody has confirmed the phone rendered it, and the live
+        // samples so far returned a message_id with no ret field at all, so the two are reported
+        // separately instead of one standing in for the other.
+        state: sent.messageId ? 'accepted_with_message_id' : 'accepted_without_message_id',
+      },
+      upload: { filekey: upload.filekey, cipherBytes: upload.cipherSize, attempts: upload.attempts },
+    };
+  }
+
   async function receiveLoop(generation) {
     const stale = () => stopped || generation !== receiveGeneration;
     state.receiveSince = Date.now();
@@ -447,5 +548,5 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     startReceive();
   }
 
-  return { status, connect, logout, stop, resume, statePath: file };
+  return { status, connect, logout, stop, resume, sendFile, statePath: file };
 }

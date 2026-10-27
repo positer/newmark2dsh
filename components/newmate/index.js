@@ -184,6 +184,34 @@ export function apply(ctx, config) {
     }), `newmate-tool-${toolName}`);
   }
   ctx.effect(() => ctx.tools.register(createAskTool(mate)), 'newmate-ask');
+  /**
+   * Sending a file to the user's phone, registered in the SHARED tool registry.
+   *
+   * Why here and not in a preset: a preset declares which of the registered tools ONE conversation may
+   * use; the registry is what every conversation reads. ctx.tools.register is the same call that
+   * carries newmate_todo_add / newmate_chat (both visible in any conversation's tool list), so the
+   * only thing that decides whether this tool can be called from a conversation is that registration
+   * and the preset's own admission - not a private list of the companion.
+   *
+   * The NewMate run reaches it a second way: component.js admits the name in NEWMATE_RUN_TOOLS, so the
+   * companion can call it on a turn the user asked for.
+   */
+  ctx.effect(() => ctx.tools.register({
+    name: 'newmate_wechat_send_file',
+    description: "Send one existing file from this machine to the user's WeChat through the NewMate ClawBot channel, optionally preceded by a one-sentence caption (sent as its own message, because one request carries one item). The file must be a regular, non-empty file of at most 20 MiB - a SELF-IMPOSED bound, not a server-declared limit, chosen from the smallest documented WeChat-side attachment cap - and must not be an executable or installer type (.exe .msi .bat .cmd .ps1 .vbs .hta .lnk .reg .jar .apk ...) or live in a credential directory (~/.ssh, ~/.dsh, ~/.Newmark, browser profiles, .env, *.pem, *.key). Requires a connected WeChat session (NewMate settings page -> 发起连接). The answer carries fileName, bytes, the server messageId and whether that id was present at all: an accepted request without an id cannot be confirmed later, so delivery is never claimed. Refusals are distinct codes: file_not_found / not_a_regular_file / file_empty / file_too_large / file_type_rejected / path_forbidden / file_unreadable / wechat_not_connected / wechat_session_paused / receiver_unavailable / upload_url_* / cdn_upload_* / send_* . A relative path resolves against the calling conversation\\'s working directory; the answer always echoes the absolute path actually used, and receiver defaults to the bound WeChat peer.",
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', minLength: 1, maxLength: 1024, description: 'Absolute path, or a path relative to the calling conversation\'s working directory.' },
+        caption: { type: 'string', maxLength: 500, description: 'Optional one-sentence note, sent as a separate text message before the file.' },
+        receiver: { type: 'string', maxLength: 200, description: 'Optional WeChat recipient id; defaults to the peer bound to this channel (newest inbound, else the user who scanned the QR).' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object' }, render: (_, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    execute: (args, execution) => wechat.sendFile({ path: args.path, caption: args.caption, receiver: args.receiver, cwd: execution?.agent?.session?.header?.cwd }),
+  }), 'newmate-wechat-send-file');
   ctx.effect(() => ctx.webServer.tapIndex(html => html.replace('</head>', `<script>window.${SNAPSHOT_GLOBAL}=${embedJson({ ok: true })};</script></head>`)), 'newmate-presence');
   ctx.effect(()=>ctx.webServer.register({kind:'exact',path:'/newmark-newmate/events',handler:async(req,res)=>{res.writeHead(req.method==='GET'?200:405,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(req.method==='GET'?{ok:true,...companionPetEvents()}:{ok:false,error:'read_only'}));}}),'newmate-pet-events');
   ctx.effect(()=>ctx.webServer.register({kind:'exact',path:'/newmark-newmate/avatar.png',handler:async(req,res)=>{if(req.method!=='GET'){res.writeHead(405);res.end();return;}res.writeHead(200,{'content-type':'image/png','cache-control':'public, max-age=3600'});res.end(fs.readFileSync(new URL('../computeruse/assets/desktop-pet.png',import.meta.url)));}}),'newmate-avatar');
