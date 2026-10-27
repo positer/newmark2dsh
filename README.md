@@ -132,7 +132,7 @@ heartBeat 负责持久化重启后任务与消费回执，也为插件更新流�
 ## 快速开始
 
 1. 在 DSH 配置好模型供应商，确认所选模型可用。
-2. 通过 DSH 插件管理器安装 **`newmark2dsh@0.3.14`**。使用明确版本可避免宿主新发布包等待策略选中较旧版本。
+2. 通过 DSH 插件管理器安装 **`newmark2dsh`**。安装时可显式指定版本，避免宿主的新发布包等待策略选中较旧的包。
 3. 打开 **Newmark Core** 配置页，选择允许插件使用的供应商／模型，并开启需要的组件。
 4. 从侧栏打开 **MemoryLab** 维护记忆，或打开 **NewMate** 开始聊天；需要桌宠陪伴时，再开启陪伴设置；桌面操作则通过 `computer_use` 发起。
 5. 更换已经加载的后端或原生代码后重启宿主；官方 Windows 容器可使用启用的 heartBeat 完成交接。
@@ -153,7 +153,7 @@ heartBeat 负责持久化重启后任务与消费回执，也为插件更新流�
 
 | 平台 | 当前桌面路径 | 已有验证与使用前提 |
 | --- | --- | --- |
-| **Windows** | 真实／隐藏桌面、UIA 与像素观察、共享桌宠与窗口呈现；官方容器自动重启 | 0.3.14 已在官方 Windows DSH 安装并核对包内容，通过完整验收及原生预览、菜单、待办、MCP、重启恢复检查；原生辅助程序使用系统 .NET Framework 编译并按源码缓存 |
+| **Windows** | 真实／隐藏桌面、UIA 与像素观察、共享桌宠与窗口呈现；官方容器自动重启 | 已在官方 Windows DSH 安装并核对包内容，通过完整验收及原生预览、菜单、待办、MCP、重启恢复检查；原生辅助程序使用系统 .NET Framework 编译并按源码缓存 |
 | **macOS · Apple Silicon** | 像素／AX 双通道、用户准备的 Mission Control Space、共享桌宠与真实桌面接管包边 | macOS 14／15／26 ARM 云端原生与网页矩阵、真实双 Space 夹具及 1x／2x 渲染检查；按所用通道授予 Accessibility／屏幕采集权限 |
 | **Linux / WSLg · X11** | 真实 X11 应用观察与输入、带认证的 Xvfb 隔离会话、Qt 桌宠及呈现映射 | 已有 X11／WSLg 路径验证；依赖 Xvfb、xauth、Openbox、xdotool、wmctrl、Python Xlib／PIL／PyQt5；WSLg 路径针对 Linux GUI 应用，原生 Wayland 控制尚不支持 |
 
@@ -212,11 +212,11 @@ node scripts/check-release-bundle.mjs .
 
 此检查核对五组件自包含装配，平台原生行为和真实模型运行需执行各自专项验证。更多文件职责见 [OVERVIEW.md](https://github.com/positer/newmark2dsh/blob/main/OVERVIEW.md)，后续文档与实现遵循 [taste.md](https://github.com/positer/newmark2dsh/blob/main/taste.md)。
 
-## 当前版本与更新
+## 更新与版本
 
-**当前版本：0.3.14；本文于 2026-10-14 核对。** 本版本带来 NewMate 待办的记忆驱动对话激活、Mac 包边与桌宠比例调整，以及 Windows 陪伴继承现有 CU 桌面。详细版本变化与验收说明见 [0.3.14 Release](https://github.com/positer/newmark2dsh/releases/tag/v0.3.14)，其他版本可在 [GitHub Releases](https://github.com/positer/newmark2dsh/releases) 中查看。
+README 只描述当前功能，不标注具体版本号：每个版本带来了什么、何时验收，以 [GitHub Releases](https://github.com/positer/newmark2dsh/releases) 为准；更早的 CHANGELOG 留在本地归档中。
 
-README 按当前功能维护；公开版本历史集中保存在 GitHub Releases，历史 CHANGELOG 留在本地归档中。文档更新不代表重新发布 npm 包或改变已经安装的版本。
+文档更新不代表重新发布 npm 包，也不改变你已经安装的版本；需要版本号时，请以插件管理器显示的已安装版本或 GitHub Releases 为准。
 
 ## 许可与反馈
 
