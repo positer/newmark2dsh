@@ -64,6 +64,7 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
   let receiveGeneration = 0;
   let receiveRun = null;
   let replyTimer = null;
+  let watchdogTimer = null;
 
   /* --------------------------------------------------------------- status */
 
@@ -78,6 +79,10 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       ? { image: safeQr(state.qrcode), at: state.qrAt }
       : null,
     stats: state.stats,
+    lastPollAt: state.lastPollAt || 0,
+    lastInboundAt: state.lastInboundAt || 0,
+    receiveSince: state.receiveSince || 0,
+    consecutiveErrors: state.consecutiveErrors || 0,
     pending: state.pending.length,
     awaiting: Object.keys(state.awaiting).length,
   });
@@ -168,6 +173,7 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       if (state.pending.some((item) => item.id === id)) continue;
       state.pending.push({ id, text, peer: String(message.from_user_id || ''), contextToken: String(message.context_token || ''), at: Date.now(), attempts: 0 });
       state.stats.inbound += 1;
+      state.lastInboundAt = Date.now();
       queued += 1;
     }
     return queued;
@@ -231,9 +237,18 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       if (!reply) continue;
       const value = textOf(reply);
       if (!value) { delete state.awaiting[taskId]; save(); continue; }
+      // Already forwarded: a restart, a replay or a second timer tick must not send it again.
+      if (state.sent[taskId]) { delete state.awaiting[taskId]; save(); continue; }
+      /**
+       * CLAIM BEFORE THE AWAIT. Deleting the entry only after the network call returned let two
+       * overlapping ticks both see the same task and both send it — measured in production:
+       * one reply, three WeChat messages. The claim is synchronous and persisted, so the second
+       * tick finds nothing to do; a failure below puts the entry back for a retry.
+       */
+      delete state.awaiting[taskId];
+      save();
       const sent = await ilink.sendText({ to: entry.peer, text: value, contextToken: entry.contextToken });
       if (sent.ok) {
-        delete state.awaiting[taskId];
         state.stats.replies += 1;
         state.sent[taskId] = { at: Date.now(), messageId: sent.messageId, chars: value.length };
         save();
@@ -248,6 +263,8 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
 
   async function receiveLoop(generation) {
     const stale = () => stopped || generation !== receiveGeneration;
+    state.receiveSince = Date.now();
+    save();
     await ilink.notify(true).catch(() => ({}));
     let consecutive = 0;
     while (!stopped && state.token && !stale()) {
@@ -257,11 +274,21 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       if (poll.timedOut) continue;
       if (!poll.ok) {
         consecutive += 1;
-        if (consecutive >= 5) { state.phase = 'error'; state.error = 'getupdates_failed'; save(); break; }
-        await new Promise((resolve) => setTimeout(resolve, 1000 * consecutive));
+        state.consecutiveErrors = consecutive;
+        state.lastErrorAt = Date.now();
+        save();
+        /**
+         * Never give up on a transport failure. A DSH restart, a sleeping laptop or a dropped
+         * connection used to end the loop after five tries and leave the channel dead until the
+         * user pressed 重新连接. Only the server saying -14 (account paused) stops it.
+         */
+        const backoff = Math.min(30000, 1000 * Math.pow(2, Math.min(consecutive - 1, 5)));
+        await new Promise((resolve) => setTimeout(resolve, backoff));
         continue;
       }
       consecutive = 0;
+      state.consecutiveErrors = 0;
+      state.lastPollAt = Date.now();
       const resp = poll.resp || {};
       const code = resp.errcode !== undefined ? resp.errcode : resp.ret;
       if (code === -14) { state.phase = 'error'; state.error = 'session_paused'; save(); break; }
@@ -283,9 +310,11 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       .catch((error) => log('wechat/receive: ' + error.message))
       .finally(() => { if (generation === receiveGeneration) receiveRun = null; });
     if (replyTimer) clearInterval(replyTimer);
-    replyTimer = setInterval(() => {
-      if (stopped || !Object.keys(state.awaiting).length) return;
-      forwardReplies().catch((error) => log('wechat/replies: ' + error.message));
+    let forwarding = false;
+    replyTimer = setInterval(async () => {
+      if (stopped || forwarding || !Object.keys(state.awaiting).length) return;
+      forwarding = true;
+      try { await forwardReplies(); } catch (error) { log('wechat/replies: ' + error.message); } finally { forwarding = false; }
     }, REPLY_POLL_MS);
     if (replyTimer.unref) replyTimer.unref();
   }
@@ -321,17 +350,25 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
   async function stop() {
     stopped = true;
     if (replyTimer) { clearInterval(replyTimer); replyTimer = null; }
+    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+    // Best effort: tell the server this client is going away, so the next process starts clean.
+    if (state.token) await ilink.notify(false).catch(() => ({}));
     if (state.phase === 'waiting_scan') { state.phase = 'disconnected'; state.qrcode = ''; save(); }
   }
 
   /** Resume a stored session on mount: no QR, no user action. */
   function resume() {
-    if (state.token) {
-      state.phase = 'connected';
+    if (!state.token) return;
+    // A restart must come back by itself; only a server-declared pause (-14) needs the user.
+    if (state.phase === 'error' && state.error !== 'session_paused') {
       state.error = '';
-      save();
-      startReceive();
+      log('wechat: resuming after "' + (state.error || 'error') + '"');
     }
+    if (state.error === 'session_paused') return;
+    state.phase = 'connected';
+    state.error = '';
+    save();
+    startReceive();
   }
 
   return { status, connect, logout, stop, resume, statePath: file };
