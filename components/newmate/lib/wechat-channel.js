@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ILINK_BASE, createIlink, wechatStatePath } from './wechat-ilink.js';
 import { qrDataUrl } from './wechat-qr.js';
-import { bubbleText } from './reply-format.js';
+import { bubbleText, toPlain } from './reply-format.js';
 
 const LOGIN_POLL_MS = 1200;
 const LOGIN_TTL_MS = 8 * 60 * 1000;
@@ -57,6 +57,8 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       fs.renameSync(temporary, file);
     } catch (error) { log('wechat/state-write: ' + error.message); }
   };
+  // Anything delivered before this moment is history, not something to replay on first run.
+  if (!state.reminderWatermark) { state.reminderWatermark = Date.now(); save(); }
   const ilink = createIlink({ getBaseUrl: () => state.baseUrl || ILINK_BASE, getToken: () => state.token, log });
   let stopped = false;
   let loginRun = null;
@@ -83,6 +85,7 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     lastInboundAt: state.lastInboundAt || 0,
     receiveSince: state.receiveSince || 0,
     consecutiveErrors: state.consecutiveErrors || 0,
+    forwarded: Object.keys(state.sent || {}).length,
     pending: state.pending.length,
     awaiting: Object.keys(state.awaiting).length,
   });
@@ -205,6 +208,8 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       state.ledger[item.id] = { state: 'acked', attempts: item.attempts, taskId: String(answer.id || ''), mode: answer.mode, at: Date.now() };
       state.pending = state.pending.filter((entry) => entry.id !== item.id);
       state.stats.acked += 1;
+      // The reminder forwarder needs somewhere to send: remember the newest peer and its token.
+      state.lastPeer = { to: item.peer, contextToken: item.contextToken || (state.lastPeer && state.lastPeer.contextToken) || '', at: Date.now() };
       if (answer.id) {
         const previous = state.awaiting[answer.id];
         state.awaiting[answer.id] = {
@@ -257,6 +262,61 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
         entry.tries = Number(entry.tries || 0) + 1;
         if (entry.tries >= 3) delete state.awaiting[taskId];
         save();
+      }
+    }
+  }
+
+  /**
+   * Reminder deliveries are NOT replies to anything this channel sent: NewMate pushes them as
+   * assistant messages whose id is `todo:<todoId>`, with no task behind them, so forwardReplies()
+   * never sees them — that is why a plain-text reminder reached the page and the desktop bubble but
+   * never the phone. They still belong to the user: forward the saved text as the same plain
+   * bubble, but only for todos whose mode is `reminder`, and only newer than the watermark so a
+   * fresh install does not replay every reminder ever delivered.
+   */
+  async function forwardReminders() {
+    const snapshot = mate.state();
+    const messages = Array.isArray(snapshot.messages) ? snapshot.messages : [];
+    const todos = Array.isArray(snapshot.todos) ? snapshot.todos : [];
+    if (!messages.length) return;
+    const reminderTodos = new Set(todos.filter((todo) => todo && todo.mode === 'reminder').map((todo) => String(todo.id)));
+    if (!reminderTodos.size) return;
+    for (const message of messages) {
+      if (!message || message.role !== 'assistant' || !message.id) continue;
+      const todoId = message.todoId ? String(message.todoId) : (typeof message.id === 'string' && message.id.startsWith('todo:') ? message.id.slice(5) : '');
+      if (!todoId || !reminderTodos.has(todoId)) continue;
+      if (state.sent[message.id]) continue;
+      if (Number(message.at || 0) <= Number(state.reminderWatermark || 0)) continue;
+      if (Date.now() - Number(message.at || 0) > 30 * 60 * 1000) continue;   // too old to be useful
+      // The reminder body is the user's own text: strip anything that would render oddly but keep
+      // it whole (the 80-character bubble limit would cut a real sentence in half).
+      const value = toPlain(String(message.text || ''), 4000);
+      if (!value) continue;
+      // The paired user id from the login is a valid recipient even before the first inbound
+      // message of this process; a context_token is only needed for a threaded reply, so an
+      // empty one is passed and the server decides.
+      const peer = state.lastPeer || (state.ilinkUserId ? { to: state.ilinkUserId, contextToken: '' } : null);
+      if (!peer || !peer.to) {
+        // Do not mark it: a reminder that arrived before any WeChat peer existed must still go
+        // out once one does. The age guard below stops ancient ones from being replayed.
+        log('wechat: reminder ' + message.id + ' has no WeChat recipient yet, will retry');
+        continue;
+      }
+      // Claim first: the timer can tick again while the send is in flight.
+      state.sent[message.id] = { at: Date.now(), chars: value.length, reminder: true, pending: true };
+      save();
+      const sent = await ilink.sendText({ to: peer.to, text: value, contextToken: peer.contextToken });
+      if (sent.ok) {
+        state.stats.replies += 1;
+        state.sent[message.id] = { at: Date.now(), messageId: sent.messageId, chars: value.length, reminder: true };
+        state.reminderWatermark = Math.max(Number(state.reminderWatermark || 0), Number(message.at || 0));
+        save();
+        log('wechat: forwarded reminder ' + message.id + ' (' + value.length + ' chars)');
+      } else {
+        state.stats.sendFailed += 1;
+        delete state.sent[message.id];
+        save();
+        log('wechat: reminder send failed ret=' + (sent.ret === undefined ? '(none)' : sent.ret) + ' ' + (sent.errmsg || sent.error || ''));
       }
     }
   }
@@ -327,9 +387,10 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     if (replyTimer) clearInterval(replyTimer);
     let forwarding = false;
     replyTimer = setInterval(async () => {
-      if (stopped || forwarding || !Object.keys(state.awaiting).length) return;
+      // Reminders arrive without any outstanding task, so the guard cannot be 'awaiting is empty'.
+      if (stopped || forwarding) return;
       forwarding = true;
-      try { await forwardReplies(); } catch (error) { log('wechat/replies: ' + error.message); } finally { forwarding = false; }
+      try { await forwardReplies(); await forwardReminders(); } catch (error) { log('wechat/replies: ' + error.message); } finally { forwarding = false; }
     }, REPLY_POLL_MS);
     if (replyTimer.unref) replyTimer.unref();
   }

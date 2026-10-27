@@ -26,7 +26,11 @@ export function apply(ctx, config) {
     parameters: { type: 'object', properties: { prompt: { type: 'string', maxLength: 16000 }, intentId: { type: 'string', maxLength: 100 } }, required: ['prompt'], additionalProperties: false }, output,
     execute: (a, e) => beat.schedule(a.prompt, currentConversation(e), e, { intentId: a.intentId }),
   }), 'heartbeat-task-tool');
-  ctx.effect(() => ctx.tools.register({ name: 'heartbeat_restart', description: 'Request a global DSH restart. With broadcast=false (default) the restart happens immediately and previously registered tasks are delivered once the new desktop host is ready. With broadcast=true this only OPENS a two-phase restart: every running conversation is told to register a continuation, the call returns phase "preparing" with the participants, and nothing restarts until heartbeat_restart_commit is called and the receipts are in.',
+  ctx.effect(() => ctx.tools.register({ name: 'heartbeat_activity', description: 'Read-only: which OTHER conversations are running right now. Call it before deciding how to restart — heartbeat_restart refuses to restart until it has reported this, so use it to decide between force:true (nobody else is running, or you accept interrupting them) and broadcast:true (wait for every running conversation to register its continuation).',
+    parameters: { type: 'object', properties: {}, additionalProperties: false }, output,
+    execute: (a, e) => beat.activity(e),
+  }), 'heartbeat-activity-tool');
+  ctx.effect(() => ctx.tools.register({ name: 'heartbeat_restart', description: 'Request a global DSH restart. IMPORTANT: the first call does NOT restart — it returns { code:"confirmation_required", activity } listing the OTHER conversations running right now, and you then decide: call again with force:true to restart now (interrupting them), or with broadcast:true to open the two-phase barrier and wait for every running conversation to register its continuation. With broadcast=false and force=false nothing restarts and previously registered tasks are delivered once the new desktop host is ready. With broadcast=true this only OPENS a two-phase restart: every running conversation is told to register a continuation, the call returns phase "preparing" with the participants, and nothing restarts until heartbeat_restart_commit is called and the receipts are in.',
     parameters: { type: 'object', properties: {
       broadcast: { type: 'boolean', description: 'true opens the two-phase barrier instead of restarting now.' },
       ackMode: { type: 'string', enum: ['auto', 'agent'], description: "auto (default) registers a continuation for every running conversation without spending a model call; agent delivers a notification into each conversation and waits for that conversation's own heartbeat_after_restart or heartbeat_restart_ack." },
@@ -38,9 +42,34 @@ export function apply(ctx, config) {
     async execute(a, execution) {
       currentConversation(execution);
       if (a.broadcast !== true) {
+        /**
+         * Probe FIRST, always. A plain restart used to go straight to globalRestart(), so the
+         * caller could interrupt another conversation's turn without ever being told there was
+         * one. The first call now reports who else is running and does NOT restart; the caller
+         * then either forces it or opens the broadcast barrier.
+         */
+        const probe = beat.activity(execution);
+        if (a.force !== true) {
+          const others = probe.ok ? probe.count : null;
+          return {
+            ok: false,
+            code: probe.ok ? 'confirmation_required' : 'activity_unavailable',
+            restarted: false,
+            activity: probe,
+            next: probe.ok
+              ? [
+                  { call: 'heartbeat_restart', arguments: { force: true }, when: others === 0 ? '没有其他对话在运行，可以直接强制重启' : '确认可以打断上面列出的 ' + others + ' 个运行中对话' },
+                  { call: 'heartbeat_restart', arguments: { broadcast: true }, when: '不想打断它们：发起广播，等每个对话登记接续后由 heartbeat_restart_commit 收尾' },
+                ]
+              : [],
+            guidance: probe.ok
+              ? '先看 activity：count>0 表示还有别的对话在跑。强制重启会打断它们；广播会等它们各自登记接续再重启。'
+              : '无法确认是否有其他对话在运行（agents 服务不可用）。要重启必须显式 force:true，并自行承担打断的风险。',
+          };
+        }
         const helper = await beat.globalRestart();
         commitAfterResponse(helper, 'heartbeat-confirmed-restart');
-        return { ok: true, restarting: true };
+        return { ok: true, restarting: true, forced: true, activity: probe };
       }
       return beat.beginBarrier(a, execution);
     },

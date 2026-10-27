@@ -134,6 +134,38 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
     return service.roots().map(agent => ({ agent, view: identity(agent) })).filter(entry => entry.view);
   };
 
+  /**
+   * The pre-restart probe: who ELSE is running right now.
+   *
+   * A restart that goes straight to globalRestart() cannot tell the caller that it is about to
+   * interrupt somebody's turn. The tool layer therefore asks this FIRST and refuses to restart
+   * until the caller has either seen this report and forced it, or opened the broadcast barrier
+   * that lets every running conversation register its continuation and finish.
+   *
+   * 'running' means the host's own predicate (agent.status === 'running') and not paused by the
+   * user. The requester is reported separately as `self`: it is always the one asking.
+   */
+  const activity = (execution) => {
+    const requesterSessionId = execution ? currentConversation(execution) : null;
+    const live = liveAgents();
+    if (live === null) return { ok: false, code: 'agents_unavailable', error: 'DSH agents 服务不可用，无法确认是否有其他对话在运行' };
+    const self = live.find(entry => entry.view.sessionId === requesterSessionId) || null;
+    const busyOthers = live.filter(entry => entry.view.sessionId !== requesterSessionId && entry.view.state === 'busy' && !pausedByUser(entry.agent));
+    const running = busyOthers.map(entry => ({ ...entry.view }));
+    const idleOthers = live.filter(entry => entry.view.sessionId !== requesterSessionId).length - running.length;
+    const intent = store.read().intent;
+    return {
+      ok: true,
+      at: now(),
+      self: self ? { ...self.view } : null,
+      running,
+      count: running.length,
+      idleOthers: Math.max(0, idleOthers),
+      intent: intent ? progressOf(intent) : null,
+    };
+  };
+
+
   /* ------------------------------------------------------------------------- tasks --- */
   const enqueue = (prompt, destination, agent, options = {}) => {
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000) throw Error('重启任务须为 1–16000 字符');
@@ -497,6 +529,7 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
       if (running) throw Error('已有一个进行中的两阶段重启准备（intentId=' + running.id + '），请先提交或等它结束');
       const prepared = await controller.prepare(installedVersion()); return this.restart(prepared.ticket);
     },
+    activity,
     beginBarrier, commitBarrier, cancelBarrier, acknowledge, barrierState,
     async tick() {
       if (pumping || stopped) return; pumping = true;
