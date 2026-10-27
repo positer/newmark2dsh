@@ -135,7 +135,7 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
   };
 
   /* ------------------------------------------------------------------------- tasks --- */
-  const enqueue = (prompt, destination, agent) => {
+  const enqueue = (prompt, destination, agent, options = {}) => {
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000) throw Error('重启任务须为 1–16000 字符');
     if (typeof destination !== 'string' || !destination) throw Error('重启任务需要目标对话');
     // ONE pending continuation per (destination, prompt). The barrier's auto registration and the
@@ -146,11 +146,11 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
     const duplicate = store.read().tasks.find(t => t.destination === destination && t.prompt === prompt && (t.status === 'waiting' || t.status === 'armed'));
     if (duplicate) return { ok: true, id: duplicate.id, destination, duplicate: true };
     const modelSelection=conversationModel(agent);
-    const id = randomUUID(); store.change(s => { if(s.tasks.length >= 2000) throw Error('heartBeat 任务队列已达容量上限'); s.tasks.push({ id, prompt, destination, status: 'waiting', created: Date.now(), creatorPid: pid,...modelSelection?{modelSelection}:{} }); }); return { ok: true, id, destination };
+    const id = randomUUID(); store.change(s => { if(s.tasks.length >= 2000) throw Error('heartBeat 任务队列已达容量上限'); s.tasks.push({ id, prompt, destination, status: 'waiting', created: Date.now(), creatorPid: pid, ...options.kind ? { kind: options.kind } : {},...modelSelection?{modelSelection}:{} }); }); return { ok: true, id, destination };
   };
   const schedule = (prompt, destination, execution, options = {}) => {
     if (execution) destination = currentConversation(execution);
-    const registered = enqueue(prompt, destination, execution?.agent);
+    const registered = enqueue(prompt, destination, execution?.agent, options);
     // A registration made while a barrier is open IS that session's receipt, so the caller cannot
     // register a continuation and then be reported as missing.
     if (options.intentId) ack(destination, 'registered', 'schedule', options.intentId);
@@ -461,7 +461,9 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
     prepare: targetVersion => controller.prepare(targetVersion),
     async restart(ticket, update = false) {
       const helper = await controller.restart(ticket);
-      const updateId = update ? schedule('Newmark2DSH 更新后 DSH 已重启。请确认组件状态，报告未完成的持久任务；不要自动重复失败动作。', 'newmate').id : null;
+      // kind:'update_report' tells NewMate this report was REQUESTED, so it is displayed instead of
+    // being judged by the proactive-message format rule (240 chars, no lists) and dropped.
+    const updateId = update ? schedule('Newmark2DSH 更新后 DSH 已重启。请确认组件状态，报告未完成的持久任务；不要自动重复失败动作。', 'newmate', undefined, { kind: 'update_report' }).id : null;
       // An UPDATE restart is issued by the panel or the update route, so there is no requesting
       // conversation to hand a continuation to — and until now NOTHING got one, which silently killed
       // work that was in flight: measured 2026-10-17, an update restart took the host down while this
@@ -508,7 +510,7 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
           try {
             if (task.destination === 'newmate') {
               if (!core()?.newMate) continue;
-              core().newMate.enqueue(task.prompt, 'newmate', task.id);
+              core().newMate.enqueue(task.prompt, 'newmate', task.id, undefined, task.kind ? { kind: task.kind } : undefined);
             } else await deliverConversation(agents(), task.destination, task);
             delivered.push(task.id);
             store.change(s => { s.receipts ||= []; if (!s.receipts.some(r => r.id === task.id)) s.receipts.push({ id: task.id, delivered: Date.now(), adopted: true }); s.tasks = s.tasks.filter(t => t.id !== task.id); s.schema = 3; });
@@ -544,7 +546,7 @@ export function createHeartBeat({ root, core, agents, goals = () => null, contro
             if (owner.path !== job.owner.path || owner.created === job.owner.created) continue;
             if (task.destination === 'newmate') {
               if (!core()?.newMate) continue;
-              core().newMate.enqueue(task.prompt, 'newmate', task.id);
+              core().newMate.enqueue(task.prompt, 'newmate', task.id, undefined, task.kind ? { kind: task.kind } : undefined);
             } else await deliverConversation(agents(), task.destination, task);
             delivered.push(task.id);
             // One atomic durable mutation consumes the executable record and leaves only its ID.

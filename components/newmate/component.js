@@ -13,7 +13,8 @@ import { NEWMATE_SEARCH_TOOL } from './lib/web-search.js';
 import { NEWMATE_ASK_TOOL, ASK_MIN_OPTIONS, ASK_MAX_OPTIONS, ASK_QUESTION_MAX_CHARS, ASK_LABEL_MAX_CHARS } from './lib/ask.js';
 import {PROACTIVE_STYLE,proactiveMessageGate} from './lib/proactive-message.js';
 import {threadHandoff,shouldRotate} from './lib/thread-handoff.js';
-import {todoInput,todoMessageId} from './lib/todo-list.js';
+import {todoInput,todoMessageId,nextActivation} from './lib/todo-list.js';
+import {REPLY_PROTOCOL,normalizeReply,bubbleText,toPlain} from './lib/reply-format.js';
 import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet,paceThreshold,paceTimeWeight} from './lib/initiative.js';
 import { MONITOR_DEFAULTS, evaluateWorkspaces, settle } from './lib/workspace-diff.js';
 
@@ -26,6 +27,20 @@ import { MONITOR_DEFAULTS, evaluateWorkspaces, settle } from './lib/workspace-di
  * model has to reconcile is a time it will get wrong, so the prompt now states one unambiguous local
  * instant with its offset, plus the user message's own send time.
  */
+/**
+ * One run's answer as {rich, plain}. The envelope's own text/plain win; a model that answered with
+ * anything else still yields a displayable rich reply and a derived plain one.
+ */
+const readReply = (envelope, automatic) => {
+  const structured = envelope?.result?.structured;
+  if (structured && typeof structured.text === 'string') {
+    const rich = structured.text.trim();
+    const plain = typeof structured.plain === 'string' && structured.plain.trim() ? structured.plain.trim() : toPlain(rich);
+    return { rich, plain, notify: typeof structured.notify === 'boolean' ? structured.notify : undefined, topic: typeof structured.topic === 'string' ? structured.topic : undefined, protocol: true };
+  }
+  return normalizeReply(envelope?.result?.output, { automatic });
+};
+
 const localStamp = (ms) => {
   const d = new Date(Number(ms) || 0);
   const p = (value) => String(value).padStart(2, '0');
@@ -172,16 +187,17 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     try{
       let message=store.read().messages.find(m=>m.id===todoMessageId(item.id));
       if(!message){thread();const destination=rotateForMessage('todo',item.content);message={id:todoMessageId(item.id),todoId:item.id,threadId:destination,role:'assistant',text:item.content,at:now(),proactive:true,unread:true};store.change(s=>{s.messages.push(message);s.threads.find(t=>t.id===destination).updated=now();});await notify(message);}
-      store.change(s=>{Object.assign(s.todos.find(t=>t.id===item.id),{status:'delivered',deliveredAt:message.at,messageId:message.id,threadId:message.threadId});});
+      // A repeating reminder stays pending with its NEXT activation; a one-shot one is delivered.
+      store.change(s=>{const t=s.todos.find(t=>t.id===item.id);if(!t)return;const receipt={deliveredAt:message.at,messageId:message.id,threadId:message.threadId,lastDeliveredAt:message.at,deliveries:(t.deliveries||0)+1};const next=item.repeat?nextActivation(item.repeat,now()):null;Object.assign(t,next?{...receipt,status:'pending',activateAt:next}:{...receipt,status:'delivered'});});
     }catch(error){const receipt=store.read().messages.find(m=>m.id===todoMessageId(item.id));store.change(s=>{Object.assign(s.todos.find(t=>t.id===item.id),receipt?{status:'delivered',deliveredAt:receipt.at,messageId:receipt.id,threadId:receipt.threadId}:{status:'failed',error:String(error.message)});});failures.record({where:'newmate/todo',code:'todo_delivery_failed',message:String(error.message)});}
   }
-  const enqueue = (prompt, destination = 'newmate', id = randomUUID(), threadId) => {
+  const enqueue = (prompt, destination = 'newmate', id = randomUUID(), threadId, options = {}) => {
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000) throw Error('任务内容须为 1–16000 字符');
     const targetThread=thread(threadId).id;
     store.change(s => {
       if (s.tasks.some(t => t.id === id)) return;
       if (s.tasks.filter(t => ['pending','running'].includes(t.status)).length >= 100 || s.tasks.length >= 2000) throw Error('持久任务队列已达到容量上限');
-      s.tasks.push({ id, prompt, destination, threadId:targetThread, status: 'pending', created: now() });
+      s.tasks.push({ id, prompt, destination, threadId:targetThread, status: 'pending', created: now(), ...options?.kind ? { kind: options.kind } : {} });
     });
     return { ok: true, id };
   };
@@ -272,7 +288,14 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
       return;
     }
     running = true; active = new AbortController();activeTask=task;manualRestart=false;userPreempted=false;guide={pending:[],drain(){return this.pending.splice(0);}};
-    const automatic=task.kind==='measurement'||task.kind==='self_activation',delegated=task.kind==='todo_activation',unsolicited=task.kind!=='chat';activeAutomatic=automatic||delegated;
+    /**
+     * `update_report` is a task the restart pipeline ASKED for, not the companion deciding to
+     * speak. It used to be classified unsolicited (kind !== 'chat'), so its report was judged by
+     * the 240-character / no-list rule of a proactive message and thrown away: measured
+     * 2026-10-27, four post-restart reports were suppressed as `proactive_format` and the user
+     * never saw them. Requested reports are displayed; only the capability-whine gate applies.
+     */
+    const report=task.kind==='update_report',automatic=task.kind==='measurement'||task.kind==='self_activation',delegated=task.kind==='todo_activation',unsolicited=task.kind!=='chat'&&!report;activeAutomatic=automatic||delegated;
     try {
       if(automatic){const s=store.read();if(!s.settings.companion||!s.settings.initiative||task.threadId!==s.activeThreadId){store.change(s=>{Object.assign(s.tasks.find(t=>t.id===task.id),{status:'paused',finished:now()});});return;}}
       store.change(s => { s.tasks.find(t => t.id === task.id).status = 'running'; });
@@ -294,9 +317,9 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
         })();
         const timeLine = '当前时间：' + localStamp(now()) + '（本机时区 ' + Intl.DateTimeFormat().resolvedOptions().timeZone + '）；最后一条用户消息发送于：' + (userMessageAt ? localStamp(userMessageAt) : '（本对话还没有用户消息）') + '。两者都是本机时间并带偏移，提到\"现在\"用前者、提到\"你发消息时\"用后者，不要换算成 UTC 或别的时区。\n';
         const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseOwner(NEWMATE_CU_OWNER,()=>withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,conversation:conversationOf(task),steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)},onEvent:event=>live.event(event)},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
-          prompt: `${timeLine}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：${store.read().watch?.lastDescription||'（本机尚无对比结果）'}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪些文件新增/改动、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。':''}${automatic?'\n输出协议：最终只输出一个合法 JSON 对象，不要 Markdown、代码围栏、说明文字或思考过程。只允许 notify（布尔）、text（字符串，最多240字符）、topic（可选字符串，最多80字符）三个键。例如 {"notify":false,"text":"","topic":"check-in"}。notify=true 时把实际发给用户的简短消息放入 text；没有合适内容时 notify=false，text=""。禁止在 JSON 之外输出任何内容。':''}`,
+          prompt: `${timeLine}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。用户要求重复时给 repeat：{every,unit:\'min\'|\'h\'|\'d\',weekdays?:[1-7]（1=周一）,at?:\'HH:MM\'}，或等价规则串 rule（如 \"every 2 d on 1-5 at 09:00\"）；不给 repeat 就只触发一次。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：${store.read().watch?.lastDescription||'（本机尚无对比结果）'}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪些文件新增/改动、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。':''}\n${REPLY_PROTOCOL}`,
           tools: { allow: newMateRunTools({automatic,origin:task.origin}) }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:0,
-          ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:240},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
+          ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:400},plain:{type:'string',maxLength:120},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
         }, signal: active.signal }))));
         active.signal.throwIfAborted();
         // A guide arriving after the loop ended must never publish an obsolete answer.
@@ -305,23 +328,37 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
         if (classified.exit !== 0) throw Error(classified.error || 'Agent API 调用失败');
         const envelope = classified.result;
         if (envelope?.ok !== true) throw Error(envelope?.error || 'Agent API 未完成任务');
-        const decision = envelope.result?.structured;
-        if(automatic&&(typeof decision?.notify!=='boolean'||typeof decision?.text!=='string'||(decision.topic!==undefined&&(typeof decision.topic!=='string'||decision.topic.length>80))))throw Error('主动判断未符合 notify/text/topic 协议');
-        const answer = automatic ? decision?.text?.trim() : envelope.result?.output;
-        if (typeof answer !== 'string' || (!answer && !unsolicited)) throw Error('Agent API 没有返回文本');
-        const current=store.read(),topic=decision?.topic||task.reason||'check-in',latest=automatic?environment():{};
+        /**
+         * One answer, two renderings. The page renders `text`; the bubble and any external channel
+         * (a WeChat clawbot bridge) get `plain`. Both come from the envelope the prompt asks for,
+         * and normalizeReply() derives the plain version when a model ignores it - the JSON object
+         * itself must never become the message (`{"notify":false,"text":""}` was a visible message
+         * on 2026-10-26 20:39).
+         */
+        const reply = readReply(envelope, automatic);
+        const decision = { ...envelope.result?.structured, text: reply.rich, notify: reply.notify, topic: reply.topic };
+        if(automatic&&(typeof reply.notify!=='boolean'||typeof reply.rich!=='string'||(reply.topic!==undefined&&(typeof reply.topic!=='string'||reply.topic.length>80))))throw Error('主动判断未符合 notify/text/plain/topic 协议');
+        const answer = reply.rich;
+        if (typeof answer !== 'string' || (!answer && !unsolicited && !report)) throw Error('Agent API 没有返回文本');
+        const current=store.read(),topic=reply.topic||task.reason||'check-in',latest=automatic?environment():{};
         if(delegated&&task.threadId!==current.activeThreadId)throw Error('待办运行期间已切换对话，回复未发布；可显式重试');
         const lateGate=automatic?(latest.ready===false?'runtime_unavailable':latest.busy?'busy':latest.readerFocused?'reading':latest.idleMs>=90*MINUTE?'away':latest.idleMs<MINUTE?'typing':''):'';
+        // Reports are REQUESTED, so neither the proactive format rule nor the capability-whine rule
+        // applies to them: measured 2026-10-27, the post-restart report was suppressed twice in a row,
+        // once by each gate, and the user saw nothing at all.
         const contentGate=unsolicited?proactiveMessageGate(answer):'';
-        const suppression=contentGate||(automatic?(decision?.notify!==true||!answer?'not_actionable':task.threadId!==current.activeThreadId?'history_closed':lateGate||messageGate(current.settings,current.initiative,now(),answer,topic,engagedAt)):'');
+        // An empty answer is silence for every task kind, reports included: a report with nothing to
+        // say must not become an empty bubble.
+        const suppression=contentGate||(!answer?'not_actionable':'')||(automatic?(reply.notify!==true?'not_actionable':task.threadId!==current.activeThreadId?'history_closed':lateGate||messageGate(current.settings,current.initiative,now(),answer,topic,engagedAt)):'');
         if(!suppression) {
           const destination=automatic?rotateForMessage(topic,answer):task.threadId;
-          const message={id:task.id,threadId:destination,role:'assistant',text:answer,at:now(),proactive:automatic||delegated,autonomous:automatic,unread:true,...task.todoId?{todoId:task.todoId}: {}};
+          // text = the page rendering, plain = what a bubble or an external channel may show.
+          const message={id:task.id,threadId:destination,role:'assistant',text:answer,plain:reply.plain,at:now(),proactive:automatic||delegated||report,autonomous:automatic,unread:true,...task.todoId?{todoId:task.todoId}: {}};
           store.change(s => { s.messages.push(message);const t=s.threads.find(t=>t.id===destination);if(t)t.updated=now();if(automatic){recordMessage(s.initiative,now(),answer,topic);s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.lastOutcome='message';} });
-          await notify(message);
+          await notify({ ...message, text: bubbleText(message), rich_text: message.text });
         }else store.change(s=>{s.initiative.lastOutcome=suppression;s.tasks.find(t=>t.id===task.id).suppressed=suppression;});
       }
-      store.change(s => { const settled=s.tasks.find(t => t.id === task.id);Object.assign(settled,{status:'completed',finished:now()});delete settled.deferred;if(task.todoId)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:s.messages.some(m=>m.id===task.id)?'completed':'failed',completedAt:now(),messageId:s.messages.some(m=>m.id===task.id)?task.id:null,...!s.messages.some(m=>m.id===task.id)?{error:'运行已结束，但回复被主动消息格式规则抑制'}:{}}); });
+      store.change(s => { const settled=s.tasks.find(t => t.id === task.id);Object.assign(settled,{status:'completed',finished:now()});delete settled.deferred;if(task.todoId){const todo=s.todos.find(t=>t.id===task.todoId),stored=s.messages.some(m=>m.id===task.id);if(todo){const next=stored&&todo.repeat?nextActivation(todo.repeat,now()):null;Object.assign(todo,stored?(next?{status:'pending',activateAt:next,lastDeliveredAt:now(),messageId:task.id,deliveries:(todo.deliveries||0)+1}:{status:'completed',completedAt:now(),messageId:task.id}):{status:'failed',completedAt:now(),error:'运行已结束，但回复被主动消息格式规则抑制'});}} });
     } catch (error) {
       const paused=automatic&&active.signal.aborted&&!stopped;
       if (!stopped&&!paused&&!manualRestart&&!userPreempted) failures.record({where:'newmate/task',code:error.code || 'task_failed',message:String(error.message),fields:{taskId:task.id}});
