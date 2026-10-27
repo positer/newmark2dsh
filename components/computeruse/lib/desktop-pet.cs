@@ -213,7 +213,7 @@ internal static class DesktopCapture {
             using (var composed=new Bitmap(screen.Width,screen.Height,PixelFormat.Format32bppRgb))
             using (var g=Graphics.FromImage(composed)) {
                 g.Clear(Color.Black);
-                int captured=0, failed=0;
+                int captured=0, failed=0, transparent=0;
                 // EnumDesktopWindows is top-to-bottom; paint back-to-front.
                 windows.Reverse();
                 foreach (IntPtr w in windows) {
@@ -240,7 +240,24 @@ internal static class DesktopCapture {
                         }
                     } finally { PetNative.SetThreadDpiAwarenessContext(previousDpi); }
                     if (bitmap!=null) using (bitmap) {
-                        if (ok) { g.DrawImage(bitmap,new Rectangle(r.Left-screen.Left,r.Top-screen.Top,width,height)); captured++; }
+                        if (ok) {
+                            // Measured 2026-10-27: several topmost, full-screen windows on this desktop
+                            // (CEF-OSC-WIDGET, Windows.UI.Core.CoreWindow, IslandWindow) are transparent
+                            // overlays. PrintWindow cannot reproduce their transparency, so each came back
+                            // as an opaque black rectangle and, painted last, turned the whole preview
+                            // black even though the windows underneath had captured fine (DSH lum=31,
+                            // taskbar 42). A window that covers a quarter of the screen and captured as
+                            // pure black is one of those overlays: skip it, do not paint over the desktop.
+                            bool blank=width*height>=screen.Width*screen.Height/4;
+                            int stepX=Math.Max(1,bitmap.Width/16), stepY=Math.Max(1,bitmap.Height/16);
+                            for (int sx=0; blank && sx<bitmap.Width; sx+=stepX)
+                                for (int sy=0; sy<bitmap.Height; sy+=stepY) {
+                                    Color c=bitmap.GetPixel(sx,sy);
+                                    if (c.R>2 || c.G>2 || c.B>2) { blank=false; break; }
+                                }
+                            if (blank) transparent++;
+                            else { g.DrawImage(bitmap,new Rectangle(r.Left-screen.Left,r.Top-screen.Top,width,height)); captured++; }
+                        }
                         else failed++;
                     }
                 }
@@ -248,7 +265,7 @@ internal static class DesktopCapture {
                 composed.Save(temp,ImageFormat.Png);
                 if (File.Exists(target)) File.Replace(temp,target,null); else File.Move(temp,target);
                 PetFiles.WriteJson(Path.Combine(config.directory,"capture.json"),new {
-                    captured=captured, failed=failed, desktop=config.desktop, bounds=PetNative.Bounds(screen),
+                    captured=captured, failed=failed, transparent=transparent, desktop=config.desktop, bounds=PetNative.Bounds(screen),
                     utc=DateTime.UtcNow.ToString("o"), method="EnumDesktopWindows/PrintWindow", read_only=true
                 });
             }

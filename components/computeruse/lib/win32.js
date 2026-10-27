@@ -438,7 +438,7 @@ const SEND_KEYS_ALIASES = {
   home: 'HOME', end: 'END',
   pageup: 'PGUP', 'page-up': 'PGUP', pgup: 'PGUP',
   pagedown: 'PGDN', 'page-down': 'PGDN', pgdn: 'PGDN',
-  plus: '+', minus: '-',
+  plus: '+', minus: '-', printscreen: 'PRTSC', prtsc: 'PRTSC', snapshot: 'PRTSC',
 };
 
 /**
@@ -450,6 +450,11 @@ const VIRTUAL_KEY_ALIASES = Object.freeze({
   delete: 0x2e, del: 0x2e, insert: 0x2d, ins: 0x2d, space: 0x20, up: 0x26, arrowup: 0x26,
   down: 0x28, arrowdown: 0x28, left: 0x25, arrowleft: 0x25, right: 0x27, arrowright: 0x27,
   home: 0x24, end: 0x23, pageup: 0x21, pgup: 0x21, pagedown: 0x22, pgdn: 0x22,
+  // The shortcut card lists Print Screen and Ctrl+plus/Ctrl+minus; without these spellings the
+  // chord parser refuses the base key and the documented shortcut cannot be delivered.
+  printscreen: 0x2c, prtsc: 0x2c, snapshot: 0x2c,
+  plus: 0xbb, '=': 0xbb, equal: 0xbb,
+  minus: 0xbd, '-': 0xbd,
 });
 
 /**

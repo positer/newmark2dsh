@@ -19,13 +19,14 @@
 
 import { causeChain, createErrorLog, describeError } from '../../lib/errors.js';
 import { computerUseOwner } from '../../lib/cu-caller.js';
+import { CU_SHORTCUTS, shortcutTable } from './lib/shortcuts.js';
 
 /** Newmark's action surface, exactly. */
 export const COMPUTER_USE_ACTIONS = [
   'observe', 'app_list', 'app_observe', 'wait_for', 'sequence',
   'takeover_start', 'takeover_stop', 'move', 'click', 'drag', 'sweep', 'scroll',
   'type', 'key', 'wait', 'app_activate', 'app_click', 'app_drag',
-  'app_scroll', 'app_type', 'app_key', 'mode_report',
+  'app_scroll', 'app_type', 'app_key', 'mode_report', 'shortcuts',
   'process_push', 'process_pull',
 ];
 
@@ -351,6 +352,10 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
             '',
             'OPENING AN APPLICATION. The Windows key does not work on this machine and it fails silently: `key: "win"` and `key: "win+r"` both answer `ok: true` with `focus_changed: true` and nothing happens, because the shell ignores synthetic Windows keys. The receipt says `windows_key_effect: "not-observed"` rather than claiming the key worked. Use the ordinary chord instead: `key: "ctrl+esc"` opens the Start menu, `type: "<the application name>"` lands in the Start menu search box, then `key: "enter"` launches it. `app_activate` NEVER launches a process: it binds a window that already exists and answers `app_target_not_found` when nothing matches, so it cannot start an application - to open one, use `ctrl+esc`.',
             '',
+            'SHORTCUT WHITELIST. The user asked for this set to be available to the desktop (and Ctrl+Space for switching input methods). \`action: "shortcuts"\` returns it as JSON; these are the spellings the chord parser accepts:',
+            shortcutTable(),
+            'Ctrl+Space and Ctrl+Shift switch input methods. A chord outside this list is still delivered when it resolves; the list is the curated set, not a sandbox.',
+            '',
             'OPERATING HABITS. Each was measured in a real session; the record and its evidence are in `docs/03-computer-use-playbook.md` (Newmark2DSH).',
             '- Call `takeover_start` before your first input, and `takeover_stop` in a `finally`. Each mode is exclusive to one DSH session; real mode leaves a topmost click-through overlay and virtual mode shows NewMate. Stop from the same session; another session receives `takeover_lease_owned_by_another_owner`. Direct API callers must keep the same `owner_id`.',
             '- `ok: true` does not mean it happened. Read the receipt fields themselves - `focus_changed`, `windows_key_effect`, `capture_scope`, `target_scope` - and where they are inconclusive verify from outside (`app_list`, or a foreground-window read) instead of trusting the return value of the action.',
@@ -412,6 +417,13 @@ export function createComputerUse({ captionDir, root, logger, leaseTtlMs } = {})
           output: { schema: { type: 'object' }, render: (args, value) => toolText(value) },
           async execute(args, execution) {
             const action = String(args?.action || 'observe');
+            // Read-only, platform-independent, and answered before any backend loads: the
+            // whitelist must be available even when no desktop backend can start.
+            if (action === 'shortcuts') return {
+              ok: true, action: 'shortcuts', platform: process.platform,
+              note: 'White-listed chords for key/app_key. Ctrl+Space and Ctrl+Shift switch input methods; a chord outside this list is still delivered if it resolves.',
+              shortcuts: CU_SHORTCUTS.map((entry) => ({ ...entry })),
+            };
             if(args?.desktop==='space'&&process.platform!=='darwin')return{ok:false,code:'unsupported_space_platform',error_code:'unsupported_space_platform',action_applied:false,error:'Mission Control Space requires macOS; no other desktop route is used'};
             const backend = await loadBackend();
             if (!backend) return UNAVAILABLE(action);
