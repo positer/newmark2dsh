@@ -1110,6 +1110,37 @@ public static class NmAgentWindow
     return (long)(ushort)delta << 16;
   }
 
+  /**
+   * Which window a wheel event at this screen point would be delivered to, ON THIS DESKTOP.
+   *
+   * Why the wheel needs this and a click does not: WM_LBUTTONDOWN carries CLIENT coordinates and a
+   * frame forwards it to the child it hit-tests, but WM_MOUSEWHEEL carries SCREEN coordinates and
+   * the system delivers it to the window under the cursor. On a desktop that is not the input
+   * desktop there is no cursor and no foreground window, so a wheel posted to the frame is left to
+   * DefWindowProc and - measured on this station - a Chromium frame does nothing with it: 46
+   * app_scroll calls answered posted=true while the page did not move.
+   *
+   * WindowFromPoint is scoped to the calling thread's desktop, and the agent thread is attached to
+   * the hidden desktop, so this resolves the render widget the mouse would have hit without
+   * reaching across desktops.
+   */
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+  [DllImport("user32.dll")] public static extern bool IsChild(IntPtr parent, IntPtr child);
+  public static IntPtr WindowAtScreenPoint(int x, int y)
+  {
+    POINT point = new POINT();
+    point.X = x;
+    point.Y = y;
+    return WindowFromPoint(point);
+  }
+  public static string ClassNameOf(IntPtr hWnd)
+  {
+    if (hWnd == IntPtr.Zero) return "";
+    StringBuilder text = new StringBuilder(256);
+    GetClassNameW(hWnd, text, text.Capacity);
+    return text.ToString();
+  }
+
   /** Where the middle of a window client area is, in screen coordinates. */
   public static bool ClientCenterOnScreen(IntPtr hWnd, out int screenX, out int screenY)
   {
@@ -1892,11 +1923,28 @@ function Invoke-NmAgentRequest {
     $centered = [NmAgentWindow]::ClientCenterOnScreen($target, [ref]$screenX, [ref]$screenY)
     $wheelParam = [NmAgentWindow]::WheelWParam($delta)
     $pointParam = [NmAgentWindow]::PointLParam($screenX, $screenY)
-    $posted = [NmAgentWindow]::Post($target, [NmAgentWindow]::WM_MOUSEWHEEL, [IntPtr][long]$wheelParam, [IntPtr][long]$pointParam)
+    # The wheel goes to the window the SYSTEM would deliver it to, and only to a descendant of the
+    # window we were told to drive. A wheel posted to the frame is what the page ignored.
+    $under = [NmAgentWindow]::WindowAtScreenPoint($screenX, $screenY)
+    $wheelTarget = $target
+    $routedToChild = $false
+    if ($under -ne [IntPtr]::Zero -and $under -ne $target -and [NmAgentWindow]::IsChild($target, $under)) {
+      $wheelTarget = $under
+      $routedToChild = $true
+    }
+    $posted = [NmAgentWindow]::Post($wheelTarget, [NmAgentWindow]::WM_MOUSEWHEEL, [IntPtr][long]$wheelParam, [IntPtr][long]$pointParam)
+    $frameFallback = $false
+    if (-not $posted -and $routedToChild) {
+      $frameFallback = [NmAgentWindow]::Post($target, [NmAgentWindow]::WM_MOUSEWHEEL, [IntPtr][long]$wheelParam, [IntPtr][long]$pointParam)
+    }
     return (New-NmLine -Id $id -Ok $true -Fields @{
       handle = [string]$request.handle
       delta = $delta
       posted = [bool]$posted
+      wheel_target = ('0x' + $wheelTarget.ToInt64().ToString('x'))
+      wheel_target_class = [NmAgentWindow]::ClassNameOf($wheelTarget)
+      wheel_target_is_child = [bool]$routedToChild
+      frame_fallback_posted = [bool]$frameFallback
       centered = [bool]$centered
       screen = @{ x = [int]$screenX; y = [int]$screenY }
     })

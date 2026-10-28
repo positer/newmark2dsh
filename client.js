@@ -1899,6 +1899,22 @@ function readPageGlobals() {
      * "重建索引只做确定性重建；三类判定由 Agent 经工具完成：先读证据，再决定，再应用". That is
      * narration, not status: nobody asked for it, and it is false now that the button drives the
      * run. A status bar reports; it does not explain itself. */
+    /*
+     * The short-memory list is presented NEWEST FIRST.
+     *
+     * It used to be appended in creation order, so the row a reader actually opens this panel
+     * for - what was just recorded - sat at the bottom behind a scroll, and every fresh entry
+     * pushed the visible ones down. The transport order is not the presentation order, so this
+     * sorts rather than reverses: the API keeps answering oldest-first because the NewMate run
+     * reads the same rows as a chronological history, and a reverse() here would silently
+     * inherit whatever order that endpoint happens to have.
+     */
+    const shortNewestFirst = (items) => (items || []).slice().sort((a, b) => {
+      const at = Date.parse(a?.createdAt);
+      const bt = Date.parse(b?.createdAt);
+      if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return bt - at;
+      return (Number(b?.seq) || 0) - (Number(a?.seq) || 0);
+    });
     function ShortMemoryView() {
       const [data,setData]=React.useState({items:[],path:'',loading:true,error:''});
       const [,setClock]=React.useState(0);
@@ -1907,8 +1923,8 @@ function readPageGlobals() {
         const timer=setInterval(()=>{if(!disposed)setClock(n=>n+1);},60000);return()=>{disposed=true;clearInterval(timer);};
       },[]);
       return h('section',{className:'ml-short-memory',style:{padding:24,width:'100%',overflowY:'auto'}},
-        h('h3',null,'短期记忆'),h('p',null,'建议每条 100 token 内 · 默认 7 天过期 · 过期项目保留并灰显'),
-        data.loading?h('p',null,'载入中…'):data.error?h('p',{role:'alert'},data.error):!data.items.length?h('p',null,'暂无短期记忆'):h('ol',null,...data.items.map(item=>{const expired=Date.parse(item.expiresAt)<=Date.now();return h('li',{key:item.seq,'data-expired':expired,style:{padding:'12px 0',whiteSpace:'pre-wrap',color:expired?'var(--dsw-alias-label-tertiary)':'var(--dsw-alias-label-primary)',opacity:expired?0.55:1}},h('div',null,`#${item.seq} · ${new Date(item.createdAt).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})} · ${expired?'已过期':'有效'} · 到期 ${new Date(item.expiresAt).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})}`),h('p',null,item.content));})),
+        h('h3',null,'短期记忆'),h('p',null,'建议每条 100 token 内 · 默认 7 天过期 · 过期项目保留并灰显 · 最新在最上'),
+        data.loading?h('p',null,'载入中…'):data.error?h('p',{role:'alert'},data.error):!data.items.length?h('p',null,'暂无短期记忆'):h('ol',null,...shortNewestFirst(data.items).map(item=>{const expired=Date.parse(item.expiresAt)<=Date.now();return h('li',{key:item.seq,'data-expired':expired,style:{padding:'12px 0',whiteSpace:'pre-wrap',color:expired?'var(--dsw-alias-label-tertiary)':'var(--dsw-alias-label-primary)',opacity:expired?0.55:1}},h('div',null,`#${item.seq} · ${new Date(item.createdAt).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})} · ${expired?'已过期':'有效'} · 到期 ${new Date(item.expiresAt).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})}`),h('p',null,item.content));})),
         data.path&&h('p',{className:'ml-preview-desc'},`完整文件：${data.path}`));
     }
     function MemoryLabPanel() {

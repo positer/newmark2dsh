@@ -31,6 +31,7 @@ import crypto from 'node:crypto';
 import { overlayContractReport, overlayState as realOverlayState, pulseOverlay, releaseOverlay, startOverlay, stopOverlay } from './overlay-win32.js';
 import { desktopPetContract, desktopPetState, releaseDesktopPet, startDesktopPet, stopDesktopPet, prepareDesktopPetTransfer } from './desktop-pet.js';
 import { acquireTakeoverLock } from './takeover-lock.js';
+import { convertCaptureFile, requestedFormat } from './image-format.js';
 import { desktopTransfers, transferReport, findDesktopTransfer, inspectTransferSource, startDesktopTransfer, returnDesktopTransfer, transferCommand, cleanupTransferredDesktop, releaseDesktopTransfersSync, restoreVirtualTransfers } from './desktop-transfer.js';
 
 /* ------------------------------------------------------------------ *
@@ -4172,23 +4173,49 @@ async function hiddenAppObserveAction(action, options, mode, header, route) {
     };
   }
   const file = hiddenFileFacts(String(shot.value.path || outPath));
+  /*
+   * The agent writes BMP because it has no encoder; a vision model reads PNG. The conversion runs
+   * only when the caller asked for it, and the receipt reports BOTH sides (requested vs served),
+   * so a caller is never told it received a format it did not get: a failed conversion keeps the
+   * BMP and names the reason instead of handing back a path that does not exist.
+   */
+  const requested = requestedFormat(options.format);
+  let imagePath = file.path;
+  let imageMime = 'image/bmp';
+  let imageBytes = file.bytes;
+  let imageSha256 = file.sha256;
+  let imageFormat = { requested, served: 'bmp', converted: false };
+  if (requested === 'png') {
+    const startedAt = Date.now();
+    const converted = convertCaptureFile({ sourcePath: file.path, targetPath: capturePath(options.ownerId, 'hidden') });
+    if (converted.ok === true) {
+      imagePath = converted.path;
+      imageMime = 'image/png';
+      imageBytes = converted.bytes;
+      imageSha256 = converted.sha256;
+      imageFormat = { requested, served: 'png', converted: true, conversion_ms: Date.now() - startedAt, source_bytes: converted.source_bytes, source_sha256: converted.source_sha256, bmp_path: file.path };
+    } else {
+      imageFormat = { requested, served: 'bmp', converted: false, error_code: converted.code, error: converted.error, conversion_ms: Date.now() - startedAt };
+    }
+  }
   const children = await hiddenAgentAnswer(route, 'children', { handle: application.handle }, { timeoutMs: options.timeoutMs });
   const controls = children.ok === true ? hiddenControls(children.value) : [];
   const capture = {
-    image_path: file.path,
-    image_mime: 'image/bmp',
+    image_path: imagePath,
+    image_mime: imageMime,
     width: Number(shot.value.width) || 0,
     height: Number(shot.value.height) || 0,
-    image_bytes: file.bytes,
+    image_bytes: imageBytes,
+    image_format: imageFormat,
     capture_method: `agent PrintWindow(hwnd,hdc,${Number(shot.value.route) || 0}) on the hidden desktop`,
     target_scope: application.handle,
     lane: 'hidden-agent',
     agent_capture_route: Number(shot.value.route) || 0,
     digest: {
-      sha256: file.sha256,
-      sha256_prefix: file.sha256 ? file.sha256.slice(0, 16) : '',
-      bytes: file.bytes,
-      of: 'the capture file bytes, not the window_capture lane luma digest',
+      sha256: imageSha256,
+      sha256_prefix: imageSha256 ? imageSha256.slice(0, 16) : '',
+      bytes: imageBytes,
+      of: imageFormat.converted ? 'the PNG this process wrote, not the agent BMP it came from' : 'the capture file bytes, not the window_capture lane luma digest',
     },
     agent_reported_sha256: String(shot.value.sha256 || ''),
     agent_reported_bytes: Number(shot.value.bytes) || 0,
@@ -4215,6 +4242,7 @@ async function hiddenAppObserveAction(action, options, mode, header, route) {
     image_height: capture.height,
     image_bytes: capture.image_bytes,
     capture,
+    image_format: imageFormat,
     controls,
     control_count: controls.length,
     controls_source: 'hidden-agent child-window enumeration, with no UI Automation and no geometry',
