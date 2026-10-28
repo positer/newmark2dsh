@@ -17,6 +17,7 @@ import {todoInput,todoMessageId,nextActivation} from './lib/todo-list.js';
 import {REPLY_PROTOCOL,normalizeReply,bubbleText,toPlain} from './lib/reply-format.js';
 import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet,paceThreshold,paceTimeWeight} from './lib/initiative.js';
 import { MONITOR_DEFAULTS, evaluateWorkspaces, settle } from './lib/workspace-diff.js';
+import { attachmentBlock, normalizeAttachments, readUploadContent, saveUpload, UPLOAD_EXCERPT_CHARS, UPLOAD_MAX_PER_MESSAGE } from './lib/upload-store.js';
 
 /**
  * A local wall-clock stamp WITH its offset.
@@ -74,7 +75,7 @@ export const NEWMATE_RUN_TOOLS = Object.freeze([
   'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size',
   'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel',
   'computer_use', 'screen_capture', NEWMATE_SEARCH_TOOL, NEWMATE_ASK_TOOL, 'compact_context', 'newmate_task',
-  'newmate_wechat_send_file',
+  'newmate_wechat_send_file', 'newmate_attachment_read',
   'newmate_conversation_new', 'newmate_conversation_send', 'newmate_conversation_read',
 ]);
 
@@ -203,10 +204,31 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     store.change(s => {
       if (s.tasks.some(t => t.id === id)) return;
       if (s.tasks.filter(t => ['pending','running'].includes(t.status)).length >= 100 || s.tasks.length >= 2000) throw Error('持久任务队列已达到容量上限');
-      s.tasks.push({ id, prompt, destination, threadId:targetThread, status: 'pending', created: now(), ...options?.kind ? { kind: options.kind } : {} });
+      s.tasks.push({ id, prompt, destination, threadId:targetThread, status: 'pending', created: now(), ...options?.kind ? { kind: options.kind } : {}, ...Array.isArray(options?.attachments) && options.attachments.length ? { attachments: options.attachments } : {} });
     });
     return { ok: true, id };
   };
+  /**
+   * What one turn's task prompt looks like when the user also handed over files.
+   *
+   * The block is built when the message is ACCEPTED, not when the run starts, because the durable
+   * task is the record: a steer, a retry or a queued turn must carry the same file facts the user
+   * sent, and re-reading the store at run time would let the two drift.
+   *
+   * The excerpt budget is what is LEFT of the 16000-character task bound after the user's own
+   * words and the block's fixed lines, so a long message shortens the excerpt instead of making
+   * the whole message unsendable. If even that does not fit, the excerpt is dropped and only the
+   * path is stated - a path the model can read through newmate_attachment_read.
+   */
+  function withAttachments(text, files) {
+    if (!files.length) return text;
+    const fixed = 240 * files.length;
+    const budget = Math.min(UPLOAD_EXCERPT_CHARS, Math.max(0, 15000 - text.length - fixed));
+    let prompt = [text, attachmentBlock(files, { budgetChars: budget })].filter(Boolean).join('\n\n');
+    if (prompt.length > 16000) prompt = [text, attachmentBlock(files, { budgetChars: 0 })].filter(Boolean).join('\n\n');
+    if (prompt.length > 16000) throw Error('附件说明过长，无法装进一条消息（上限 16000 字符）；请减少附件或缩短消息');
+    return prompt;
+  }
   /** A durable task's outcome as the live view's phase. The task record is the authority. */
   const liveOutcome = (status) => status === 'completed' ? 'done' : status === 'failed' ? 'failed' : status === 'paused' ? 'paused' : status === 'interrupted' ? 'interrupted' : status === 'pending' ? 'superseded' : 'done';
 
@@ -601,23 +623,53 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     },
     memoryContext() { const value=nativeMemory(); return {key:value.key,tree:structuredClone(value.tree),tags:structuredClone(value.tags),shortMemory:structuredClone(value.shortMemory),shortMemoryTotal:value.shortMemoryTotal,shortMemoryOmitted:value.shortMemoryOmitted,tools:structuredClone(value.tools),toolsMissing:structuredClone(value.toolsMissing),cacheHits:value.cacheHits()}; },
     failure(where,error) { failures.record({where,code:error.code || 'newmate_failed',message:String(error.message)}); },
-    chat(text, execution, threadId) {
-      if(typeof text!=='string'||!text.trim()||text.length>16000)throw Error('消息须为 1–16000 字符');
+    /**
+     * One user turn, from any entrance: the page, MCP newmate_chat, or the WeChat channel.
+     *
+     * The fourth argument is the only addition: a list of attachments the user handed over (see
+     * lib/upload-store.js). It is optional, so every existing caller is unaffected, and an empty
+     * message is legal only when at least one file came with it - a photo from the phone carries no
+     * words, and refusing it would make the channel unable to accept the very thing this argument
+     * exists for.
+     *
+     * The durable user message keeps the user's own words (text) and the files (attachments);
+     * the TASK prompt keeps the words plus the block that describes them, built once here so a
+     * steer, a queued merge and a fresh task all carry the same facts.
+     */
+    chat(text, execution, threadId, attachments) {
+      const files=normalizeAttachments(attachments),words=typeof text==='string'?text:'';
+      if(!files.length&&!words.trim())throw Error('消息须为 1–16000 字符');
+      if(words.length>16000)throw Error('消息须为 1–16000 字符');
+      const prompt=withAttachments(words,files);
       const selected=thread(threadId),caller=computerUseCaller(execution),origin=caller?.startsWith('dsh-session:')?caller.slice('dsh-session:'.length):undefined;
       const inputId=randomUUID();let task,mode='start';
       if(running&&activeTask?.threadId===selected.id&&activeTask.destination==='newmate'){
-        if(guide.pending.length>=32||guide.pending.reduce((n,m)=>n+m.content[0].text.length,0)+text.length>32000)throw Error('当前引导过长，请等待当前回复处理');
+        if(guide.pending.length>=32||guide.pending.reduce((n,m)=>n+m.content[0].text.length,0)+prompt.length>32000)throw Error('当前引导过长，请等待当前回复处理');
         task={ok:true,id:activeTask.id};mode='steer';
-        if(activeAutomatic){manualRestart=true;store.change(s=>{const t=s.tasks.find(t=>t.id===activeTask.id);t.kind='chat';t.prompt=text;if(origin)t.origin=origin;});active.abort();}
-        else guide.pending.push({role:'user',content:[{type:'text',text}],timestamp:now()});
+        if(activeAutomatic){manualRestart=true;store.change(s=>{const t=s.tasks.find(t=>t.id===activeTask.id);t.kind='chat';t.prompt=prompt;if(origin)t.origin=origin;if(files.length)t.attachments=files;});active.abort();}
+        else guide.pending.push({role:'user',content:[{type:'text',text:prompt}],timestamp:now()});
       }else{
         if(running&&activeTask?.destination==='newmate'&&activeTask.threadId!==selected.id){userPreempted=true;active.abort();}
         const pending=store.read().tasks.find(t=>t.kind==='chat'&&t.threadId===selected.id&&t.status==='pending');
-        if(pending){task={ok:true,id:pending.id};mode='steer';store.change(s=>{const t=s.tasks.find(t=>t.id===pending.id);t.prompt=[t.prompt,text].filter(Boolean).join('\n');});}
-        else {task=enqueue(text,'newmate',randomUUID(),selected.id);store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='chat';if(origin)t.origin=origin;});}
+        if(pending){task={ok:true,id:pending.id};mode='steer';store.change(s=>{const t=s.tasks.find(t=>t.id===pending.id);t.prompt=[t.prompt,prompt].filter(Boolean).join('\n');if(files.length)t.attachments=[...(t.attachments||[]),...files];});}
+        else {task=enqueue(prompt,'newmate',randomUUID(),selected.id,{attachments:files});store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='chat';if(origin)t.origin=origin;});}
       }
-      store.change(s=>{s.messages.push({role:'user',text,threadId:selected.id,at:now(),id:inputId,steerTaskId:task.id});const p=s.initiative;p.lastUserAt=now();p.unanswered=0;p.nextAttemptAt=Math.max(p.nextAttemptAt||0,now()+45*MINUTE);s.attention ||= {};s.attention[selected.id]={...(s.attention[selected.id]||{}),lastFocusedAt:now(),draftUntil:0};const t=s.threads.find(t=>t.id===selected.id);t.updated=now();if(t.title==='新对话')t.title=text.trim().slice(0,32);});
-      if(!running)queueMicrotask(()=>tick().catch(e=>logger?.warn?.(e.message)));return{...task,mode,inputId};
+      store.change(s=>{s.messages.push({role:'user',text:words,threadId:selected.id,at:now(),id:inputId,steerTaskId:task.id,...(files.length?{attachments:files}:{})});const p=s.initiative;p.lastUserAt=now();p.unanswered=0;p.nextAttemptAt=Math.max(p.nextAttemptAt||0,now()+45*MINUTE);s.attention ||= {};s.attention[selected.id]={...(s.attention[selected.id]||{}),lastFocusedAt:now(),draftUntil:0};const t=s.threads.find(t=>t.id===selected.id);t.updated=now();if(t.title==='新对话')t.title=(words.trim()||files[0].name).slice(0,32);});
+      if(!running)queueMicrotask(()=>tick().catch(e=>logger?.warn?.(e.message)));return{...task,mode,inputId,...(files.length?{attachments:files.length}:{})};
+    },
+    /**
+     * Store one file the user handed over, for either entrance (the page route and the WeChat
+     * channel call this same method, so a byte bound cannot be enforced in one path only).
+     */
+    saveAttachment({ bytes, name, source = 'page' } = {}) {
+      return saveUpload({ root, name, bytes, source, at: now() });
+    },
+    /**
+     * Read one stored attachment. The containment rule lives in the store, not here: this method
+     * exists so the model-facing tool and the page have exactly one reader to reason about.
+     */
+    readAttachment({ path: target, offset, limit } = {}) {
+      return readUploadContent({ root, path: target, offset, limit });
     },
     retry(id) { store.change(s => { const t = s.tasks.find(t => t.id === id); if (!t || (t.todoId&&s.todos.find(todo=>todo.id===t.todoId)?.status==='cancelled') || t.threadId!==s.activeThreadId || ['measurement','self_activation'].includes(t.kind)|| !['failed','interrupted'].includes(t.status)) throw Error('历史/自动任务只读或任务不可重试'); t.status = 'pending'; delete t.error;if(t.todoId){const todo=s.todos.find(todo=>todo.id===t.todoId);if(todo){todo.status='activated';delete todo.error;}} }); return { ok: true }; },
     wake(prompt, execution) { return enqueue(prompt, currentConversation(execution)); },

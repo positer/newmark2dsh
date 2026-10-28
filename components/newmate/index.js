@@ -11,6 +11,7 @@ import { createAskTool } from './lib/ask.js';
 import { createConversationBridge } from './lib/conversations.js';
 import { createWechatChannel } from './lib/wechat-channel.js';
 import { MONITOR_DEFAULTS, dedupeRoots } from './lib/workspace-diff.js';
+import { UPLOAD_MAX_BYTES } from './lib/upload-store.js';
 import { readCoreSelection } from '../agent-api/lib/core-model.js';
 import { startDesktopPet, stopDesktopPet, companionPetEvents, notifyDesktopPet, updateDesktopPetFocus, claimDesktopPetNotice, updateDesktopPetTheme } from '../computeruse/lib/desktop-pet.js';
 import { probeDesktop } from '../../lib/core-restart.js';
@@ -212,7 +213,65 @@ export function apply(ctx, config) {
     output: { schema: { type: 'object' }, render: (_, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     execute: (args, execution) => wechat.sendFile({ path: args.path, caption: args.caption, receiver: args.receiver, cwd: execution?.agent?.session?.header?.cwd }),
   }), 'newmate-wechat-send-file');
+  ctx.effect(() => ctx.tools.register({
+    name: 'newmate_attachment_read',
+    description: "Read a file the USER handed to NewMate - one uploaded on the NewMate page or received over the WeChat ClawBot channel - by the absolute path that the turn prompt quotes. Its authority is deliberately narrow: only files inside NewMate's own upload store can be read, so a path anywhere else on this machine is refused with file_not_in_upload_store even when it exists. Text only: a binary, an image, a PDF or an Office file answers file_not_text with its kind and size, because this bundle does not parse documents and will not pretend to. Bounds: at most 2000 lines per call (500 by default) and 2 MiB of bytes, and the answer reports more/truncatedBy so a short answer is known to be short. Refusals: path_required / file_not_found / file_unreadable / file_not_in_upload_store / not_a_regular_file / file_not_text.",
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', minLength: 1, maxLength: 1024, description: 'Absolute path of an attachment, exactly as the turn prompt quoted it.' },
+        offset: { type: 'integer', minimum: 1, description: 'First line to return, 1-based. Default 1.' },
+        limit: { type: 'integer', minimum: 1, maximum: 2000, description: 'How many lines to return. Default 500, at most 2000.' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object' }, render: (_, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    execute: (args) => mate.readAttachment({ path: args.path, offset: args.offset, limit: args.limit }),
+  }), 'newmate-attachment-read');
   ctx.effect(() => ctx.webServer.tapIndex(html => html.replace('</head>', `<script>window.${SNAPSHOT_GLOBAL}=${embedJson({ ok: true })};</script></head>`)), 'newmate-presence');
+  /**
+   * The one route that carries BYTES.
+   *
+   * It is separate from POST /newmark-newmate because that is a JSON control channel with a
+   * 64000-byte cap: base64 in JSON would inflate a 20 MiB file by a third and push it through a
+   * parser it does not belong in. Here the body IS the file, the name travels in a header, and the
+   * bound is enforced WHILE STREAMING, so an oversized upload is refused instead of buffered.
+   *
+   * The page then announces the returned attachment to the ordinary 'chat' action, which keeps
+   * exactly one inbound kernel: a file never enters NewMate by a second path, and the same
+   * announcement works for a file the WeChat channel saved for itself.
+   */
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/newmark-newmate/upload', handler: async (req, res) => {
+    const finish = (status, body) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(body)); };
+    try {
+      if (req.method !== 'POST') return finish(405, { ok: false, error: 'method_not_allowed' });
+      if (req.headers['x-newmark-newmate'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site') throw Error('请求来源无效');
+      const header = req.headers['x-newmate-filename'];
+      const rawName = Array.isArray(header) ? header[0] : header;
+      let name = '';
+      try { name = decodeURIComponent(String(rawName || '')); } catch { name = String(rawName || ''); }
+      const chunks = [];
+      let bytes = 0;
+      let over = false;
+      for await (const chunk of req) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytes += buffer.length;
+        if (bytes > UPLOAD_MAX_BYTES) { over = true; break; }
+        chunks.push(buffer);
+      }
+      if (over) {
+        // Stop pulling: the rest of an oversized body is not worth reading, and the caller is told
+        // why in a code it can act on.
+        try { req.destroy(); } catch { /* the connection is already the caller's problem */ }
+        return finish(413, { ok: false, code: 'file_too_large', error: '文件超过 ' + UPLOAD_MAX_BYTES + ' 字节（本机自设上限，不是微信协议声明的上限）', limitBytes: UPLOAD_MAX_BYTES });
+      }
+      if (!bytes) return finish(400, { ok: false, code: 'file_empty', error: '请求体为空：没有可保存的字节。' });
+      const saved = mate.saveAttachment({ bytes: Buffer.concat(chunks), name, source: 'page' });
+      if (!saved.ok) return finish(400, saved);
+      finish(200, { ok: true, attachment: saved.entry });
+    } catch (error) { finish(400, { ok: false, error: error.message }); }
+  } }), 'newmate-upload');
   ctx.effect(()=>ctx.webServer.register({kind:'exact',path:'/newmark-newmate/events',handler:async(req,res)=>{res.writeHead(req.method==='GET'?200:405,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(req.method==='GET'?{ok:true,...companionPetEvents()}:{ok:false,error:'read_only'}));}}),'newmate-pet-events');
   ctx.effect(()=>ctx.webServer.register({kind:'exact',path:'/newmark-newmate/avatar.png',handler:async(req,res)=>{if(req.method!=='GET'){res.writeHead(405);res.end();return;}res.writeHead(200,{'content-type':'image/png','cache-control':'public, max-age=3600'});res.end(fs.readFileSync(new URL('../computeruse/assets/desktop-pet.png',import.meta.url)));}}),'newmate-avatar');
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/newmark-newmate/loop', handler: async (req, res) => { if (req.method !== 'GET') { res.writeHead(405); res.end(); return; } res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify({ ok: true, agentLoop: mate.loopStatus(), question: mate.pendingQuestion() })); } }), 'newmate-loop-route');
@@ -234,7 +293,7 @@ export function apply(ctx, config) {
           case 'reveal-file':body=await revealReferencedFile({messages:mate.state().messages,id:input.id,target:input.path,controller:ctx.get?.('sessionController'),signal:new AbortController().signal});break;
           case 'claim-notification':body=claimDesktopPetNotice(input.id);break;
           case 'retry':body=mate.retry(input.id);break;
-          case 'chat':body=mate.chat(input.text,undefined,input.threadId);break;
+          case 'chat':body=mate.chat(input.text,undefined,input.threadId,input.attachments);break;
           case 'wechat-connect':body=await wechat.connect();break;
           case 'wechat-logout':wechat.logout();body=wechat.status();break;
           case 'answer-question':body=mate.answerQuestion(input);break;

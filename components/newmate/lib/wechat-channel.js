@@ -13,6 +13,7 @@ import { CDN_BASE, ILINK_BASE, createIlink, wechatStatePath } from './wechat-ili
 import { qrDataUrl } from './wechat-qr.js';
 import { bubbleText, toPlain } from './reply-format.js';
 import { inspectWechatFile } from './wechat-file.js';
+import { saveUpload, UPLOAD_MAX_BYTES } from './upload-store.js';
 
 const LOGIN_POLL_MS = 1200;
 const LOGIN_TTL_MS = 8 * 60 * 1000;
@@ -28,7 +29,7 @@ function emptyState() {
     token: '', botId: '', baseUrl: ILINK_BASE, ilinkUserId: '',
     cursor: '', ledger: {}, pending: [], awaiting: {}, sent: {},
     qrcode: '', qrAt: 0, error: '', connectedAt: 0, updatedAt: 0,
-    stats: { inbound: 0, acked: 0, skipped: 0, replies: 0, sendFailed: 0, files: 0, fileFailed: 0 },
+    stats: { inbound: 0, acked: 0, skipped: 0, replies: 0, sendFailed: 0, files: 0, fileFailed: 0, media: 0, mediaBytes: 0, mediaFailed: 0, voiceUnsupported: 0 },
   };
 }
 
@@ -93,6 +94,15 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     pending: state.pending.length,
     awaiting: Object.keys(state.awaiting).length,
     files: { count: Number(state.stats.files || 0), failed: Number(state.stats.fileFailed || 0), last: state.lastFile || null },
+    // The inbound half of the same question: how many files did the USER send us, and how many of
+    // those could not be fetched. Kept apart from files{} - that one is what this bot SENT.
+    media: {
+      count: Number(state.stats.media || 0),
+      bytes: Number(state.stats.mediaBytes || 0),
+      failed: Number(state.stats.mediaFailed || 0),
+      voiceUnsupported: Number(state.stats.voiceUnsupported || 0),
+      last: state.lastInboundFile || null,
+    },
   });
 
   function safeQr(payload) {
@@ -165,7 +175,72 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     }
   }
 
-  /* -------------------------------------------------------------- receive */
+  /* ---------------------------------------------------- inbound media (user -> bot) */
+
+  /**
+   * The ONE media item a WeChat message carries, in the official client's priority order.
+   *
+   * A message carries at most one downloadable media item (the SDK picks image > video > file >
+   * voice and never more than one), so accepting one is the protocol, not a shortcut we took.
+   * Picking the same order as the official client means a message the phone and this channel
+   * disagree about cannot exist.
+   *
+   * What each field is for:
+   *   encrypt_query_param / full_url  the CDN reference (full_url wins when the server sent one);
+   *   aes_key                         the key, in one of two encodings (see parseAesKey);
+   *   image aeskey                    a bare 32-hex key that WINS over aes_key for images;
+   *   file_name                       the ONLY name the protocol carries, and only for files.
+   */
+  const MEDIA_ITEM_ORDER = [
+    { type: 2, key: 'image_item', kind: 'image', plaintextAllowed: true },
+    { type: 5, key: 'video_item', kind: 'video', plaintextAllowed: false },
+    { type: 4, key: 'file_item', kind: 'file', plaintextAllowed: false },
+  ];
+
+  const hasReference = (media) => Boolean(media && (media.encrypt_query_param || media.full_url));
+
+  function describeMedia(items) {
+    for (const spec of MEDIA_ITEM_ORDER) {
+      const item = items.find((entry) => entry && entry.type === spec.type && entry[spec.key] && hasReference(entry[spec.key].media));
+      if (!item) continue;
+      const payload = item[spec.key];
+      const media = payload.media || {};
+      const named = typeof payload.file_name === 'string' && payload.file_name.trim() ? payload.file_name : '';
+      const fileName = named || (spec.kind === 'video' ? 'video.mp4' : 'image.bin');
+      return {
+        kind: spec.kind,
+        plaintextAllowed: spec.plaintextAllowed === true,
+        fileName,
+        originalName: named,
+        encryptQueryParam: typeof media.encrypt_query_param === 'string' ? media.encrypt_query_param : '',
+        fullUrl: typeof media.full_url === 'string' ? media.full_url : '',
+        aesKeyBase64: typeof media.aes_key === 'string' ? media.aes_key : '',
+        aeskeyHex: spec.kind === 'image' && typeof payload.aeskey === 'string' ? payload.aeskey : '',
+        declaredBytes: Number(spec.kind === 'file' ? payload.len : payload.video_size) || 0,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * A name for an inbound image.
+   *
+   * The extension is sniffed from the BYTES, not from the message: an image item carries no file
+   * name and no mime type, and naming a JPEG .bin would make the rest of the store describe it as
+   * binary. The magic numbers are the five formats a phone actually sends.
+   */
+  function imageFileName(bytes, at) {
+    const stamp = new Date(at || Date.now());
+    const pad = (value) => String(value).padStart(2, '0');
+    const base = '图片-' + stamp.getFullYear() + pad(stamp.getMonth() + 1) + pad(stamp.getDate()) + '-' + pad(stamp.getHours()) + pad(stamp.getMinutes()) + pad(stamp.getSeconds());
+    const head = bytes.subarray(0, 12);
+    if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return base + '.jpg';
+    if (head.subarray(0, 8).toString('hex') === '89504e470d0a1a0a') return base + '.png';
+    if (head.subarray(0, 3).toString('ascii') === 'GIF') return base + '.gif';
+    if (head.subarray(0, 4).toString('ascii') === 'RIFF' && head.subarray(8, 12).toString('ascii') === 'WEBP') return base + '.webp';
+    if (head.subarray(0, 2).toString('ascii') === 'BM') return base + '.bmp';
+    return base + '.img';
+  }
 
   function queue(messages) {
     let queued = 0;
@@ -174,17 +249,72 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       if (Number(message.message_type) !== 1) { state.stats.skipped += 1; continue; }
       const items = Array.isArray(message.item_list) ? message.item_list : [];
       const textItem = items.find((item) => item && item.type === 1);
-      const text = textItem && textItem.text_item && typeof textItem.text_item.text === 'string' ? textItem.text_item.text : '';
-      if (!text) { state.stats.skipped += 1; continue; }
+      let text = textItem && textItem.text_item && typeof textItem.text_item.text === 'string' ? textItem.text_item.text : '';
+      const voice = items.find((item) => item && item.type === 3);
+      // The server transcribes voice itself, and the SILK decode belongs to the phone's side of the
+      // protocol; when the server sent the transcript, a voice message IS a text message here.
+      if (!text && voice && voice.voice_item && typeof voice.voice_item.text === 'string') text = voice.voice_item.text;
+      const media = describeMedia(items);
+      if (!text && !media) {
+        // A voice item without a server transcript is the one inbound kind this bundle cannot use:
+        // decoding SILK needs a codec it does not carry. Counted apart from skipped, because "the
+        // user spoke" and "there was nothing to read" are different facts.
+        if (voice) state.stats.voiceUnsupported = Number(state.stats.voiceUnsupported || 0) + 1;
+        state.stats.skipped += 1;
+        continue;
+      }
       const known = id ? state.ledger[id] : null;
       if (known && known.state === 'acked') { state.stats.skipped += 1; log('wechat: id ' + id + ' already confirmed, not delivered again'); continue; }
       if (state.pending.some((item) => item.id === id)) continue;
-      state.pending.push({ id, text, peer: String(message.from_user_id || ''), contextToken: String(message.context_token || ''), at: Date.now(), attempts: 0 });
+      state.pending.push({ id, text, peer: String(message.from_user_id || ''), contextToken: String(message.context_token || ''), at: Date.now(), attempts: 0, ...media ? { media } : {} });
       state.stats.inbound += 1;
       state.lastInboundAt = Date.now();
       queued += 1;
     }
     return queued;
+  }
+
+  /**
+   * Hand ONE pending item to NewMate, fetching its media first when it has any.
+   *
+   * The split matters: a DOWNLOAD failure is not a DELIVERY failure. The first is retried and, when
+   * it keeps failing, still becomes a message to NewMate that says plainly the file could not be
+   * fetched - a file the user believes they sent cannot be dropped in silence. The second is the
+   * delivery itself, retried and then recorded as failed.
+   */
+  async function deliverOne(item) {
+    let attachment;
+    if (item.media) {
+      const got = await ilink.downloadMedia({
+        encryptQueryParam: item.media.encryptQueryParam,
+        fullUrl: item.media.fullUrl,
+        aesKeyBase64: item.media.aesKeyBase64,
+        aeskeyHex: item.media.aeskeyHex,
+        allowPlaintext: item.media.plaintextAllowed === true,
+        maxBytes: UPLOAD_MAX_BYTES,
+      });
+      if (!got.ok) return { failure: got };
+      const name = item.media.kind === 'image' ? imageFileName(got.bytes, item.at) : item.media.fileName;
+      const stored = saveUpload({ root, bytes: got.bytes, name, source: 'wechat', at: Date.now() });
+      if (!stored.ok) return { failure: stored };
+      attachment = stored.entry;
+      state.stats.media = Number(state.stats.media || 0) + 1;
+      state.stats.mediaBytes = Number(state.stats.mediaBytes || 0) + attachment.bytes;
+      state.lastInboundFile = { at: Date.now(), id: item.id, name: attachment.name, bytes: attachment.bytes, kind: attachment.kind, decrypted: got.decrypted === true, declaredBytes: Number(item.media.declaredBytes || 0) };
+    }
+    try {
+      // Exactly the call the page's POST reaches, plus the attachment list the page also uses.
+      return { answer: mate.chat(item.text, undefined, undefined, attachment ? [attachment] : undefined), attachment };
+    } catch (error) {
+      return { answer: { ok: false, error: error.message }, attachment };
+    }
+  }
+
+  /** What the user is owed, through NewMate, when a file could not be fetched at all. */
+  function mediaFailureNotice(item, failure) {
+    const label = item.media.kind === 'image' ? '图片' : item.media.kind === 'video' ? '视频' : '文件';
+    return '（用户通过微信发来一个' + label + '，本机没能取回：' + item.media.fileName + '；原因：' + (failure.code || 'download_failed') + '）'
+      + '请如实告诉用户没有收到这个' + label + '，不要假装看过它，也不要描述里面的内容。';
   }
 
   async function drain(generation) {
@@ -193,24 +323,40 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       if (item.lastAttempt && Date.now() - item.lastAttempt < RETRY_MS) continue;
       item.attempts = Number(item.attempts || 0) + 1;
       item.lastAttempt = Date.now();
-      let answer;
-      try {
-        // Exactly the call the page's POST reaches: chat(text, execution, threadId).
-        answer = mate.chat(item.text, undefined, undefined);
-      } catch (error) {
-        answer = { ok: false, error: error.message };
+      let attempt = await deliverOne(item);
+      let notice = false;
+      if (attempt.failure) {
+        if (item.attempts < MAX_DELIVERY_ATTEMPTS) {
+          save();
+          continue;
+        }
+        // Final attempt: the file is gone for good (an expired CDN reference, a key that does not
+        // match, a store that refused it), so the USER is owed an answer rather than silence.
+        state.stats.mediaFailed = Number(state.stats.mediaFailed || 0) + 1;
+        log('wechat: could not fetch media for ' + item.id + ' (' + (attempt.failure.code || 'failed') + '), delivering a notice instead');
+        try { attempt = { answer: mate.chat(mediaFailureNotice(item, attempt.failure), undefined, undefined), failure: attempt.failure }; notice = true; }
+        catch (error) { attempt = { answer: { ok: false, error: error.message }, failure: attempt.failure }; }
       }
+      const answer = attempt.answer;
       if (!answer || answer.ok !== true) {
         if (item.attempts >= MAX_DELIVERY_ATTEMPTS) {
-          state.ledger[item.id] = { state: 'failed', attempts: item.attempts, error: String(answer && answer.error || 'unavailable'), at: Date.now() };
+          state.ledger[item.id] = { state: 'failed', attempts: item.attempts, error: String((attempt.failure || answer || {}).error || 'unavailable'), at: Date.now() };
           state.pending = state.pending.filter((entry) => entry.id !== item.id);
           log('wechat: gave up delivering ' + item.id + ' after ' + item.attempts + ' attempts');
         }
         save();
         continue;
       }
-      // Receipt: from this line on, that WeChat message is never handed to NewMate again.
-      state.ledger[item.id] = { state: 'acked', attempts: item.attempts, taskId: String(answer.id || ''), mode: answer.mode, at: Date.now() };
+      /**
+       * Receipt: from this line on, that WeChat message is never handed to NewMate again. The
+       * attachment receipt says what was STORED (name, bytes, kind, digest); it does not claim the
+       * model read it, because whether it did is the answer's business, not the channel's.
+       */
+      state.ledger[item.id] = {
+        state: 'acked', attempts: item.attempts, taskId: String(answer.id || ''), mode: answer.mode, at: Date.now(),
+        ...attempt.attachment ? { attachment: { name: attempt.attachment.name, bytes: attempt.attachment.bytes, kind: attempt.attachment.kind, sha256: attempt.attachment.sha256 } } : {},
+        ...notice ? { mediaFailure: String(attempt.failure?.code || 'download_failed'), notice: true } : {},
+      };
       state.pending = state.pending.filter((entry) => entry.id !== item.id);
       state.stats.acked += 1;
       // The reminder forwarder needs somewhere to send: remember the newest peer and its token.

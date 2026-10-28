@@ -41,6 +41,13 @@ export const ILINK_BASE = 'https://ilinkai.weixin.qq.com';
 export const CDN_BASE = 'https://novac2c.cdn.weixin.qq.com/c2c';
 /** A 20 MB attachment over a phone hotspot needs more than the 15 s an API call gets. */
 const CDN_UPLOAD_TIMEOUT_MS = 120000;
+/** The same reasoning in the other direction: an inbound file arrives over the same link. */
+const CDN_DOWNLOAD_TIMEOUT_MS = 120000;
+/**
+ * The default ceiling for one inbound media item. The caller passes its own bound; this default
+ * mirrors the upload store's self-imposed number so the two directions cannot disagree by default.
+ */
+const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 /** Official client: retry server errors, abort at once on 4xx (src/cdn/cdn-upload.ts). */
 const CDN_UPLOAD_ATTEMPTS = 3;
 /** UploadMediaType.FILE — 1 image, 2 video, 3 file, 4 voice. */
@@ -89,6 +96,41 @@ function encryptAesEcb(plaintext, key) {
 /** Ciphertext size for that padding, which is what getuploadurl calls `filesize`. */
 export function aesEcbPaddedSize(plaintextSize) {
   return Math.ceil((plaintextSize + 1) / 16) * 16;
+}
+
+/**
+ * The inbound half of the same cipher, and the reference parser for its key.
+ *
+ * An INBOUND media item carries a CDN reference, not bytes: media.encrypt_query_param names the
+ * object and media.aes_key carries the key. Two encodings of that key are seen in the wild, and
+ * they are not interchangeable:
+ *   base64(raw 16 bytes)            -> the historical image shape;
+ *   base64(the 32 ASCII hex chars)  -> file, voice and video (this is what our OWN outbound
+ *                                      file_item writes, so the two directions meet here).
+ * An image also has a bare 32-hex `aeskey` field of its own, which WINS over media.aes_key, and an
+ * image with no key at all is legitimately served in the clear. Source: @tencent-weixin/openclaw-weixin
+ * 2.4.10, src/cdn/pic-decrypt.ts (parseAesKey), src/media/media-download.ts, src/cdn/aes-ecb.ts.
+ */
+export function decryptAesEcb(ciphertext, key) {
+  const decipher = crypto.createDecipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+export function parseAesKey({ aesKeyBase64, aeskeyHex } = {}) {
+  const bare = typeof aeskeyHex === 'string' ? aeskeyHex.trim() : '';
+  if (/^[0-9a-fA-F]{32}$/.test(bare)) return { ok: true, key: Buffer.from(bare, 'hex'), encoding: 'bare-hex' };
+  const base64 = typeof aesKeyBase64 === 'string' ? aesKeyBase64.trim() : '';
+  if (!base64) return { ok: false, code: 'aes_key_missing', error: '这条媒体没有 aes_key，也没有 image aeskey' };
+  const decoded = Buffer.from(base64, 'base64');
+  if (decoded.length === 16) return { ok: true, key: decoded, encoding: 'base64-raw16' };
+  const ascii = decoded.toString('ascii');
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(ascii)) return { ok: true, key: Buffer.from(ascii, 'hex'), encoding: 'base64-hex32' };
+  return { ok: false, code: 'aes_key_invalid', error: 'aes_key 解码后既不是 16 字节原始密钥，也不是 32 位十六进制字符串（拿到 ' + decoded.length + ' 字节）' };
+}
+
+/** The download target for one inbound media reference; full_url wins when the server sent one. */
+export function cdnDownloadUrl({ cdnBaseUrl = CDN_BASE, encryptQueryParam } = {}) {
+  return String(cdnBaseUrl).replace(/\/+$/, '') + '/download?encrypted_query_param=' + encodeURIComponent(String(encryptQueryParam || ''));
 }
 
 /** The upload target when the server did not answer with a full URL. */
@@ -320,6 +362,73 @@ export function createIlink({ getBaseUrl, getToken, log, getCdnBaseUrl }) {
           len: String(upload.fileSize),
         },
       };
+    },
+    /**
+     * Fetch ONE inbound media reference and answer its plaintext bytes.
+     *
+     * No API endpoint is involved: the official client builds a plain HTTPS GET to the media CDN
+     * and decrypts what comes back (src/cdn/cdn-url.ts, src/cdn/pic-decrypt.ts). So the sequence
+     * here is: resolve the URL, GET it under a bound, parse the key, decrypt.
+     *
+     * Every refusal is its own code, because each one needs a different action from the caller:
+     * media_reference_missing (nothing to fetch), cdn_download_failed (the object is gone or the
+     * URL expired), media_too_large (refused before buffering), aes_key_* (the item's key is
+     * unusable), media_decrypt_failed (the bytes are not what the key describes).
+     *
+     * `allowPlaintext` exists for exactly one case, which the official client documents: an IMAGE
+     * that carries neither aes_key nor aeskey is served in the clear. Everything else without a
+     * key is refused rather than stored as garbage.
+     */
+    async downloadMedia({ encryptQueryParam, fullUrl, aesKeyBase64, aeskeyHex, allowPlaintext = false, maxBytes = MEDIA_MAX_BYTES } = {}) {
+      const full = typeof fullUrl === 'string' && fullUrl.trim() ? fullUrl.trim() : '';
+      const param = typeof encryptQueryParam === 'string' && encryptQueryParam.trim() ? encryptQueryParam.trim() : '';
+      if (!full && !param) return { ok: false, code: 'media_reference_missing', error: '这条媒体既没有 full_url 也没有 encrypt_query_param' };
+      const key = parseAesKey({ aesKeyBase64, aeskeyHex });
+      if (!key.ok && !(allowPlaintext && key.code === 'aes_key_missing')) return key;
+      const target = full || cdnDownloadUrl({ cdnBaseUrl: String(getCdnBaseUrl?.() || CDN_BASE), encryptQueryParam: param });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), CDN_DOWNLOAD_TIMEOUT_MS);
+      if (timer.unref) timer.unref();
+      let response;
+      try {
+        response = await fetch(target, { method: 'GET', signal: controller.signal });
+      } catch (error) {
+        clearTimeout(timer);
+        return { ok: false, code: error && error.name === 'AbortError' ? 'cdn_download_timeout' : 'cdn_download_failed', error: '下载超时（' + CDN_DOWNLOAD_TIMEOUT_MS + ' ms）' };
+      }
+      try {
+        if (!response.ok) {
+          const body = await response.text().catch(() => '');
+          return { ok: false, code: 'cdn_download_failed', status: response.status, error: 'CDN 下载 HTTP ' + response.status + ' ' + String(body || '').slice(0, 200) };
+        }
+        const declared = Number(response.headers.get('content-length') || 0);
+        // The bound is checked against the declaration AND while streaming: a lying or absent
+        // content-length must not be able to turn 20 MiB into a 1 GiB allocation.
+        if (declared && declared > maxBytes + 16) {
+          return { ok: false, code: 'media_too_large', declaredBytes: declared, limitBytes: maxBytes, error: '媒体声明 ' + declared + ' 字节，超过本机上限 ' + maxBytes + ' 字节' };
+        }
+        const chunks = [];
+        let total = 0;
+        for await (const chunk of response.body) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          total += buffer.length;
+          if (total > maxBytes + 16) {
+            try { await response.body.cancel?.(); } catch { /* the bound already answered */ }
+            return { ok: false, code: 'media_too_large', declaredBytes: total, limitBytes: maxBytes, error: '媒体超过本机上限 ' + maxBytes + ' 字节（已读 ' + total + ' 字节）' };
+          }
+          chunks.push(buffer);
+        }
+        const ciphertext = Buffer.concat(chunks);
+        if (!ciphertext.length) return { ok: false, code: 'media_empty', error: 'CDN 返回了 0 字节' };
+        if (!key.ok) {
+          return { ok: true, bytes: ciphertext, decrypted: false, cipherBytes: ciphertext.length, plainBytes: ciphertext.length, plaintext: true };
+        }
+        let plaintext;
+        try { plaintext = decryptAesEcb(ciphertext, key.key); } catch (error) {
+          return { ok: false, code: 'media_decrypt_failed', cipherBytes: ciphertext.length, error: 'AES-128-ECB 解密失败（密钥不匹配或密文被截断）：' + (error.message || error) };
+        }
+        return { ok: true, bytes: plaintext, decrypted: true, keyEncoding: key.encoding, cipherBytes: ciphertext.length, plainBytes: plaintext.length };
+      } finally { clearTimeout(timer); }
     },
     async notify(start) {
       return call({ endpoint: start ? 'ilink/bot/msg/notifystart' : 'ilink/bot/msg/notifystop', token: getToken(), payload: { base_info: baseInfo() } });
