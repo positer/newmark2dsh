@@ -46,6 +46,18 @@
 /** Which chunk types carry something this loop reads. Kept as data so the gate can assert the set. */
 export const CONSUMED_CHUNK_TYPES = ['text-delta', 'reasoning-delta', 'tool-call-delta', 'block-end', 'usage', 'finish'];
 
+/**
+ * How often the seam republishes the accumulating reasoning text while a turn streams.
+ *
+ * Every chunk of a reasoning stream is tiny, and each publication crosses a context event and
+ * a status reader; publishing each chunk would turn a 3,000-character thought into thousands
+ * of events for a view that is polled every 800 ms. The text is therefore published when it
+ * has grown by THINKING_CHUNK_CHARS characters or THINKING_CHUNK_MS has passed, plus once when
+ * the turn settles, so the live view never trails the model by more than a fraction of a second.
+ */
+export const THINKING_CHUNK_CHARS = 120;
+export const THINKING_CHUNK_MS = 200;
+
 /** The finish kinds this seam maps, and the loop stop reason each becomes. */
 export const FINISH_TO_STOP = {
   stop: 'stop',
@@ -570,9 +582,62 @@ export function createLlmStreamFn(llm, selection, options = {}) {
             continue;
           }
 
+          /**
+           * THE THINKING CHANNEL, and why it is a queue rather than a callback.
+           *
+           * The stream is read to its end by collectAssistant, but a live reader wants the
+           * reasoning WHILE it is produced. collectAssistant already reports every chunk to an
+           * onPartial callback, so the seam accumulates the reasoning deltas and republishes
+           * them in bounded steps; the generator below drains that queue between awaits, which
+           * is what lets the loop emit thinking events without changing the collector.
+           *
+           * The reasoning text is deliberately NOT added to the assistant message here: the
+           * provider's reasoning blocks already arrive through block-end and the collector keeps
+           * them, so this channel exists only for the live view. A failed attempt keeps whatever
+           * it published - the next attempt starts its text from empty, which is the honest
+           * description of a retry.
+           */
           let message;
+          let reasoning = '';
+          let publishedReasoning = 0;
+          let publishedAt = 0;
+          const pendingThinking = [];
+          let wakeThinking = null;
+          let settled = false;
+          let settleError = null;
+          const wake = () => {
+            if (wakeThinking !== null) {
+              const resolve = wakeThinking;
+              wakeThinking = null;
+              resolve();
+            }
+          };
+          const publishThinking = (final) => {
+            if (reasoning.length === 0 || reasoning.length === publishedReasoning) return;
+            const at = Date.now();
+            if (!final && reasoning.length - publishedReasoning < THINKING_CHUNK_CHARS && at - publishedAt < THINKING_CHUNK_MS) return;
+            publishedReasoning = reasoning.length;
+            publishedAt = at;
+            pendingThinking.push({ type: 'thinking', text: reasoning });
+            wake();
+          };
+          const collecting = collectAssistant(stream, modelId, (chunk) => {
+            if (chunk?.type !== 'reasoning-delta' || typeof chunk.text !== 'string' || chunk.text.length === 0) return;
+            reasoning += chunk.text;
+            publishThinking(false);
+          }, { signal: ctx.signal, BlockAssembler: options.BlockAssembler }).then(
+            (value) => { message = value; settled = true; publishThinking(true); wake(); return value; },
+            (error) => { settleError = error; settled = true; publishThinking(true); wake(); return undefined; },
+          );
+          while (true) {
+            if (pendingThinking.length > 0) { yield pendingThinking.shift(); continue; }
+            if (settled) break;
+            await new Promise((resolve) => { wakeThinking = resolve; });
+          }
           try {
-            message = await collectAssistant(stream, modelId, undefined, { signal: ctx.signal, BlockAssembler: options.BlockAssembler });
+            const value = await collecting;
+            if (settleError !== null) throw settleError;
+            message = value;
           } catch (error) {
             message = assistantMessageWithError(modelId, `the model stream failed: ${failureText(error)}`, String(error?.code ?? 'LLM_STREAM_FAILED'));
             message.causeText = error?.cause?.message;

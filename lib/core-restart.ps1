@@ -62,16 +62,47 @@ try {
   # The host may be launched via Electron-as-Node; do not propagate that mode.
   Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
   Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
-  Status 'starting' 'Launching the same installed desktop executable'
-  $started=Start-Process -FilePath $job.owner.path -WorkingDirectory (Split-Path $job.owner.path) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $folder 'desktop.stdout.log') -RedirectStandardError (Join-Path $folder 'desktop.stderr.log') -PassThru
-  $deadline=[DateTime]::UtcNow.AddSeconds(60)
+
+  # Wait until the Electron profile is actually released. The identity wait above only covers
+  # the tree frozen before the kill; a helper that outlives it keeps the user-data lock, and the
+  # replacement then exits within a second. Measured 2026-10-27 12:31:16: status.json said
+  # "DSH exited during startup ()" and the user had to launch the app by hand.
+  $deadline=[DateTime]::UtcNow.AddSeconds(20)
   do {
-    if ($started.HasExited) { throw "DSH exited during startup ($($started.ExitCode)); launch the installed app manually" }
-    $output=Get-Content -LiteralPath (Join-Path $folder 'desktop.stdout.log') -Raw -ErrorAction SilentlyContinue
-    if ($output -match 'dsh web: http://127\.0\.0\.1:') { Status 'running' "DSH host ready; new main PID $($started.Id)"; exit 0 }
-    Start-Sleep -Milliseconds 250
-  } while ([DateTime]::UtcNow -lt $deadline)
-  throw 'DSH launched but host readiness timed out; inspect local restart logs'
+    $samePath=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $job.owner.path })
+    if (!$samePath.Count) { break }
+    if ([DateTime]::UtcNow -gt $deadline) { throw 'Old DSH processes still hold the profile; no replacement launched' }
+    Start-Sleep -Milliseconds 200
+  } while ($true)
+
+  # One launch is not evidence. A launcher that re-execs exits and leaves the real host behind,
+  # so readiness is judged by the host itself - its stdout line or its window - not by the pid we
+  # happened to start. A launch that dies with nothing left behind is retried, bounded.
+  $attempts=0; $ready=$false; $lastDetail=''
+  while ($attempts -lt 3 -and !$ready) {
+    $attempts++
+    Status 'starting' "Launching the installed desktop executable (attempt $attempts of 3)"
+    # NOT -WindowStyle Hidden for the app itself. Measured 2026-10-27 12:35:31: the host came back
+    # with the HTTP server up and ZERO visible windows, because this Electron build creates its
+    # first window with the startup show state it was given. The helper stays hidden; the app must
+    # start normal or the restart looks to the user exactly like "it did not start".
+    $started=Start-Process -FilePath $job.owner.path -WorkingDirectory (Split-Path $job.owner.path) -WindowStyle Normal -RedirectStandardOutput (Join-Path $folder 'desktop.stdout.log') -RedirectStandardError (Join-Path $folder 'desktop.stderr.log') -PassThru
+    $deadline=[DateTime]::UtcNow.AddSeconds(45)
+    do {
+      $output=Get-Content -LiteralPath (Join-Path $folder 'desktop.stdout.log') -Raw -ErrorAction SilentlyContinue
+      if ($output -match 'dsh web: http://127\.0\.0\.1:') { $lastDetail='HTTP server up, waiting for a visible window' }
+      $alive=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $job.owner.path -and $_.CommandLine -notmatch '--type=' })
+      # A desktop app is not "ready" until it has a visible window. The stdout line only proves the
+      # HTTP server is up, and a windowless host is precisely the failure the user reported.
+      $window=@(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
+      if ($window.Count -gt 0) { $ready=$true; break }
+      if ($started.HasExited -and !$alive.Count) { $lastDetail="launched process exited ($($started.ExitCode)) with no host left behind"; break }
+      Start-Sleep -Milliseconds 300
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (!$ready -and $attempts -lt 3) { Start-Sleep -Seconds 2 }
+  }
+  if ($ready) { Status 'running' "DSH host ready after $attempts attempt(s)"; exit 0 }
+  throw "DSH did not become ready after $attempts attempt(s): $lastDetail"
 } catch {
   Status 'failed' $_.Exception.Message
   exit 1
