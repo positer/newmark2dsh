@@ -40,14 +40,12 @@ window.__ModuleLoader__.load({
     const NEWMATE_SLIDER_CSS = `@layer newmate-controls {
       .newmate-size-control { box-sizing:border-box; width:260px; max-width:100%; padding:12px; color:var(--dsw-alias-label-primary); font:inherit; }
       .newmate-size-heading,.newmate-size-limits { display:flex; justify-content:space-between; gap:16px; }
-      .newmate-size-heading { margin-bottom:12px; font-size:13px; }
-      .newmate-size-limits { font-size:11px; opacity:.65; margin-top:6px; }
+      .newmate-size-heading { margin-bottom:12px; font-size:13px; line-height:20px; }
+      .newmate-size-limits { font-size:11px; line-height:14px; opacity:.65; margin-top:6px; }
       .newmate-size-control input { display:block; width:100%; margin:0; cursor:pointer; accent-color:var(--dsw-alias-label-primary); }
       .newmate-size-control output { font-variant-numeric:tabular-nums; min-width:46px; text-align:right; }
-      .nmc-config-section { display:grid; gap:12px; padding:16px 0; }
-      .nmc-config-section + .nmc-config-section { border-top:1px solid var(--dsw-alias-border-secondary); }
-      .nmc-config-subhead { font-size:13px; margin:0; font-weight:500; }
     }`;
+
     function NewMatePetMenuControl(){return h('div',{style:{display:'grid',gap:2,padding:6,minWidth:180}},h('button',{type:'button',role:'menuitem',className:'newmate-pet-action','data-newmate-action':'stop-companion',style:{textAlign:'left',padding:'10px 14px',border:0,borderRadius:7,background:'transparent',color:'inherit',font:'inherit'}},'退出伴随'),h('button',{type:'button',role:'menuitem',className:'newmate-pet-action','data-newmate-action':'settings',style:{textAlign:'left',padding:'10px 14px',border:0,borderRadius:7,background:'transparent',color:'inherit',font:'inherit'}},'打开设置'));}
         function NewMateSizeControl({value=1,onChange,disabled=false,title='NewMate 大小'}) {
       const percent=Math.round(value*1000)/10;
@@ -2277,7 +2275,7 @@ function readPageGlobals() {
             .nm-page *{box-sizing:border-box}.nm-page button,.nm-page input,.nm-page textarea{font:inherit;color:inherit}.nm-page button{cursor:pointer;transition:background .15s;border:1px solid transparent;border-radius:9px;background:transparent;padding:8px 12px}.nm-page button:hover{background:var(--dsw-alias-bg-hover,#ffffff0b)}.nm-page button:focus-visible,.nm-page textarea:focus-visible,.nm-page input:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#6ea2ff);outline-offset:2px}.nm-page button:disabled{opacity:.45;cursor:default}
             .nm-history{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--dsw-alias-border-secondary,#ffffff12);background:var(--dsw-alias-bg-elevated,#1b1b1b);padding:20px 12px 12px;gap:16px}.nm-history-heading{display:flex;align-items:center;justify-content:space-between;padding:0 8px;font-size:15px;font-weight:600}.nm-new{width:100%;border-color:var(--dsw-alias-border-secondary,#ffffff20);text-align:left;min-height:40px}.nm-search{width:100%;padding:9px 11px;border:1px solid var(--dsw-alias-border-secondary,#ffffff20);border-radius:9px;background:transparent}.nm-thread-list{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:5px}.nm-thread{position:relative;border-radius:10px}.nm-thread.active{background:var(--dsw-alias-bg-hover,#ffffff0b)}.nm-page .nm-thread-main{width:100%;text-align:left;padding:12px;display:grid;gap:6px}.nm-thread-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;padding-right:9px}.nm-thread-date{color:var(--dsw-alias-label-tertiary,#888);font-size:11px}.nm-thread-actions{display:flex;justify-content:flex-end;padding:0 5px 5px;gap:2px}.nm-thread-actions button{font-size:11px;padding:4px 7px;color:var(--dsw-alias-label-secondary,#aaa)}.nm-history-footer{display:grid;gap:5px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-secondary,#ffffff12)}.nm-history-empty{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-tertiary,#888);padding:12px}.nm-unread{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-brand-primary,#6ea2ff);margin-right:6px}
             .nm-main{min-width:0;min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr) auto}.nm-header{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 28px;border-bottom:1px solid var(--dsw-alias-border-secondary,#ffffff12)}.nm-heading{min-width:0;display:grid;gap:5px}.nm-heading h2{font-size:16px;margin:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nm-subtitle{font-size:12px;color:var(--dsw-alias-label-tertiary,#888)}.nm-header-actions{display:flex;align-items:center;gap:4px;flex-shrink:0}.nm-header-actions>button{font-size:12px;color:var(--dsw-alias-label-secondary,#aaa);min-height:34px}.nm-header-actions>button:hover{color:var(--dsw-alias-label-primary,#eee)}.nm-brand{display:flex;align-items:center;gap:12px;min-width:0}.nm-brand-mark{width:34px;height:34px;display:grid;place-items:center;overflow:hidden;border-radius:10px;background:var(--dsw-alias-bg-elevated,#202020);flex-shrink:0}.nm-brand-mark img{width:27px;height:27px;object-fit:contain;transform:scale(1.65);opacity:.9}.nm-page .nm-switch{display:flex;align-items:center;gap:9px;white-space:nowrap;font-size:12px}.nm-switch-track{width:31px;height:18px;border-radius:12px;background:var(--dsw-alias-border-primary,#555);position:relative}.nm-switch-track:after{content:'';position:absolute;width:12px;height:12px;background:white;top:3px;left:3px;border-radius:50%;transition:transform .18s}.nm-switch[aria-checked=true] .nm-switch-track{background:var(--dsw-alias-brand-primary,#548bea)}.nm-switch[aria-checked=true] .nm-switch-track:after{transform:translateX(13px);background:var(--dsw-alias-bg-base,#141414)}.nm-history-toggle{display:inline-block}.nm-history-view{height:100%;overflow:auto;padding:24px 32px}.nm-history-view .nm-thread-list{max-width:760px;margin:auto;overflow:visible;gap:4px}.nm-history-view .nm-thread-main{min-height:64px;border-bottom:1px solid var(--dsw-alias-border-secondary,#ffffff12);border-radius:0;padding:14px 12px}.nm-history-view .nm-thread-main:hover{border-radius:9px}.nm-history-view .nm-thread-title{font-size:14px}.nm-history-view .nm-header{padding:0 12px 20px;max-width:760px;margin:auto}.nm-history-reading .nm-header{min-width:0}.nm-history-view .nm-search{max-width:760px;display:block;margin:16px auto}.nm-history-reading{min-height:0;min-width:0;overflow:hidden;display:grid;grid-template-rows:auto minmax(0,1fr);height:100%}.nm-feed{overflow:auto;min-height:0;padding:28px 32px;scrollbar-gutter:stable;scroll-padding-block:24px}.nm-feed:empty{padding:0}.nm-message{max-width:760px;margin:0 auto 28px;line-height:1.8;font-size:14px}.nm-message-label{display:flex;gap:9px;align-items:center;font-size:12px;font-weight:600;margin-bottom:8px}.nm-avatar{width:25px;height:25px;display:grid;place-items:center;border-radius:8px;background:var(--dsw-alias-bg-hover,#ffffff12);font-size:12px;overflow:hidden}.nm-message time{font-weight:400;color:var(--dsw-alias-label-tertiary,#888);font-size:11px}.nm-message-body{white-space:pre-wrap;overflow-wrap:anywhere}.nm-message.user{display:flex;flex-direction:column;align-items:flex-end}.nm-message.user .nm-message-body{max-width:88%;padding:12px 17px;border-radius:14px 14px 4px 14px;background:var(--dsw-alias-bg-elevated,#252525)}.nm-proactive{font-weight:400;color:var(--dsw-alias-brand-primary,#6ea2ff);font-size:11px}.nm-welcome{height:100%;min-height:240px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:14px;padding:24px;color:var(--dsw-alias-label-secondary,#aaa)}.nm-welcome-mark{width:56px;height:56px;border-radius:18px;display:grid;place-items:center;font-size:23px;color:var(--dsw-alias-label-primary,#eee);background:var(--dsw-alias-bg-elevated,#252525)}.nm-welcome h3{margin:4px 0 0;font-size:21px;font-weight:500;color:var(--dsw-alias-label-primary,#eee)}.nm-welcome p{font-size:13px;line-height:1.8;max-width:360px;margin:0;white-space:pre-line}.nm-prompts{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:6px}.nm-prompts button{border-color:var(--dsw-alias-border-secondary,#ffffff20);font-size:12px;padding:9px 14px;color:var(--dsw-alias-label-secondary,#aaa)}.nm-prompts button:hover{border-color:var(--dsw-alias-border-primary,#ffffff35);color:var(--dsw-alias-label-primary,#eee)}
-            .nm-composer-wrap{padding:8px 28px 18px;background:var(--dsw-alias-bg-base,#141414)}.nm-composer{max-width:760px;margin:auto;padding:13px 15px 10px;border:1px solid var(--dsw-alias-border-primary,#ffffff28);border-radius:16px;background:var(--dsw-alias-bg-elevated,#202020)}.nm-composer textarea{display:block;width:100%;resize:none;caret-color:var(--dsw-alias-label-primary,#eee);min-height:54px;max-height:150px;background:transparent;border:0;outline:none;line-height:1.6;padding:0}.nm-composer:focus-within{border-color:var(--dsw-alias-label-secondary,#aaa)}.nm-page .nm-composer textarea:focus-visible{outline:none}.nm-composer textarea::placeholder{color:var(--dsw-alias-label-tertiary,#888);opacity:1}.nm-composer-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}.nm-composer-hint{font-size:11px;color:var(--dsw-alias-label-tertiary,#888)}.nm-page .nm-send{background:var(--dsw-alias-label-primary,#e8e8e8);color:var(--dsw-alias-bg-base,#141414);font-size:12px;padding:7px 16px}.nm-error{max-width:760px;margin:0 auto 8px;font-size:12px;line-height:1.6;color:var(--dsw-alias-status-error,#ef9292)}.nm-pending{font-size:12px;color:var(--dsw-alias-label-secondary,#aaa);max-width:760px;margin:12px auto}.nm-live{font-size:11px;color:var(--dsw-alias-label-tertiary,#888)}.nm-question{max-width:760px;margin:0 auto 10px;border:1px solid var(--dsw-alias-border-primary,#555);border-radius:12px;padding:14px 16px;background:var(--dsw-alias-bg-elevated,#1b1b1b)}.nm-question-text{margin:0 0 10px;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-primary,#eee)}.nm-option{display:block;width:100%;text-align:left;margin:0 0 8px;padding:9px 12px;border:1px solid var(--dsw-alias-border-secondary,#444);border-radius:9px;background:transparent;color:inherit;cursor:pointer;font-size:12px;line-height:1.5}.nm-option:hover{border-color:var(--dsw-alias-brand-primary,#548bea)}.nm-option:disabled{opacity:.55;cursor:default}.nm-option-label{font-weight:600}.nm-option-desc{display:block;margin-top:3px;color:var(--dsw-alias-label-tertiary,#999);font-size:11px}.nm-question-manual{display:flex;gap:8px;margin-top:4px}.nm-question-manual input{flex:1;min-width:0;padding:8px 10px;border:1px solid var(--dsw-alias-border-secondary,#444);border-radius:8px;background:var(--dsw-alias-bg-base,#141414);color:inherit;font-size:12px}.nm-question-manual button{padding:8px 14px;border:1px solid var(--dsw-alias-border-secondary,#444);border-radius:8px;background:var(--dsw-alias-bg-layer-2,#252525);color:inherit;cursor:pointer;font-size:12px}.nm-live-thought{max-width:760px;margin:0 auto 8px;padding-left:9px;border-left:1px solid var(--dsw-alias-border-secondary,#ffffff20);font-size:11px;line-height:1.7;color:var(--dsw-alias-label-tertiary,#888);white-space:pre-wrap;overflow-wrap:anywhere;max-height:140px;overflow:auto}.nm-tasks{font-size:12px;max-width:760px;margin:20px auto;color:var(--dsw-alias-label-secondary,#aaa)}.nm-tasks-row{padding:10px 0;border-bottom:1px solid var(--dsw-alias-border-secondary,#ffffff12)}.nm-rename{display:flex;gap:4px;padding:7px}.nm-rename input{width:100%;min-width:0;background:transparent;border:1px solid var(--dsw-alias-border-secondary,#ffffff20);border-radius:5px;padding:6px}.nm-settings-view{height:100%;overflow:auto;padding:24px;color:var(--dsw-alias-label-primary,#eee)}.nm-settings-bar button{font:inherit;color:inherit;border:0;border-radius:9px;padding:8px 12px;background:transparent;cursor:pointer}.nm-settings-bar button:hover{background:var(--dsw-alias-bg-hover,#ffffff0b)}.nm-settings-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:12px}.nm-initiative-settings{max-width:760px;margin-bottom:28px;padding:16px 18px;border:1px solid var(--dsw-alias-border-secondary,#ffffff12);border-radius:12px;background:var(--dsw-alias-bg-elevated,#191919)}.nm-initiative-settings>label{display:flex;align-items:center;gap:8px;font-size:13px}.nm-initiative-settings>p{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,#aaa);margin:10px 0 16px}.nm-preference-row{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin:14px 0;font-size:13px}.nm-settings-view .nm-initiative-settings .nm-toggle-row{display:flex;align-items:center;gap:8px;font-size:13px}.nm-settings-view .nm-initiative-settings .nm-settings-divider{border:0;border-top:1px solid var(--dsw-alias-border-secondary,#ffffff12);margin:18px 0}.nm-settings-view .nm-initiative-settings select,.nm-settings-view .nm-initiative-settings input[type=number]{height:30px;padding:0 8px;border:1px solid var(--dsw-alias-border-secondary,#ffffff1f);border-radius:8px;background:var(--dsw-alias-bg-base,#141414);color:inherit;font:inherit;font-size:13px}.nm-settings-view .nm-initiative-settings input[type=number]{width:96px;font-variant-numeric:tabular-nums}.nm-settings-view .nm-initiative-settings select:focus,.nm-settings-view .nm-initiative-settings input[type=number]:focus{outline:none;border-color:var(--dsw-alias-border-primary,#ffffff40)}.nm-settings-view .nm-initiative-settings input[type=number]:disabled,.nm-settings-view .nm-initiative-settings select:disabled{opacity:.55}.nm-settings-view .nm-initiative-settings .nm-unit{color:var(--dsw-alias-label-secondary,#9aa0a6);font-size:12px;margin-left:-2px}.nm-settings-view .nm-initiative-settings .nm-hint{margin:-2px 0 14px;color:var(--dsw-alias-label-secondary,#9aa0a6);font-size:12px;line-height:1.6}.nm-settings-view .nm-initiative-settings .nm-hint code{padding:0 4px;border-radius:4px;background:var(--dsw-alias-bg-base,#141414);font-size:11px}.nm-settings-view .nm-initiative-settings .nm-initiative-status{margin:10px 0 0;color:var(--dsw-alias-label-secondary,#9aa0a6);font-size:12px}.nm-preference-row select{font:inherit;color:var(--dsw-alias-label-primary,#eee);background:var(--dsw-alias-bg-base,#141414);border:1px solid var(--dsw-alias-border-primary,#ffffff25);border-radius:7px;padding:6px 9px}.nm-preference-row button{font:inherit;color:var(--dsw-alias-label-secondary,#aaa);background:transparent;border:1px solid var(--dsw-alias-border-secondary,#ffffff20);border-radius:8px;padding:7px 10px;cursor:pointer}.nm-preference-row button:hover{background:var(--dsw-alias-bg-hover,#ffffff0b)}.nm-initiative-settings .nm-initiative-status{margin-bottom:16px}.nm-settings-view h2{font-size:18px;margin:18px 0}.nm-settings-view{font-size:14px}.nm-settings-bar .nm-switch{display:flex;align-items:center;gap:9px;font-size:12px}.nm-settings-view>label{display:flex;align-items:center;gap:8px;font-size:13px;padding-bottom:18px;border-bottom:1px solid var(--dsw-alias-border-secondary,#ffffff12);margin-bottom:20px}.nm-settings-view>label input{width:14px;height:14px;margin:0}
+            .nm-composer-wrap{padding:8px 28px 18px;background:var(--dsw-alias-bg-base,#141414)}.nm-composer{max-width:760px;margin:auto;padding:13px 15px 10px;border:1px solid var(--dsw-alias-border-primary,#ffffff28);border-radius:16px;background:var(--dsw-alias-bg-elevated,#202020)}.nm-composer textarea{display:block;width:100%;resize:none;caret-color:var(--dsw-alias-label-primary,#eee);min-height:54px;max-height:150px;background:transparent;border:0;outline:none;line-height:1.6;padding:0}.nm-composer:focus-within{border-color:var(--dsw-alias-label-secondary,#aaa)}.nm-page .nm-composer textarea:focus-visible{outline:none}.nm-composer textarea::placeholder{color:var(--dsw-alias-label-tertiary,#888);opacity:1}.nm-composer-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}.nm-composer-hint{font-size:11px;color:var(--dsw-alias-label-tertiary,#888)}.nm-page .nm-send{background:var(--dsw-alias-label-primary,#e8e8e8);color:var(--dsw-alias-bg-base,#141414);font-size:12px;padding:7px 16px}.nm-error{max-width:760px;margin:0 auto 8px;font-size:12px;line-height:1.6;color:var(--dsw-alias-status-error,#ef9292)}.nm-pending{font-size:12px;color:var(--dsw-alias-label-secondary,#aaa);max-width:760px;margin:12px auto}.nm-live{font-size:11px;color:var(--dsw-alias-label-tertiary,#888)}.nm-question{max-width:760px;margin:0 auto 10px;border:1px solid var(--dsw-alias-border-primary,#555);border-radius:12px;padding:14px 16px;background:var(--dsw-alias-bg-elevated,#1b1b1b)}.nm-question-text{margin:0 0 10px;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-primary,#eee)}.nm-option{display:block;width:100%;text-align:left;margin:0 0 8px;padding:9px 12px;border:1px solid var(--dsw-alias-border-secondary,#444);border-radius:9px;background:transparent;color:inherit;cursor:pointer;font-size:12px;line-height:1.5}.nm-option:hover{border-color:var(--dsw-alias-brand-primary,#548bea)}.nm-option:disabled{opacity:.55;cursor:default}.nm-option-label{font-weight:600}.nm-option-desc{display:block;margin-top:3px;color:var(--dsw-alias-label-tertiary,#999);font-size:11px}.nm-question-manual{display:flex;gap:8px;margin-top:4px}.nm-question-manual input{flex:1;min-width:0;padding:8px 10px;border:1px solid var(--dsw-alias-border-secondary,#444);border-radius:8px;background:var(--dsw-alias-bg-base,#141414);color:inherit;font-size:12px}.nm-question-manual button{padding:8px 14px;border:1px solid var(--dsw-alias-border-secondary,#444);border-radius:8px;background:var(--dsw-alias-bg-layer-2,#252525);color:inherit;cursor:pointer;font-size:12px}.nm-live-thought{max-width:760px;margin:0 auto 8px;padding-left:9px;border-left:1px solid var(--dsw-alias-border-secondary,#ffffff20);font-size:11px;line-height:1.7;color:var(--dsw-alias-label-tertiary,#888);white-space:pre-wrap;overflow-wrap:anywhere;max-height:140px;overflow:auto}.nm-tasks{font-size:12px;max-width:760px;margin:20px auto;color:var(--dsw-alias-label-secondary,#aaa)}.nm-tasks-row{padding:10px 0;border-bottom:1px solid var(--dsw-alias-border-secondary,#ffffff12)}.nm-rename{display:flex;gap:4px;padding:7px}.nm-rename input{width:100%;min-width:0;background:transparent;border:1px solid var(--dsw-alias-border-secondary,#ffffff20);border-radius:5px;padding:6px}
             @media(max-width:760px){.nm-page{grid-template-columns:minmax(0,1fr)}.nm-history{display:none}.nm-history-open .nm-history{display:flex;position:absolute;left:0;top:72px;bottom:0;width:240px;z-index:5;box-shadow:12px 0 35px #0003}.nm-history-toggle{display:inline-block}.nm-header{padding:14px 16px;gap:8px}.nm-header-actions{gap:2px}.nm-feed{padding:22px 18px}.nm-composer-wrap{padding:8px 16px 14px}.nm-subtitle{font-size:11px}.nm-message.user .nm-message-body{max-width:94%}}@media(prefers-reduced-motion:reduce){.nm-page *{transition:none}}
             .nm-attachments{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}.nm-attach{display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:3px 8px;border:1px solid var(--dsw-alias-border-secondary,#ffffff20);border-radius:999px;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary,#aaa);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:0 6px 6px 0}.nm-attach-size{opacity:.65}.nm-page .nm-attach button{border:0;background:transparent;padding:0 2px;font-size:12px;color:inherit;opacity:.7}.nm-page .nm-attach button:hover{opacity:1}.nm-page .nm-attach-btn{font-size:12px;padding:6px 10px;border:1px solid var(--dsw-alias-border-secondary,#ffffff20);border-radius:9px;color:var(--dsw-alias-label-secondary,#aaa);white-space:nowrap}.nm-page .nm-attach-btn:hover{color:var(--dsw-alias-label-primary,#eee)}`;
           function NewMatePanel() {
@@ -2317,7 +2315,6 @@ function readPageGlobals() {
             }
             /** The one-line live state of the agent loop, in the user-facing short form. */
             /** 微信通道的一句话状态；按钮文案只由连接状态决定。 */
-            const wechatStatusLine=(w)=>{if(!w||!w.phase||w.phase==='disconnected')return '未连接';if(w.phase==='connected')return '已连接';if(w.phase==='waiting_scan')return '等待扫码…';if(w.phase==='error')return '出错 '+(w.error||'');return '未连接';};
             function loopStatusLine(loop, now = Date.now()) {
               if (!loop?.running) return 'NewMate 正在回复 · 可继续输入引导';
               const phases={starting:'正在准备',model:'正在思考',finishing:'正在收尾',releasing:'正在释放桌面接管'};
@@ -2402,34 +2399,14 @@ function readPageGlobals() {
             async function addTodo(e){e.preventDefault();if(busy)return;setBusy(true);setError('');try{const repeat=todoRepeat==='none'?undefined:{every:Math.max(1,Number(todoEvery)||1),unit:todoRepeat,weekdays:todoRepeat==='d'&&todoDays.length?todoDays:undefined};await post({action:'todo-add',activateAt:new Date(todoTime).toISOString(),content:todoContent,mode:todoMode,repeat});setTodoDays([]);setTodoContent('');setTodoTime('');}catch(e){setError(e.message);}finally{setBusy(false);}}
             function renderTodos(){if(!todoOpen)return null;const list=[...(state.todos||[])].map(t=>({...t,repeatLabel:t.repeatText||(t.repeat?'重复':'')})).sort((a,b)=>(a.status==='pending'?0:1)-(b.status==='pending'?0:1)||a.activateAt-b.activateAt),labels={pending:'等待合适时机',activated:'已激活 · 正在处理',completed:'已完成',delivering:'正在投递',delivered:'已投递',cancelled:'已取消',failed:'未完成'};return h('aside',{className:'nm-todo','aria-label':'toDoList 待办列表'},h('header',null,h('div',null,h('strong',null,'toDoList'),h('p',null,'在合适的时候，开始一轮对话。')),h('button',{'aria-label':'关闭待办',onClick:()=>setTodoOpen(false)},'×')),h('div',{className:'nm-todo-scroll'},h('form',{className:'nm-todo-form',onSubmit:addTodo},h('label',null,'激活时间',h('input',{type:'datetime-local',required:true,value:todoTime,'aria-label':'待办激活时间',onChange:e=>setTodoTime(e.target.value)})),h('label',null,'到期方式',h('select',{value:todoMode,'aria-label':'待办到期方式',onChange:e=>setTodoMode(e.target.value)},h('option',{value:'conversation'},'激活 NewMate 对话'),h('option',{value:'reminder'},'仅发送原文提醒'))),h('label',null,'重复',h('select',{value:todoRepeat,'aria-label':'待办重复频率',onChange:e=>setTodoRepeat(e.target.value)},h('option',{value:'none'},'不重复'),h('option',{value:'min'},'按分钟'),h('option',{value:'h'},'按小时'),h('option',{value:'d'},'按天'))),todoRepeat!=='none'&&h('label',null,'每隔',h('input',{type:'number',min:1,max:10000,value:todoEvery,'aria-label':'重复间隔',onChange:e=>setTodoEvery(Number(e.target.value))})),todoRepeat==='d'&&h('div',{className:'nm-todo-days','aria-label':'重复工作日'},...['一二三四五六日'].map((name,i)=>h('label',{key:name},h('input',{type:'checkbox',checked:todoDays.includes(i+1),onChange:e=>setTodoDays(cur=>e.target.checked?[...new Set([...cur,i+1])].sort((a,b)=>a-b):cur.filter(d=>d!==i+1))}),'周'+name))),h('label',null,'内容或委托',h('textarea',{rows:3,required:true,maxLength:16000,value:todoContent,'aria-label':'待办发送内容',placeholder:'例如：该出发去见朋友了。',onChange:e=>setTodoContent(e.target.value)})),h('button',{type:'submit',className:'nm-send',disabled:busy||!todoTime||!todoContent.trim()},'添加待办')),error&&h('p',{role:'alert',className:'nm-error'},error),h('p',{className:'nm-todo-hint'},'两种到期方式都只等「陪伴开启 + NewMate 自己空闲」，与 DSH 工作区会话无关；被挡下时这里写明原因。静默时段只静音气泡，不推迟到账。'),h('div',{className:'nm-todo-list'},...list.map(t=>h('article',{key:t.id,className:'nm-todo-item','data-status':t.status},h('div',{className:'nm-todo-meta'},h('time',{dateTime:new Date(t.activateAt).toISOString()},new Date(t.activateAt).toLocaleString('zh-CN',{hour12:false})),h('span',null,t.status==='pending'&&t.activateAt<=Date.now()?(t.deferred?.reason?'已到期 · '+t.deferred.reason:'已到期 · 等待合适时机'):labels[t.status]||t.status)),h('small',null,t.mode==='conversation'?'激活 NewMate 对话':'原文提醒'),h('p',null,t.content),t.error&&h('small',null,t.error),['pending','failed'].includes(t.status)&&h('button',{disabled:busy,onClick:()=>act({action:'todo-cancel',id:t.id})},'取消待办'))),!list.length&&h('p',{className:'nm-todo-empty'},'还没有待办。把想记住的时间和事情放在这里。'))));}
             function renderPreview(){return preview?.file&&h('aside',{className:'nm-preview'+(previewExpanded?' expanded':''),'aria-label':'NewMate 原生文件预览'},h('header',null,h('strong',null,preview.title||'文件预览'),h('button',{onClick:()=>setPreviewExpanded(v=>!v)},previewExpanded?'收起':'展开'),h('button',{onClick:()=>preview.reveal()},'定位文件'),h('button',{'aria-label':'关闭预览',onClick:()=>setPreview(null)},'×')),h('div',{className:'nm-preview-path'},preview.file.path),h('div',{className:'nm-native-document'},h(NativeDocumentBoundary,{key:preview.file.path+preview.file.version,reveal:preview.reveal},h(NewMateNativeDocument,{file:preview.file,reveal:preview.reveal}))));}
+            // The settings view is the SAME catalogue the plugin page renders — components,
+            // model, companion, desktop size, update — mounted a second time. It is not a second
+            // page: the sections come from CONFIG_SECTION_ORDER, so a control added to the bundle
+            // appears here in the same commit, and one removed here is removed from the plugin
+            // page too. Its companion surface is this panel's live state, which already polls the
+            // route every two seconds; the rest comes from the same hook the plugin page uses.
             if(settingsView){
-              const watch=state.watch||{};
-              return h('section',{className:'nm-settings-view'},h('style',null,NEWMATE_CHAT_CSS),h('div',{className:'nm-settings-bar'},h('button',{onClick:()=>setSettingsView(false)},'返回 NewMate'),toggle),h(NewmarkConfigPanel),h('h2',null,'陪伴与工作区监控'),
-                h('div',{className:'nm-initiative-settings'},
-                  h('label',{className:'nm-toggle-row'},h('input',{type:'checkbox',checked:state.settings.initiative!==false,disabled:busy,onChange:e=>act({action:'settings',settings:{initiative:e.target.checked}})}),h('span',null,'允许主动陪伴')),
-                  h('p',{className:'nm-hint'},'不用你先开口，也会在合适的空隙聊聊；没有具体内容时保持沉默。'),
-                  h('div',{className:'nm-preference-row'},h('label',{htmlFor:'nm-pace'},'主动性'),h('select',{id:'nm-pace',value:state.settings.pace||'balanced',disabled:busy,onChange:e=>act({action:'settings',settings:{pace:e.target.value}})},h('option',{value:'quiet'},'低 · 更少打扰'),h('option',{value:'balanced'},'中 · 均衡'),h('option',{value:'active'},'高 · 更主动'))),
-                  h('p',{className:'nm-hint'},'主动性同时决定触发阈值（当前 '+(watch.threshold??0.6)+'）和安静时间的权重；没有每日条数上限，间距与静默时段仍然生效。'),
-                  h('div',{className:'nm-preference-row'},h('span',null,'静默时段（北京时间）'),h('select',{'aria-label':'静默开始时间',value:state.settings.quietStart??23,disabled:busy,onChange:e=>act({action:'settings',settings:{quietStart:Number(e.target.value)}})},...Array.from({length:24},(_,i)=>h('option',{key:i,value:i},String(i).padStart(2,'0')+':00'))),h('span',null,'至'),h('select',{'aria-label':'静默结束时间',value:state.settings.quietEnd??8,disabled:busy,onChange:e=>act({action:'settings',settings:{quietEnd:Number(e.target.value)}})},...Array.from({length:24},(_,i)=>h('option',{key:i,value:i},String(i).padStart(2,'0')+':00')))),
-                  h('div',{className:'nm-preference-row'},h('button',{disabled:busy,onClick:()=>act({action:'settings',settings:{snoozeUntil:Date.now()+8*3600000}})},'暂停主动陪伴 8 小时'),(state.settings.snoozeUntil||0)>Date.now()&&h('button',{disabled:busy,onClick:()=>act({action:'settings',settings:{snoozeUntil:0}})},'恢复主动陪伴')),
-                  h('hr',{className:'nm-settings-divider'}),
-                  h('label',{className:'nm-toggle-row'},h('input',{type:'checkbox',checked:state.settings.watchEnabled!==false,disabled:busy,onChange:e=>act({action:'settings',settings:{watchEnabled:e.target.checked}})}),h('span',null,'对比工作区文件变动')),
-                  h('p',{className:'nm-hint'},'启动时对比一次，之后按间隔重复；只比较文件数量、名称与最新修改时间，不读取文件内容。'),
-                  h('div',{className:'nm-preference-row'},h('label',{htmlFor:'nm-watch-interval'},'对比间隔'),h('input',{id:'nm-watch-interval',type:'number',min:5,max:1440,step:5,value:state.settings.watchIntervalMinutes??30,disabled:busy,onChange:e=>act({action:'settings',settings:{watchIntervalMinutes:Number(e.target.value)}})}),h('span',{className:'nm-unit'},'分钟')),
-                  h('p',{className:'nm-hint'},'范围 5–1440；改动从下一轮开始生效，不会打断正在进行的那一轮。'),
-                                    h('p',{className:'nm-hint'},'扫描深度、DSH 自建改动权重等高级项保留默认值（3 层 / 0.1 倍），可在插件配置里调整；此处不再显示。'),
-                  h('hr',{className:'nm-settings-divider'}),
-                  h('div',{className:'nm-preference-row'},h('span',null,'微信 ClawBot'),h('span',{className:'nm-unit'},wechatStatusLine(state.wechat)),h('button',{disabled:busy,onClick:async()=>{try{await act({action:'wechat-connect'});}finally{setWechatOpen(true);}}},(state.wechat&&state.wechat.connected)?'重新连接':'发起连接')),
-                  h('p',{className:'nm-hint'},(state.wechat&&state.wechat.connected)?'已连接。微信里发来的话等于你在页面上发信（运行中同样插入引导）；发来的图片、视频与文件也会存到本机，和页面上传共用同一套存储（图片与文档本身不解析，只按名称与字节数转述）。NewMate 的最终回复只以纯文字气泡发回微信，不转发思考、工具或主动消息。':'未连接。点「发起连接」弹出二维码；绑定信息只保存在本机，重启后自动恢复；点「重新连接」会清除旧登录并重新扫码。')),
-                error&&h('p',{role:'alert',className:'nm-error'},error),
-                (UpdateModal&&wechatOpen)?h(UpdateModal,{
-                  open:true,title:'连接微信 ClawBot',closeLabel:'取消',
-                  onClose:()=>setWechatOpen(false),
-                  description:(state.wechat&&state.wechat.connected)?'已连接。关闭这个窗口即可，无需再扫码。':(state.wechat&&state.wechat.waiting?'用手机微信扫描下面的二维码：我 → 设置 → 插件 → 微信 ClawBot → 扫描二维码。绑定成功后这里会自动变成已连接。':'正在向微信申请二维码…'),
-                  footer:h(React.Fragment,null,
-                    UpdateButton&&h(UpdateButton,{variant:'outline',onClick:()=>act({action:'wechat-connect'})},'重新生成二维码'),
-                    UpdateButton&&h(UpdateButton,{variant:'primary',onClick:()=>setWechatOpen(false)},(state.wechat&&state.wechat.connected)?'完成':'关闭')),
-                },(state.wechat&&state.wechat.qr&&state.wechat.qr.image)?h('div',{style:{display:'flex',justifyContent:'center',padding:12,background:'#fff',borderRadius:12,width:'fit-content',margin:'4px auto 0'}},h('img',{src:state.wechat.qr.image,alt:'微信 ClawBot 绑定二维码',width:260,height:260,style:{display:'block',imageRendering:'pixelated'}})):h('p',{style:{textAlign:'center',opacity:.7,minHeight:120,display:'flex',alignItems:'center',justifyContent:'center'}},'正在向微信申请二维码…')):null);
+              return h(NewMateSettingsView,{state,act,busy,error:String(error||''),onBack:()=>setSettingsView(false)});
             }
             const history=state.threads.filter(t=>t.id!==threadId&&t.title.toLowerCase().includes(search.toLowerCase())).sort((a,b)=>b.updated-a.updated);
             if(historyOpen){const selected=state.threads.find(t=>t.id===viewedHistory),past=state.messages.filter(m=>m.threadId===viewedHistory);
@@ -2481,161 +2458,653 @@ function readPageGlobals() {
           }, 'newmate-client-seats');
         }
 
-        /** Panel styles. Theme tokens only, so both colour schemes follow the shell. */
+        /* ============================================================================
+         * The configuration format.
+         *
+         * Every configuration surface this bundle owns is ONE composition of the parts
+         * below. Two mounts use it — the plugin page's own seat (plugins.bundle.config)
+         * and the NewMate settings view — and they render the same catalogue in the same
+         * order, so a control cannot exist on one of them and be missing from the other:
+         *
+         *   ConfigPage       the page frame: heading, subtitle, hero actions, sections
+         *   ConfigSection    a titled group, carrying data-config-section=<id>
+         *   ConfigCard       one bordered surface: category, title, copy, body, footer
+         *   ConfigRow        one component: name, role, state, note, one action
+         *   ConfigField      one labelled control, with its hint
+         *   ConfigNote       one line of state — plain, warning or error
+         *   ConfigSwitch     the one toggle shape (role=switch, aria-checked)
+         *   ConfigSelect     a select built from an options list
+         *   ConfigNumber     a number input with its unit
+         *   ConfigButton     DSH's own Button when the shell carries it, otherwise an
+         *                    equivalent with the same props and the same tokens
+         *
+         * The rule the format holds: a control is declared ONCE. Adding a field to a
+         * section puts it on both mounts in the same edit; removing it takes it off both.
+         * That property is what the two pages being locked to each other means — it is a
+         * fact about the catalogue, not about two blocks of markup that agree by hand
+         * until the next edit.
+         *
+         * Styling is --dsw-* tokens only: no literal colour, no !important, and every
+         * selector of this format is namespaced nmc-, so a rule of another plugin still
+         * wins by cascade order. The single exception is the shell-row suppression in
+         * PLUGIN_ROWS_CSS below, which the plugin mount renders and the other does not.
+         * ========================================================================== */
         const CONFIG_CSS = `
-    .nmc-config-settings { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr)); gap:16px; align-items:stretch; }
-    .nmc-config-card { min-width:0; display:flex; flex-direction:column; align-items:stretch; gap:12px; padding:20px; border:1px solid var(--dsw-alias-border-l1); border-radius:16px; background:var(--dsw-alias-bg-layer-2); }
-    .nmc-config-category { font-size:11px; color:var(--dsw-alias-label-tertiary); letter-spacing:.06em; }
-    .nmc-config-card .nmc-config-subhead { margin:0; font-size:16px; font-weight:600; line-height:1.5; color:var(--dsw-alias-label-primary); }
-    .nmc-config-description { margin:0; font-size:12px; line-height:1.7; color:var(--dsw-alias-label-secondary); }
-    .nmc-config-card.nmc-update-card { margin-top:4px; padding:20px 0 0; border:0; border-radius:0; background:transparent; }
-    .nmc-update-header { display:flex; align-items:center; justify-content:space-between; gap:24px; flex-wrap:wrap; }
-    .nmc-update-title { display:grid; gap:7px; min-width:0; flex:1 1 230px; }
-    .nmc-update-button { min-height:38px; padding:8px 18px; border-radius:10px; white-space:nowrap; flex:0 0 auto; }
-    .nmc-config-footnote.nmc-update-status { margin:0; padding-top:4px; border:0; overflow-wrap:anywhere; }
-    @media(max-width:480px) { .nmc-update-button { width:100%; } .nmc-update-header { gap:16px; } }
-    .nmc-config-section-heading { display:grid; gap:6px; margin-bottom:4px; }
-    .nmc-config-section-heading .nmc-config-head { margin:0; font-size:16px; }
-    .nmc-config-card .nmc-config-model { padding:0; border:0; background:transparent; gap:12px; }
-    .nmc-config-card .nmc-config-model-pick { flex-direction:column; align-items:stretch; gap:6px; }
-    .nmc-config-card .nmc-config-select { width:100%; min-height:36px; flex:auto; border-radius:9px; }
-    .nmc-config-card .newmate-size-control { width:100%; padding:8px 0; margin-top:4px; }
-    .nmc-config-card .newmate-size-heading { margin-bottom:18px; }
-    .nmc-config-footnote { margin-top:auto; padding-top:12px; border-top:1px solid var(--dsw-alias-border-l1); color:var(--dsw-alias-label-tertiary); font-size:11px; line-height:1.7; }
-    .nmc-config-card .nmc-config-model-note { line-height:1.7; overflow-wrap:anywhere; word-break:normal; }
-    .nmc-config { display: flex; flex-direction: column; gap: 10px; }
-    .nmc-config-head { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
-    .nmc-config-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-    .nmc-config-row {
-      display: grid;
-      grid-template-columns: 10px minmax(0, 1fr) auto auto;
-      grid-template-areas: "dot text state action" ". note note note";
-      align-items: center;
-      gap: 4px 10px;
-      padding: 10px 12px;
-      border-radius: 10px;
-      background: var(--dsw-alias-bg-layer-2);
-      border: 1px solid var(--dsw-alias-border-l1);
-    }
-    .nmc-config-switch {
-      grid-area: action;
-      font: inherit;
-      font-size: 12px;
-      padding: 3px 12px;
-      border-radius: 999px;
-      cursor: pointer;
-      color: var(--dsw-alias-label-primary);
-      background: transparent;
-      border: 1px solid var(--dsw-alias-border-l1);
-    }
-    .nmc-config-switch:hover:not(:disabled) { border-color: var(--dsw-alias-label-primary); }
-    .nmc-config-switch:disabled { opacity: 0.45; cursor: default; }
-    /* The plugin page has no slot for suppressing its own component rows: that section
-       is rendered unconditionally from the bundle's row list, and the "hidden" slots
-       filter the plugin LIST page, not a bundle's page.
-
-       An adjacent-sibling rule was tried first and did not work, which means the slot
-       renders this panel inside a wrapper and the rows section is not its sibling. So
-       this rule is unscoped instead, and its scoping comes from where the style tag
-       lives: the tag is rendered by this component, so it is in the DOM only while this
-       panel is mounted, and the plugin page shows one bundle at a time. No other
-       plugin's rows can be on screen while this rule is.
-
-       THE ONE UNSCOPED SELECTOR IN THIS PACKAGE, and it is declared rather than hidden:
-       the data-plugin-rows ATTRIBUTE is not a namespace, so another plugin that put the
-       same attribute on its own element would be styled by it — and one that set the
-       attribute on markup of its own would have that markup hidden while our panel is
-       mounted. Neither can happen on the bundle page as the shell renders it today (one
-       bundle per page, and the attribute is the shell's own for its row section), and the
-       alternative is leaving duplicate, contradictory row controls on the page. The gate
-       keeps a list of exactly this exception, so a SECOND unscoped selector fails rather
-       than joining it quietly.
-
-       The panel above replaces what it hides: it names the components and carries their
-       switches, which those rows cannot do. */
-    [data-plugin-rows] { display: none; }
-    .nmc-config-dot { grid-area: dot; width: 8px; height: 8px; border-radius: 50%; background: var(--dsw-alias-label-tertiary); }
-    .nmc-config-on { background: var(--dsw-alias-state-success-primary, #38a06a); }
-    .nmc-config-text { grid-area: text; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-    .nmc-config-name { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
-    .nmc-config-role { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
-    .nmc-config-state { grid-area: state; font-size: 12px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
-    .nmc-config-note { grid-area: note; font-size: 12px; color: var(--dsw-alias-label-tertiary); word-break: break-all; }
-    /* The model block. Not a row in the list above: a row is a switch, and this is the one
-       value on the page that is 准用 — authorised. It borrows the rows' surface so the page
-       reads as one surface, and its own accents so the states stay apart. */
-    .nmc-config-model {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      padding: 10px 12px;
-      border-radius: 10px;
-      background: var(--dsw-alias-bg-layer-2);
-      border: 1px solid var(--dsw-alias-border-l1);
-    }
-    .nmc-config-model-current { font-size: 12px; color: var(--dsw-alias-label-primary); word-break: break-all; }
-    .nmc-config-model-pick { display: flex; align-items: center; gap: 8px; }
-    .nmc-config-model-label { font-size: 12px; color: var(--dsw-alias-label-tertiary); white-space: nowrap; }
-    .nmc-config-select {
-      flex: 1;
-      min-width: 0;
-      height: 28px;
-      padding: 0 8px;
-      border-radius: 7px;
-      border: 1px solid var(--dsw-alias-border-l1);
-      background: var(--dsw-alias-bg-layer-1);
-      color: var(--dsw-alias-label-primary);
-      font: inherit;
-      font-size: 12px;
-    }
-    .nmc-config-select:disabled { opacity: 0.55; cursor: default; }
-    .nmc-config-model-note { font-size: 12px; color: var(--dsw-alias-label-tertiary); word-break: break-all; }
-    /* A state that needs acting on, not a decoration: an authorised model that is gone, or a
-       catalogue that could not be read. Amber, the shell's own warn token. */
-    .nmc-config-model-warn { font-size: 12px; color: var(--dsw-alias-state-warn-primary); word-break: break-all; }
-    
-    .nmc-config{max-width:1060px;margin:0 auto;gap:28px;padding:8px 2px 28px;color:var(--dsw-alias-label-primary)}
-    .nmc-config-hero{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:8px 0 22px;border-bottom:1px solid var(--dsw-alias-border-l1)}
-    .nmc-config-hero h2{margin:0 0 7px;font-size:25px;line-height:1.3;letter-spacing:-.025em;font-weight:600}.nmc-config-hero p{margin:0;font-size:13px;line-height:1.7;color:var(--dsw-alias-label-secondary)}
-    .nmc-config-hero-mark{width:46px;height:46px;display:grid;place-items:center;border-radius:14px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);flex-shrink:0}
-    .nmc-config-section>.nmc-config-head{margin:0 0 14px;font-size:15px}.nmc-config-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-    .nmc-config-row{padding:18px;gap:7px 10px;min-height:112px;border-radius:14px;align-content:start;background:var(--dsw-alias-bg-layer-1);transition:border-color .16s}
-    .nmc-config-row:hover{border-color:var(--dsw-alias-border-l2)}.nmc-config-name{font-size:14px;line-height:1.5}.nmc-config-role{font-size:12px;line-height:1.65;color:var(--dsw-alias-label-secondary)}
-    .nmc-config-state{font-size:11px;padding:3px 7px;border-radius:6px;background:var(--dsw-alias-interactive-bg-hover)}.nmc-config-note{font-size:11px;line-height:1.65;overflow-wrap:anywhere;word-break:normal;margin-top:2px}
-    .nmc-config-switch{min-height:30px;padding:4px 11px;border-radius:8px;background:var(--dsw-alias-bg-layer-2)}.nmc-config-switch:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:3px}
-    .nmc-config-settings{gap:16px}.nmc-config-card{border-radius:14px;padding:22px;gap:12px;background:var(--dsw-alias-bg-layer-1)}.nmc-config-section-heading{margin-bottom:16px}.nmc-config-category{font-size:10px;letter-spacing:.1em}
-    .nmc-config-card.nmc-update-card{margin-top:6px;padding:20px;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-layer-2)}
-    @media(max-width:640px){.nmc-config-list{grid-template-columns:1fr}.nmc-config-row{min-height:0;padding:16px}.nmc-config-hero h2{font-size:22px}.nmc-config{gap:22px}}
+    /* width:100% + min-width:0: the six-row grid's intrinsic width is wide, and as an auto-sized
+       child of the NewMate pane it grew past the pane and got clipped on the right (measured from
+       a capture: the second card and the hero mark were cut at the window edge). The plugin seat
+       is already narrower than max-width, so this changes nothing there. */
+    .nmc-page{display:flex;flex-direction:column;gap:26px;width:100%;max-width:1060px;min-width:0;margin:0 auto;padding:4px 2px 28px;color:var(--dsw-alias-label-primary);font:var(--dsw-font-s-14);box-sizing:border-box}
+    .nmc-page *,.nmc-page *::before,.nmc-page *::after{box-sizing:border-box}
+    .nmc-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:6px 0 20px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+    .nmc-hero-copy{display:grid;gap:6px;min-width:0}
+    .nmc-title{margin:0;font:var(--dsw-font-l-20);letter-spacing:-.01em}
+    .nmc-subtitle{margin:0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary)}
+    .nmc-hero-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:0 0 auto}
+    .nmc-hero-mark{display:grid;place-items:center;width:44px;height:44px;border-radius:12px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);flex:0 0 auto}
+    .nmc-mark{font:var(--dsw-font-l-20);color:var(--dsw-alias-label-primary)}
+    .nmc-section{display:grid;gap:12px}
+    .nmc-section-head{display:grid;gap:3px}
+    .nmc-section-title{margin:0;font:var(--dsw-font-s-strong-14);color:var(--dsw-alias-label-primary)}
+    .nmc-section-note{margin:0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary)}
+    /* TWO COLUMNS, NOT auto-fit. The plugin seat and the NewMate panel are containers of
+       different widths (measured: 905 and ~1040 CSS px), and an auto-fit list turned that
+       difference into three columns on one page and two on the other — the same catalogue
+       laid out differently on the two mounts. The column count is the format's decision, so
+       it is fixed here and only the narrow breakpoint below changes it. */
+    .nmc-list{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+    .nmc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;align-items:stretch}
+    .nmc-stack{display:grid;gap:12px}
+    .nmc-row{display:grid;grid-template-columns:10px minmax(0,1fr) auto auto;grid-template-areas:"dot name state action" "dot role state action" "dot note note note";align-items:start;gap:3px 10px;padding:13px 14px;min-height:96px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);transition:border-color var(--ds-transition-duration-fast) var(--ds-ease-in-out)}
+    .nmc-row:hover{border-color:var(--dsw-alias-border-l2)}
+    .nmc-dot{grid-area:dot;width:8px;height:8px;margin-top:6px;border-radius:50%;background:var(--dsw-alias-label-tertiary)}
+    .nmc-dot-on{background:var(--dsw-alias-state-success-primary)}
+    .nmc-dot-pending{background:var(--dsw-alias-state-warn-primary)}
+    .nmc-row-name{grid-area:name;font:var(--dsw-font-s-strong-14);color:var(--dsw-alias-label-primary)}
+    .nmc-row-role{grid-area:role;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary)}
+    /* align-self:start, not center: the row's cells are top-aligned, and a centred pill sat
+       26 px below its own button (measured) — two labels for one state on two different
+       lines. Both sit on the name line, at every row height. */
+    .nmc-row-state{grid-area:state;font:var(--dsw-font-xxxs-strong-11);color:var(--dsw-alias-label-secondary);padding:3px 7px;border-radius:6px;background:var(--dsw-alias-interactive-bg-hover);white-space:nowrap;align-self:start;margin-top:1px}
+    .nmc-row-note{grid-area:note;font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere;margin-top:2px}
+    .nmc-card{display:flex;flex-direction:column;gap:10px;min-width:0;padding:18px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);transition:border-color var(--ds-transition-duration-fast) var(--ds-ease-in-out)}
+    .nmc-card:hover{border-color:var(--dsw-alias-border-l2)}
+    .nmc-card-warn{border-color:var(--dsw-alias-state-warn-primary)}
+    .nmc-card-category{font:var(--dsw-font-xxxs-strong-11);letter-spacing:.08em;color:var(--dsw-alias-label-tertiary)}
+    .nmc-card-title{margin:0;font:var(--dsw-font-s-strong-14);color:var(--dsw-alias-label-primary)}
+    .nmc-card-copy{margin:0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary)}
+    .nmc-card-foot{margin-top:auto;padding-top:12px;border-top:1px solid var(--dsw-alias-border-l1);font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+    .nmc-field{display:grid;gap:6px;min-width:0}
+    .nmc-field-label{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary)}
+    .nmc-field-control{display:flex;align-items:center;gap:8px;min-width:0}
+    .nmc-field-inline{grid-template-columns:auto minmax(0,1fr);align-items:center;gap:10px}
+    .nmc-field-inline .nmc-field-hint{grid-column:1 / -1}
+    .nmc-field-hint{margin:0;font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+    .nmc-row-fields{display:grid;gap:12px;margin-top:2px}
+    .nmc-note{margin:0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+    .nmc-note-warn{margin:0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-state-warn-primary);overflow-wrap:anywhere}
+    .nmc-note-error{margin:0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-state-error-primary);overflow-wrap:anywhere}
+    .nmc-rule{margin:2px 0;border:0;border-top:1px solid var(--dsw-alias-border-l1)}
+    .nmc-switch{display:inline-flex;align-items:center;gap:8px;padding:4px 10px 4px 4px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-strong-12);cursor:pointer;white-space:nowrap}
+    .nmc-switch:hover:not(:disabled){border-color:var(--dsw-alias-border-l2)}
+    .nmc-switch:disabled{opacity:.45;cursor:default}
+    .nmc-switch:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+    .nmc-switch-track{position:relative;width:30px;height:18px;border-radius:999px;background:var(--dsw-alias-interactive-bg-active);transition:background var(--ds-transition-duration-fast) var(--ds-ease-in-out)}
+    .nmc-switch-knob{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--dsw-alias-label-primary);transition:transform var(--ds-transition-duration-fast) var(--ds-ease-in-out)}
+    .nmc-switch[aria-checked="true"] .nmc-switch-track{background:var(--dsw-alias-state-success-primary)}
+    .nmc-switch[aria-checked="true"] .nmc-switch-knob{transform:translateX(12px)}
+    .nmc-select{min-width:0;flex:1 1 auto;min-height:32px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12)}
+    .nmc-select:disabled{opacity:.55;cursor:default}
+    .nmc-select:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+    .nmc-number{width:88px;min-height:32px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-12);font-variant-numeric:tabular-nums}
+    .nmc-number:disabled{opacity:.55;cursor:default}
+    .nmc-number:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+    .nmc-unit{font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary)}
+    .nmc-action{min-height:32px;padding:0 14px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-strong-12);cursor:pointer;white-space:nowrap}
+    .nmc-action:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+    .nmc-action:disabled{opacity:.45;cursor:default}
+    .nmc-action:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+    .nmc-action-primary{background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-inverted);border-color:transparent}
+    .nmc-action-primary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}
+    .nmc-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    /* The NewMate mount's shell. The plugin page arrives inside the plugin manager's own
+       scrolling page; the NewMate panel has none, so without this the page was the direct child
+       of a pane that sizes to content. Same padding as the settings page it replaces. */
+    .nmc-mount{box-sizing:border-box;height:100%;min-height:0;min-width:0;width:100%;overflow-y:auto;overflow-x:hidden;padding:24px}
+    .nmc-card .newmate-size-control{width:100%;padding:0}
+    .nmc-card .newmate-size-heading{margin-bottom:14px}
+    @media(max-width:640px){.nmc-page{gap:22px}.nmc-title{font:var(--dsw-font-m-18)}.nmc-row{min-height:0;padding:12px}.nmc-list{grid-template-columns:1fr}}
 `;
+        /**
+         * The shell's own component rows, which this bundle's page replaces.
+         *
+         * The plugin page has no slot for suppressing them: that section is rendered
+         * unconditionally from the bundle's row list, and the hidden slots filter the plugin
+         * LIST page, not a bundle's page.
+         *
+         * An adjacent-sibling rule was tried first and did not work, which means the slot
+         * renders the panel inside a wrapper and the rows section is not its sibling. So
+         * this rule is unscoped instead, and its scoping comes from which mount renders the
+         * tag: suppressRows below is passed by the plugin mount alone, never by the NewMate
+         * settings view, so the rule is in the DOM only while the page that needs it is.
+         *
+         * THE ONE UNSCOPED SELECTOR IN THIS PACKAGE, declared rather than hidden: the
+         * data-plugin-rows ATTRIBUTE is not a namespace, so another plugin that put the same
+         * attribute on its own element would be styled by it. That cannot happen on the
+         * bundle page as the shell renders it today (one bundle per page, and the attribute
+         * is the shell's own for its row section). The gate keeps a list of exactly this
+         * exception, so a SECOND unscoped selector fails rather than joining it quietly.
+         *
+         * The panel above replaces what it hides: it names the components and carries their
+         * switches, which those rows cannot do.
+         */
+        const PLUGIN_ROWS_CSS = '[data-plugin-rows] { display: none; }';
+
+        /* ------------------------------------------------------------------ the parts --- */
 
         /**
-         * The bundle's own configuration page.
+         * One button, in whichever of its two forms the shell supports.
          *
-         * Registered into `plugins.bundle.config` under this package's name, which is the
-         * seat the plugin card renders on the bundle's page. It exists because the rows the
-         * card draws underneath are Loader bookkeeping — a row id and the module it resolved
-         * to — and a module path is not something a person can act on. Here the components
-         * appear by the names they are known by, each with the state that is true right now,
-         * read from the same page globals the rest of this half uses.
+         * DSH's own Button carries the shell's exact button tokens, so it is preferred; a
+         * shell without the primitives still gets a button, styled from the same tokens, so
+         * this format never has to be re-styled for a missing module. Both forms take the
+         * same props, so a call site names the role rather than the implementation.
          */
-        function NewmarkConfigPanel() {
+        function ConfigButton({ variant, size, onClick, disabled, title, children }) {
+          const kind = variant || 'outline';
+          if (typeof UpdateButton === 'function') {
+            return h(UpdateButton, { variant: kind, size, onClick, disabled, title }, children);
+          }
+          return h('button', {
+            type: 'button',
+            className: kind === 'primary' ? 'nmc-action nmc-action-primary' : 'nmc-action',
+            onClick, disabled, title,
+          }, children);
+        }
+
+        /** The page frame every configuration surface is rendered inside. */
+        function ConfigPage({ title, subtitle, mark, actions, sections, suppressRows }) {
+          return h('section', { className: 'nmc-page', 'aria-label': title },
+            h('style', null, CONFIG_CSS + NEWMATE_SLIDER_CSS + (suppressRows ? PLUGIN_ROWS_CSS : '')),
+            h('header', { className: 'nmc-hero' },
+              h('div', { className: 'nmc-hero-copy' },
+                h('h2', { className: 'nmc-title' }, title),
+                subtitle ? h('p', { className: 'nmc-subtitle' }, subtitle) : null),
+              h('div', { className: 'nmc-hero-actions' },
+                ...(Array.isArray(actions) ? actions.filter(Boolean) : []),
+                mark ? h('div', { className: 'nmc-hero-mark', 'aria-hidden': true }, mark) : null)),
+            ...(Array.isArray(sections) ? sections.filter(Boolean) : []));
+        }
+
+        /** One titled group. The id is the section's identity in the catalogue, not decoration. */
+        function ConfigSection({ id, title, note, children }) {
+          return h('section', { className: 'nmc-section', 'data-config-section': id, 'aria-label': title },
+            h('div', { className: 'nmc-section-head' },
+              h('h3', { className: 'nmc-section-title' }, title),
+              note ? h('p', { className: 'nmc-section-note' }, note) : null),
+            children);
+        }
+
+        /** One bordered surface with its own category, title, copy and footer. */
+        function ConfigCard({ category, title, description, footer, tone, children }) {
+          return h('section', { className: 'nmc-card' + (tone === 'warn' ? ' nmc-card-warn' : ''), 'aria-label': title },
+            category ? h('span', { className: 'nmc-card-category' }, category) : null,
+            title ? h('h4', { className: 'nmc-card-title' }, title) : null,
+            description ? h('p', { className: 'nmc-card-copy' }, description) : null,
+            children,
+            footer ? h('div', { className: 'nmc-card-foot' }, footer) : null);
+        }
+
+        /**
+         * One component: what it is called, what it does, what state it is in, and the one
+         * action that changes that state. `state` is the Host's answer rendered in words;
+         * `note` is the detail that identifies it.
+         */
+        function ConfigRow({ name, role, state, note, action, on, pending }) {
+          return h('li', { className: 'nmc-row' },
+            h('span', { className: pending ? 'nmc-dot nmc-dot-pending' : on ? 'nmc-dot nmc-dot-on' : 'nmc-dot', 'aria-hidden': true }),
+            h('span', { className: 'nmc-row-name' }, name),
+            h('span', { className: 'nmc-row-role' }, role),
+            state ? h('span', { className: 'nmc-row-state' }, state) : null,
+            h('span', { className: 'nmc-row-note' }, note),
+            action || null);
+        }
+
+        /** One labelled control. `inline` puts the label beside it instead of above. */
+        function ConfigField({ id, label, hint, control, inline }) {
+          return h('div', { className: 'nmc-field' + (inline ? ' nmc-field-inline' : '') },
+            h('label', { className: 'nmc-field-label', htmlFor: id }, label),
+            h('div', { className: 'nmc-field-control' }, control),
+            hint ? h('p', { className: 'nmc-field-hint' }, hint) : null);
+        }
+
+        /** One line of state. `tone` is what it means, not how it is coloured. */
+        function ConfigNote({ tone, children }) {
+          const kind = tone === 'warn' ? 'nmc-note-warn' : tone === 'error' ? 'nmc-note-error' : 'nmc-note';
+          return h('p', { className: kind, role: tone === 'error' ? 'alert' : undefined }, children);
+        }
+
+        /** The one toggle shape: a switch role, its track, and its label. */
+        function ConfigSwitch({ id, label, checked, disabled, onChange }) {
+          return h('button', {
+            id, type: 'button', role: 'switch', className: 'nmc-switch',
+            'aria-checked': checked === true, 'aria-label': label, disabled,
+            onClick: () => onChange?.(checked !== true),
+          },
+            h('span', { className: 'nmc-switch-track', 'aria-hidden': true }, h('span', { className: 'nmc-switch-knob' })),
+            h('span', { className: 'nmc-switch-label' }, label));
+        }
+
+        /** A select over an explicit option list; `groups` renders optgroups instead. */
+        function ConfigSelect({ id, label, value, options, groups, onChange, disabled }) {
+          const flat = Array.isArray(options) ? options : [];
+          const nested = Array.isArray(groups) ? groups : [];
+          return h('select', {
+            id, className: 'nmc-select', value: value === undefined ? '' : value,
+            'aria-label': label, disabled,
+            onChange: event => onChange?.(event.target.value),
+          },
+            ...flat.map(option => h('option', { key: String(option.value), value: option.value, disabled: option.disabled === true }, option.label)),
+            ...nested.map(group => h('optgroup', { key: group.id, label: group.label },
+              ...(group.options || []).map(option => h('option', { key: String(option.value), value: option.value, disabled: option.disabled === true }, option.label)))));
+        }
+
+        /** A number field with the unit read out beside it and its own hint. */
+        function ConfigNumber({ id, label, value, min, max, step, unit, hint, onChange, disabled }) {
+          return h(ConfigField, {
+            id, label, hint,
+            control: h(React.Fragment, null,
+              h('input', {
+                id, type: 'number', className: 'nmc-number', value,
+                min, max, step, disabled, 'aria-label': label,
+                onChange: event => onChange?.(Number(event.target.value)),
+              }),
+              unit ? h('span', { className: 'nmc-unit' }, unit) : null),
+          });
+        }
+        /* -------------------------------------------------------- the components list --- */
+
+        /**
+         * The components this bundle composes, named as their products — one list, read by
+         * the components section on every mount. `mounted` and `absent` are the words the row
+         * says when the Host reports the component running or not; a component whose note
+         * needs a live fact (the lease, the snapshot root) supplies it through `note`.
+         */
+        const CONFIG_COMPONENTS = [
+          { key: 'core', name: 'Newmark Core', role: 'shared user store, page snapshot', switchable: false },
+          { key: 'memoryLab', name: 'MemoryLab', role: 'durable memory, nine memory_lab_* tools, sidebar renderer', switchable: true, mounted: 'store mounted', absent: 'not loaded' },
+          { key: 'computerUse', name: 'ComputerUse', role: '21 computer_use actions, native screen-wide takeover stroke', switchable: true },
+          { key: 'agentApi', name: 'Agent API', role: '标准化的 Agent 调用接口：信封、错误分级、只读状态与 agent run', switchable: true, mounted: 'interface mounted', absent: 'not loaded' },
+          { key: 'newMate', name: 'NewMate', role: 'MemoryLab 驱动的陪伴内核、持久任务与低成本文件测量', switchable: true, mounted: 'kernel mounted', absent: 'not loaded' },
+          { key: 'heartBeat', name: 'heartBeat', role: 'DSH 全局重启与重启后向当前对话 / NewMate 投递任务', switchable: true, mounted: 'restart delivery mounted', absent: 'not loaded' },
+        ];
+
+        /**
+         * The components section.
+         *
+         * Everything the row says is the Host's answer, never the click: `applied[key]` is the
+         * receipt of the last switch, the note prefers the Host's own `detail` over the row's
+         * prose, and a failed switch prints the status, the error code and the detail together —
+         * showing one of them has already cost a diagnosis round.
+         */
+        function ConfigComponents({ model }) {
+          const rows = CONFIG_COMPONENTS.map(entry => {
+            const answer = model.applied[entry.key];
+            const answered = answer && answer.ok === true && typeof answer.mounted === 'boolean';
+            // `on` is null until something has answered: the page snapshot may be absent and the
+            // route may not have replied yet, and a row that renders that as 已禁用 tells the user
+            // five running components are off. The measured case: opening the page showed
+            // 已禁用 / not loaded for all five rows, then 已启用 a moment later.
+            const on = answered ? answer.mounted : model.on(entry.key);
+            const unknown = on === null || on === undefined;
+            const failed = Boolean(answer && answer.ok === false);
+            const note = failed
+              ? [answer.httpStatus ? 'HTTP ' + answer.httpStatus : null, answer.error ? String(answer.error) : null, answer.detail ? String(answer.detail) : null].filter(Boolean).join(' · ') || 'failed'
+              : answered && answer.detail ? String(answer.detail) : unknown ? '' : model.note(entry.key, on === true);
+            return h(ConfigRow, {
+              key: entry.key,
+              name: entry.name,
+              role: entry.role,
+              on: on === true,
+              pending: unknown,
+              state: failed ? '切换失败' : unknown ? '读取中…' : on ? '已启用' : '已禁用',
+              note,
+              action: entry.switchable
+                ? h(ConfigButton, {
+                    variant: on === true ? 'outline' : 'primary',
+                    disabled: model.pending === entry.key || unknown,
+                    onClick: () => model.toggle(entry.key, on !== true),
+                  }, model.pending === entry.key ? '…' : on ? '禁用' : '启用')
+                : null,
+            });
+          });
+          return h('ul', { className: 'nmc-list' }, ...rows);
+        }
+
+        /* --------------------------------------------------------------- the model card --- */
+
+        /**
+         * The authorised model.
+         *
+         * Four states are kept apart on purpose: not read yet, nothing authorised, authorised
+         * and listed, authorised and GONE. The last two must never look alike — a stale
+         * selection that reads as fine fails at run time with the provider's own error, which
+         * is the expensive way to learn it. The control shows the Host's answer and never a
+         * click, and an authorised model that is no longer offered stays selected and labelled
+         * rather than falling back to some other model's name.
+         */
+        function ConfigModelCard({ model }) {
+          const state = model.state;
+          const chosen = state && state.selected ? state.selected.provider + '\u0000' + state.selected.model : '';
+          const groups = state && Array.isArray(state.groups) ? state.groups : [];
+          const offered = groups.some(group => (group.models || []).some(entry => entry.provider + '\u0000' + entry.id === chosen));
+          const options = [];
+          if (chosen && !offered) options.push({ value: chosen, label: state.selected.provider + ' / ' + state.selected.model + ' —— 不在当前可用列表中' });
+          if (chosen && !offered) options.unshift({ value: '', label: '— 请重新选择 —', disabled: true });
+          const grouped = groups.map(group => ({
+            id: group.id,
+            label: group.name || group.id,
+            options: (group.models || []).map(entry => ({
+              value: entry.provider + '\u0000' + entry.id,
+              label: entry.name && entry.name !== entry.id ? entry.name + ' (' + entry.id + ')' : entry.id,
+            })),
+          }));
+          const empty = state && state.ok === true && (state.models || []).length === 0 && (state.failures || []).length === 0;
+          return h(ConfigCard, {
+            title: '准用模型',
+            footer: model.error ? h(ConfigNote, { tone: 'warn' }, model.error) : null,
+          },
+            h(ConfigNote, { tone: state !== null && state.selectedListed === false ? 'warn' : 'plain' },
+              state === null
+                ? '读取中…'
+                : state.selected
+                  ? '已准用：' + state.selected.provider + ' / ' + state.selected.model
+                  : '尚未准用任何模型 —— agent-api 会以 model_not_selected 拒绝运行，不会替用户选择'),
+            state !== null && state.selected && state.selectedListed === false
+              ? h(ConfigNote, { tone: 'warn' }, '⚠ 已准用的模型当前不在 DSH 的可用列表中：provider 已移除、凭据失效或模型已下线。运行会在开始前被拒绝（model_unavailable），请重新准用一个。')
+              : null,
+            state !== null && state.selected && state.selectedListed === null
+              ? h(ConfigNote, { tone: 'warn' }, '该模型所属的 provider 这次未能枚举，因此它是否仍可用未经验证（不是「已失去」）：运行会照常尝试，若 provider 真的不在，失败会带 provider 自己的报错。')
+              : null,
+            state === null ? null : state.ok !== true
+              ? h(ConfigNote, { tone: 'warn' }, '无法读取 DSH 的可用模型列表：' + (state.detail || state.error || 'unknown') + '。模型选择不可用；上面的组件开关不受影响。')
+              : h(ConfigField, {
+                  id: 'nmc-model', label: '模型', inline: true,
+                  control: h(React.Fragment, null,
+                    h(ConfigSelect, {
+                      id: 'nmc-model', label: '准用模型', value: chosen,
+                      options: chosen ? options : [{ value: '', label: '— 尚未准用 —' }, ...options],
+                      groups: grouped,
+                      disabled: model.busy || !model.loaded || state.editable === false,
+                      onChange: value => { const parts = String(value || '').split('\u0000'); model.save(parts[0], parts[1]); },
+                    }),
+                    model.busy ? h('span', { className: 'nmc-unit' }, '写入中…') : null),
+                }),
+            state !== null && Array.isArray(state.failures) && state.failures.length > 0
+              ? h(ConfigNote, null, 'provider 枚举失败：' + state.failures.map(failure => (failure.id || failure.name) + ': ' + failure.message).join(' · '))
+              : null,
+            empty ? h(ConfigNote, null, 'DSH 当前没有列出任何可用模型。') : null,
+            state !== null && state.defaultSelection
+              ? h(ConfigNote, null, 'DSH 的默认模型是 ' + state.defaultSelection.provider + ' / ' + state.defaultSelection.model + '（仅供参考；本 bundle 只用上面准用的模型，未准用时拒绝运行）。')
+              : null,
+            state !== null && state.editable === false
+              ? h(ConfigNote, null, '此 profile 的配置编辑器不可用，因此这个选择无法写入 profile patch；开关不受影响。')
+              : null);
+        }
+
+        /* ----------------------------------------------------------- the companion card --- */
+
+        /**
+         * The companion and the workspace monitor — the one card both mounts render.
+         *
+         * Field for field this is the page the user already had; what changed is that it is
+         * declared here and mounted twice, so the plugin page and the NewMate settings view
+         * cannot drift apart. The save is one patch of the settings object, exactly as the
+         * route validates it.
+         */
+        function ConfigCompanionCard({ model }) {
+          const settings = model.settings || {};
+          const watch = model.watch || {};
+          const wechat = model.wechat || {};
+          const busy = model.busy === true;
+          const [qrOpen, setQrOpen] = React.useState(false);
+          const save = patch => model.save(patch);
+          // While the QR window is open the card keeps asking, because the code arrives from
+          // WeChat after the connect call returns. The NewMate mount needs no such poll: the
+          // page behind it already reads the same route every two seconds.
+          React.useEffect(() => {
+            if (!qrOpen) return undefined;
+            const timer = setInterval(() => { try { model.refresh?.(); } catch {} }, 1500);
+            return () => clearInterval(timer);
+          }, [qrOpen]);
+          const quietOptions = Array.from({ length: 24 }, (_, hour) => ({ value: hour, label: String(hour).padStart(2, '0') + ':00' }));
+          return h(ConfigCard, {
+            title: '陪伴与工作区监控',
+            description: '两页写的是同一份设置：开关立即生效，对比间隔从下一轮开始算，不会打断正在进行的那一轮。',
+          },
+            h('div', { className: 'nmc-row-fields' },
+              h(ConfigSwitch, {
+                id: 'nmc-initiative', label: '允许主动陪伴',
+                checked: settings.initiative !== false, disabled: busy,
+                onChange: value => save({ initiative: value }),
+              }),
+              h(ConfigNote, null, '不用你先开口，也会在合适的空隙聊聊；没有具体内容时保持沉默。'),
+              h(ConfigField, {
+                id: 'nmc-pace', label: '主动性', inline: true,
+                control: h(ConfigSelect, {
+                  id: 'nmc-pace', label: '主动性', value: settings.pace || 'balanced', disabled: busy,
+                  options: [
+                    { value: 'quiet', label: '低 · 更少打扰' },
+                    { value: 'balanced', label: '中 · 均衡' },
+                    { value: 'active', label: '高 · 更主动' },
+                  ],
+                  onChange: value => save({ pace: value }),
+                }),
+              }),
+              h(ConfigNote, null, '主动性同时决定触发阈值（当前 ' + (watch.threshold ?? 0.6) + '）和安静时间的权重；没有每日条数上限，间距与静默时段仍然生效。'),
+              h(ConfigField, {
+                label: '静默时段（北京时间）', inline: true,
+                control: h(React.Fragment, null,
+                  h(ConfigSelect, { id: 'nmc-quiet-start', label: '静默开始时间', value: settings.quietStart ?? 23, options: quietOptions, disabled: busy, onChange: value => save({ quietStart: Number(value) }) }),
+                  h('span', { className: 'nmc-unit' }, '至'),
+                  h(ConfigSelect, { id: 'nmc-quiet-end', label: '静默结束时间', value: settings.quietEnd ?? 8, options: quietOptions, disabled: busy, onChange: value => save({ quietEnd: Number(value) }) })),
+              }),
+              h('div', { className: 'nmc-actions' },
+                h(ConfigButton, { variant: 'outline', disabled: busy, onClick: () => save({ snoozeUntil: Date.now() + 8 * 3600000 }) }, '暂停主动陪伴 8 小时'),
+                (settings.snoozeUntil || 0) > Date.now()
+                  ? h(ConfigButton, { variant: 'outline', disabled: busy, onClick: () => save({ snoozeUntil: 0 }) }, '恢复主动陪伴')
+                  : null),
+              h('hr', { className: 'nmc-rule' }),
+              h(ConfigSwitch, {
+                id: 'nmc-watch', label: '对比工作区文件变动',
+                checked: settings.watchEnabled !== false, disabled: busy,
+                onChange: value => save({ watchEnabled: value }),
+              }),
+              h(ConfigNote, null, '启动时对比一次，之后按间隔重复；只比较文件数量、名称与最新修改时间，不读取文件内容。'),
+              h(ConfigNumber, {
+                id: 'nmc-watch-interval', label: '对比间隔', unit: '分钟',
+                value: settings.watchIntervalMinutes ?? 30, min: 5, max: 1440, step: 5, disabled: busy,
+                hint: '范围 5–1440。',
+                onChange: value => save({ watchIntervalMinutes: Number(value) }),
+              }),
+              h(ConfigNote, null, '扫描深度与 DSH 自建改动权重保留默认值（3 层 / 0.1 倍）：深度可在插件配置里调整，权重是固定默认值，两页都不再提供开关。'),
+              h('hr', { className: 'nmc-rule' }),
+              h('div', { className: 'nmc-actions' },
+                h('span', { className: 'nmc-field-label' }, '微信 ClawBot'),
+                h('span', { className: 'nmc-unit' }, wechatPhaseText(wechat)),
+                h(ConfigButton, {
+                  variant: wechat.connected ? 'outline' : 'primary', disabled: busy,
+                  onClick: async () => { try { await model.connectWechat?.(); } finally { setQrOpen(true); } },
+                }, wechat.connected ? '重新连接' : '发起连接')),
+              h(ConfigNote, null, wechatHint(wechat))),
+            model.error ? h(ConfigNote, { tone: 'error' }, model.error) : null,
+            qrOpen && UpdateModal ? h(UpdateModal, {
+              open: true, title: '连接微信 ClawBot', closeLabel: '取消',
+              onClose: () => setQrOpen(false),
+              description: wechat.connected
+                ? '已连接。关闭这个窗口即可，无需再扫码。'
+                : wechat.waiting
+                  ? '用手机微信扫描下面的二维码：我 → 设置 → 插件 → 微信 ClawBot → 扫描二维码。绑定成功后这里会自动变成已连接。'
+                  : '正在向微信申请二维码…',
+              footer: h(React.Fragment, null,
+                h(ConfigButton, { variant: 'outline', onClick: () => model.connectWechat?.() }, '重新生成二维码'),
+                h(ConfigButton, { variant: 'primary', onClick: () => setQrOpen(false) }, wechat.connected ? '完成' : '关闭')),
+            }, wechat.qr && wechat.qr.image
+              ? h('div', { style: { display: 'flex', justifyContent: 'center', padding: 12, background: 'var(--dsw-alias-bg-base)', borderRadius: 12, width: 'fit-content', margin: '4px auto 0' } },
+                  h('img', { src: wechat.qr.image, alt: '微信 ClawBot 绑定二维码', width: 260, height: 260, style: { display: 'block', imageRendering: 'pixelated' } }))
+              : h('p', { className: 'nmc-note', style: { textAlign: 'center', minHeight: 120, display: 'flex', alignItems: 'center', justifyContent: 'center' } }, '正在向微信申请二维码…')) : null);
+        }
+        /* ------------------------------------------------------------- the desktop card --- */
+
+        /** The desktop pet's size: the same control the pet's own menu renders. */
+        function ConfigDesktopCard({ model }) {
+          return h(ConfigCard, {
+            title: 'NewMate',
+            description: '显示大小在此调整并自动保存；桌宠右键可退出伴随或打开设置。',
+            footer: model.error ? null : '默认 100% · 自动保存，启动时恢复上次大小',
+          },
+            h(NewMateSizeControl, {
+              value: model.scale === null || model.scale === undefined ? 1 : model.scale,
+              onChange: model.save,
+              disabled: model.scale === null || model.scale === undefined,
+              title: '显示大小',
+            }),
+            model.error ? h(ConfigNote, { tone: 'error' }, model.error) : null);
+        }
+
+        /* -------------------------------------------------------------- the update card --- */
+
+        /**
+         * The bundle's own update, from this page only.
+         *
+         * The check asks the Host's update route, compares the installed version with npm's
+         * latest, asks the user through the shell's own confirmation modal, then installs the
+         * named tarball and restarts through the restart helper. A downgrade is refused rather
+         * than performed: an older official release is not an update.
+         */
+        function ConfigUpdateCard({ model }) {
+          return h(ConfigCard, {
+            title: 'Newmark Core',
+            description: '统一更新五个组件，重启后任务由 heartBeat 接续。',
+          },
+            h('div', { className: 'nmc-actions' },
+              h(ConfigButton, { variant: 'outline', disabled: model.busy, onClick: model.check }, model.busy ? '处理中…' : '检查更新')),
+            h(ConfigNote, null, model.message),
+            model.prompt && UpdateModal
+              ? h(UpdateModal, {
+                  open: true, title: '更新 Newmark Core', closeLabel: '取消',
+                  onClose: () => model.decide(false),
+                  description: '当前 ' + model.prompt.current + ' → 最新 ' + model.prompt.latest + '。所有组件将一并更新；安装成功后会结束当前 DSH 及其任务进程并重新启动。',
+                  footer: h(React.Fragment, null,
+                    h(ConfigButton, { variant: 'outline', onClick: () => model.decide(false) }, '取消'),
+                    h(ConfigButton, { variant: 'primary', onClick: () => model.decide(true) }, '更新并重启')),
+                })
+              : null);
+        }
+
+        /* ------------------------------------------------------------- the catalogue --- */
+
+        /**
+         * The catalogue: which sections exist, in which order, and what each renders.
+         *
+         * Both mounts walk CONFIG_SECTION_ORDER, so the plugin page and the NewMate settings
+         * view show the same sections in the same order. A section added here appears on both;
+         * a section removed here leaves both. That is the lock.
+         */
+        const CONFIG_SECTION_ORDER = ['components', 'model', 'companion', 'desktop', 'update'];
+        const CONFIG_SECTIONS = {
+          components: {
+            title: '组件',
+            note: '五个组件同装同卸，开关立即生效。',
+            render: model => h(ConfigComponents, { model: model.components }),
+          },
+          model: {
+            title: '智能体',
+            note: '运行用哪个模型由这里决定；未准用时拒绝运行。',
+            render: model => h('div', { className: 'nmc-grid' }, h(ConfigModelCard, { model: model.model })),
+          },
+          companion: {
+            title: '陪伴',
+            note: '主动陪伴与工作区监控在同一张卡里；与 DSH 工作区会话无关。',
+            render: model => h('div', { className: 'nmc-grid' }, h(ConfigCompanionCard, { model: model.companion })),
+          },
+          desktop: {
+            title: '桌面助手',
+            note: '桌宠的大小，与陪伴开关分开。',
+            render: model => h('div', { className: 'nmc-grid' }, h(ConfigDesktopCard, { model: model.desktop })),
+          },
+          update: {
+            title: '版本管理',
+            note: '一个 tarball、一次重启。',
+            render: model => h('div', { className: 'nmc-grid' }, h(ConfigUpdateCard, { model: model.update })),
+          },
+        };
+
+        /**
+         * The two mounts.
+         *
+         * `suppressRows` is the only difference that is not prose: the shell's component rows
+         * exist on the plugin page and nowhere else, so only that mount renders the rule that
+         * hides them.
+         */
+        const CONFIG_MOUNTS = {
+          plugin: {
+            title: 'Newmark2DSH',
+            subtitle: '记忆、执行与陪伴，在一处管理。下面的陪伴与桌面设置与 NewMate 设置页是同一份内容。',
+            suppressRows: true,
+          },
+          newmate: {
+            title: 'NewMate 设置',
+            subtitle: '与 DSH 插件配置页（Newmark Core → 配置）是同一份内容：下面每个开关在两处都能改。',
+            suppressRows: false,
+          },
+        };
+
+        /** One page, rendered from the catalogue against one set of surfaces. */
+        function ConfigSurface({ mount, core, companion, actions }) {
+          const spec = CONFIG_MOUNTS[mount] || CONFIG_MOUNTS.plugin;
+          const model = { ...core, companion };
+          return h(ConfigPage, {
+            title: spec.title,
+            subtitle: spec.subtitle,
+            mark: h('span', { className: 'nmc-mark' }, 'N'),
+            suppressRows: spec.suppressRows,
+            actions: actions || [],
+            sections: CONFIG_SECTION_ORDER.map(id => {
+              const section = CONFIG_SECTIONS[id];
+              return h(ConfigSection, { key: id, id, title: section.title, note: section.note }, section.render(model));
+            }),
+          });
+        }
+        /* ------------------------------------------------------------------ the data --- */
+
+        /**
+         * The bundle's own control surface: the components, the authorised model, the pet's
+         * size and the update.
+         *
+         * One GET answers the components and the model together, because the route answers
+         * them together — there is no second channel and no second source of truth. After
+         * every write the surface asks again rather than trusting the POST's receipt: the
+         * POST reports whether the Host accepted the change, and only the next read reports
+         * whether it took effect. Those are not the same thing, and a page that renders the
+         * receipt would be describing a click.
+         */
+        function useCoreSurface() {
           const state = useMemoryLab();
           const payload = state && typeof state.payload === 'object' ? state.payload : null;
           const components = payload && typeof payload.components === 'object' && payload.components ? payload.components : {};
           const lease = payload && typeof payload.computerUse === 'object' && payload.computerUse ? payload.computerUse : null;
 
-          // The Host half owns these switches, so what is shown is its answer — not the
-          // click. A switch that only echoed the click would be a label.
           const [pending, setPending] = React.useState('');
           const [applied, setApplied] = React.useState({});
           const [loaded, setLoaded] = React.useState(false);
           const [hostCompose, setHostCompose] = React.useState(null);
           const [updateMessage, setUpdateMessage] = React.useState('所有组件随 Newmark Core 统一更新。');
           const [updateBusy, setUpdateBusy] = React.useState(false);
-          const updateLock = React.useRef(false);
           const [updatePrompt, setUpdatePrompt] = React.useState(null);
+          const updateLock = React.useRef(false);
           const updateDecision = React.useRef(null);
-          const decideUpdate = (confirmed) => {
+          const decideUpdate = confirmed => {
             const resolve = updateDecision.current;
             updateDecision.current = null;
             setUpdatePrompt(null);
@@ -2645,200 +3114,51 @@ function readPageGlobals() {
             updateDecision.current?.(false);
             updateDecision.current = null;
           }, []);
-          const updateCore = async () => {
-            if (updateLock.current) return;
-            updateLock.current = true; setUpdateBusy(true);
-            let requested = false;
-            try {
-              const manager = coreUpdateManager;
-              if (!manager) throw new Error('当前宿主的插件管理服务尚未就绪');
-              setUpdateMessage('正在查询 npm 官方最新版本…');
-              const response = await fetch('/newmark-core/update', { cache: 'no-store', credentials: 'same-origin' });
-              if (response.status === 404 || response.status === 405) throw new Error('当前宿主尚未加载更新接口，请完全退出并重启 DSH');
-              if (response.status === 401 || response.status === 403) throw new Error('当前页面认证已失效，请重新打开 DSH 插件配置页');
-              const body = await response.text();
-              if (!body.trim()) throw new Error(`更新接口返回空响应（HTTP ${response.status}），请完全重启 DSH 后重试`);
-              let latest;
-              try { latest = JSON.parse(body); }
-              catch { throw new Error(`更新接口返回非 JSON 响应（HTTP ${response.status}），请完全重启 DSH 后重试`); }
-              if (!response.ok || !latest.ok) throw new Error(latest.error || '无法查询最新版');
-              const installed = await manager.listBundles();
-              if (!installed.ok) throw new Error(installed.error?.message || '无法读取已安装版本');
-              const currentVersion = installed.value.find(bundle => bundle.name === 'newmark2dsh')?.version;
-              if (/^\d+\.\d+\.\d+$/.test(currentVersion || '')) {
-                const currentParts = currentVersion.split('.').map(Number), nextParts = latest.latest.split('.').map(Number);
-                const different = currentParts.findIndex((part, index) => part !== nextParts[index]);
-                if (different >= 0 && currentParts[different] > nextParts[different]) {
-                  setUpdateMessage(`已安装 ${currentVersion}，官方 latest 暂为 ${latest.latest}；未执行降级。`); return;
-                }
-              }
-              if (currentVersion === latest.latest) {
-                setUpdateMessage(`已安装最新版本 ${latest.latest}；若刚完成更新，请完全重启 DSH。`); return;
-              }
-              if (!UpdateModal || !UpdateButton) throw new Error('当前宿主的确认弹窗组件不可用');
-              setUpdateMessage(`发现新版本 ${latest.latest}，等待确认。`);
-              const confirmed = await new Promise(resolve => {
-                updateDecision.current = resolve;
-                setUpdatePrompt({ current: currentVersion || latest.current, latest: latest.latest });
-              });
-              if (!confirmed) { setUpdateMessage('已取消更新。'); return; }
-              const restartRequest = async input => {
-                const response = await fetch('/newmark-core/update', {
-                  method: 'POST', credentials: 'same-origin',
-                  headers: { 'content-type': 'application/json', 'x-newmark-restart': '1' },
-                  body: JSON.stringify(input),
-                });
-                const text = await response.text();
-                let result;
-                try { result = JSON.parse(text); } catch { throw new Error('重启辅助宿主返回无效响应'); }
-                if (!response.ok || !result.ok) throw new Error(result.error || '重启辅助宿主未就绪');
-                return result;
-              };
-              const restart = await restartRequest({ action: 'prepare', version: latest.latest });
-              setUpdateMessage(`正在更新 Newmark Core 至 ${latest.latest}…`);
-              requested = true;
-              // The authoritative tarball names exactly the selected release. It avoids
-              // pnpm's bare-name age fallback without changing the user's pnpm policies.
-              const answer = await manager.installBundle(latest.tarball, {
-                enabled: true, registry: latest.registry, requestId: crypto.randomUUID(),
-              });
-              if (!answer.ok) throw new Error(answer.error?.message || '安装结果不可用，请查看 DSH 插件管理记录');
-              const receipt = answer.value;
-              if (!['applied', 'restart-required'].includes(receipt.application)) {
-                throw new Error(receipt.error?.diagnostic || `安装返回状态：${receipt.application}`);
-              }
-              const after = await manager.listBundles();
-              if (!after.ok || after.value.find(bundle => bundle.name === 'newmark2dsh')?.version !== latest.latest) {
-                throw new Error('安装后的版本核验未通过，请查看 DSH 插件管理记录');
-              }
-              setUpdateMessage(`已安装 ${latest.latest}，正在完整重启 DSH…`);
-              await restartRequest({ action: 'restart', ticket: restart.ticket });
-            } catch (error) {
-              setUpdateMessage(`${requested ? '更新未确认' : '更新失败'}：${error.message || error}。未回退旧版本。`);
-            } finally { updateLock.current = false; setUpdateBusy(false); }
-          };
 
-          // The authorised model, read from the same route and shown in its own block below
-          // the component rows. It is deliberately NOT a row in `rows`: a row is a switch, and
-          // this is a value — the one thing on this page that is 准用, authorised.
-          //
-          // `null` means the route has not answered yet. `{ ok: false }` means it answered and
-          // could not read the catalogue, which is a different thing from an empty catalogue
-          // and is rendered as such.
-          const [modelState, setModelState] = React.useState(null);
-          const [modelBusy, setModelBusy] = React.useState(false);
-          const [modelError, setModelError] = React.useState('');
-          const [petScale,setPetScale]=React.useState(null),[petError,setPetError]=React.useState('');
-          const petWrite=React.useRef({pending:null,busy:false,revision:0,live:true});
-          React.useEffect(()=>{
-            const control=petWrite.current;control.live=true;
-            const read=async()=>{
-              const revision=control.revision;
-              if(control.busy||control.pending!==null)return;
-              try {
-                const response=await fetch('/newmark-core/components'+'?view=newMate'),body=await response.json();
-                if(control.live && revision===control.revision && body.newMate){setPetScale(body.newMate.sizeMultiplier);setPetError(body.newMate.ok?'':body.newMate.error);}
-              } catch(error){if(control.live)setPetError(error.message);}
-            };
-            read();const timer=setInterval(read,1000);
-            return()=>{control.live=false;clearInterval(timer);};
-          },[]);
-          const savePetScale=async value=>{
-            setPetScale(value);const control=petWrite.current;control.pending=value;control.revision++;
-            if(control.busy)return;control.busy=true;
-            try {
-              while(control.pending!==null){
-                const next=control.pending;control.pending=null;
-                const response=await fetch('/newmark-core/components',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({component:'newMate',sizeMultiplier:next})});
-                const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'大小保存失败');
-                if(control.live)setPetError('');
-              }
-            } catch(error){if(control.live)setPetError(error.message);control.pending=null;}
-            finally{control.busy=false;}
-          };
-
-
-          // The mount read and the post-switch read ask the same question, so they are the
-          // same function. After a switch the panel asks again rather than trusting the
-          // POST's receipt: the POST reports whether the Host accepted the change, and only
-          // the next read reports whether it took effect. Those are not the same thing.
-          //
-          // Both composed switches come from this one route, and the route answers the
-          // components and the model together — one GET, one answer, no second channel.
+          /** Read the component rows and the composed switches. */
           const readState = () =>
             fetch('/newmark-core/components')
-              .then((response) =>
-                response
-                  .json()
-                  .catch(() => ({}))
-                  .then((body) => ({ ...body, httpStatus: response.status })),
-              )
-              .then((result) => {
+              .then(response => response.json().catch(() => ({})).then(body => ({ ...body, httpStatus: response.status })))
+              .then(result => {
                 if (!result || !Array.isArray(result.components)) return false;
                 if (typeof result.compose === 'boolean') setHostCompose(result.compose);
                 const next = {};
-                // Carry `detail` through too: it is the Host's own description of what it
-                // read, and dropping it left the panel able to show only a boolean, which
-                // is not enough to tell "off" from "the edit did nothing".
-                for (const entry of result.components) {
-                  next[entry.name] = { ok: true, mounted: entry.mounted === true, detail: entry.detail };
-                }
-                setApplied((current) => ({ ...current, ...next }));
+                for (const entry of result.components) next[entry.name] = { ok: true, mounted: entry.mounted === true, detail: entry.detail };
+                setApplied(current => ({ ...current, ...next }));
                 return true;
               })
               .catch(() => false);
 
+          const [modelState, setModelState] = React.useState(null);
+          const [modelBusy, setModelBusy] = React.useState(false);
+          const [modelError, setModelError] = React.useState('');
+
           /**
-           * Read the authorised model and the models DSH currently offers.
-           *
-           * The read rides the SAME route the switches use: one GET answers the components
-           * and the model, so there is no second channel and no second source of truth.
-           * `GET /newmark-core/components` therefore does the whole job.
-           *
-           * Every failure is reported, never swallowed: a catalogue that could not be read
-           * leaves `ok: false` with the Host's own detail, which is what the block below
-           * renders. A silent empty list would look exactly like "DSH has no models", and a
-           * page that says that while the user has models would be worse than one that says
-           * it could not find out.
+           * Read the authorised model and the models DSH offers. A catalogue that could not be
+           * read leaves ok:false with the Host's own detail, which is what the card renders; a
+           * silent empty list would look exactly like DSH has no models.
            */
           const readModel = () =>
             fetch('/newmark-core/components')
-              .then((response) =>
-                response
-                  .json()
-                  .catch(() => ({}))
-                  .then((body) => ({ ...body, httpStatus: response.status })),
-              )
-              .then((body) => {
+              .then(response => response.json().catch(() => ({})).then(body => ({ ...body, httpStatus: response.status })))
+              .then(body => {
                 const answer = body && typeof body.model === 'object' && body.model ? body.model : null;
-                setModelState(answer === null ? { ok: false, error: 'no_model_answer', detail: `the route answered HTTP ${body?.httpStatus ?? 'nothing'} with no model block` } : answer);
+                setModelState(answer === null ? { ok: false, error: 'no_model_answer', detail: 'the route answered HTTP ' + (body?.httpStatus ?? 'nothing') + ' with no model block' } : answer);
                 return answer;
               })
-              .catch((error) => {
+              .catch(error => {
                 setModelState({ ok: false, error: 'model_read_failed', detail: String((error && error.message) || error) });
                 return null;
               });
 
           React.useEffect(() => {
             let live = true;
-            readState().then(() => {
-              if (live) setLoaded(true);
-            });
+            readState().then(() => { if (live) setLoaded(true); });
             readModel();
-            return () => {
-              live = false;
-            };
+            return () => { live = false; };
           }, []);
 
-          /**
-           * Persist one choice, then ask what is true.
-           *
-           * The order matters and is the same one the switches use: POST, then READ. The POST's
-           * receipt is what the Host accepted; only the next read says whether it took. The
-           * select is NOT updated optimistically — if the write did not land, the control must
-           * still show the model that is actually authorised, or the page would be lying about
-           * the one value a run depends on.
-           */
+          /** Persist one model choice, then ask what is true. Never optimistic. */
           const saveModel = (provider, model) => {
             if (!provider || !model) return;
             setModelBusy(true);
@@ -2848,363 +3168,310 @@ function readPageGlobals() {
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ component: 'model', provider, model }),
             })
-              .then((response) =>
-                response
-                  .json()
-                  .catch(() => ({}))
-                  .then((body) => ({ ...body, httpStatus: response.status, ok: body && body.ok === true })),
-              )
-              .then((result) => {
+              .then(response => response.json().catch(() => ({})).then(body => ({ ...body, httpStatus: response.status, ok: body && body.ok === true })))
+              .then(result => {
                 if (result.ok !== true) {
-                  setModelError(
-                    [
-                      result.httpStatus ? 'HTTP ' + result.httpStatus : null,
-                      result.error ? String(result.error) : null,
-                      result.detail ? String(result.detail) : null,
-                    ]
-                      .filter(Boolean)
-                      .join(' · ') || 'the write failed',
-                  );
+                  setModelError([
+                    result.httpStatus ? 'HTTP ' + result.httpStatus : null,
+                    result.error ? String(result.error) : null,
+                    result.detail ? String(result.detail) : null,
+                  ].filter(Boolean).join(' · ') || 'the write failed');
                 }
                 return readModel();
               })
-              .catch((error) => setModelError(String((error && error.message) || error)))
+              .catch(error => setModelError(String((error && error.message) || error)))
               .then(() => setModelBusy(false));
           };
 
+          /** ONE path for every switch: POST the desired state, then read what is true. */
           const toggle = (key, next) => {
             setPending(key);
-
-            // ONE path for both switches. The POST carries the component key and the desired
-            // state; the read that follows is what the panel renders, so the receipt can never
-            // disagree with the row.
             fetch('/newmark-core/components', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ component: key, enabled: next }),
             })
-              .then((response) =>
-                // Keep the status. A rejected request or an error page has no JSON body,
-                // and swallowing that into a generic message throws away the one fact
-                // that identifies the failure. Reading the status costs nothing.
-                response
-                  .json()
-                  .catch(() => ({}))
-                  .then((body) => ({ ...body, httpStatus: response.status, ok: body && body.ok === true })),
-              )
-              .then((result) => {
-                setApplied((current) => ({ ...current, [key]: result }));
-                if (result.ok && typeof result.mounted === 'boolean' && typeof window.CustomEvent === 'function') window.dispatchEvent(new window.CustomEvent('newmark-component-change', {detail:{key,mounted:result.mounted}}));
-                // Ask what is true now. If the change did not take, this read will show the
-                // old state and the row will keep saying so.
+              .then(response => response.json().catch(() => ({})).then(body => ({ ...body, httpStatus: response.status, ok: body && body.ok === true })))
+              .then(result => {
+                setApplied(current => ({ ...current, [key]: result }));
+                if (result.ok && typeof result.mounted === 'boolean' && typeof window.CustomEvent === 'function') {
+                  window.dispatchEvent(new window.CustomEvent('newmark-component-change', { detail: { key, mounted: result.mounted } }));
+                }
                 return readState();
               })
-              .catch((error) => setApplied((current) => ({ ...current, [key]: { ok: false, error: String(error) } })))
+              .catch(error => setApplied(current => ({ ...current, [key]: { ok: false, error: String(error) } })))
               .then(() => setPending(''));
           };
 
-          const rows = [
-            {
-              key: 'core',
-              name: 'Newmark Core',
-              role: 'shared user store, page snapshot',
-              on: hostCompose === null ? Boolean(payload) : hostCompose,
-              note: payload && payload.root ? payload.root : 'no snapshot on this page',
-              switchable: false,
-            },
-            {
-              key: 'memoryLab',
-              name: 'MemoryLab',
-              role: 'durable memory, nine memory_lab_* tools, sidebar renderer',
-              on: components.memoryLab === true,
-              note: components.memoryLab === true ? 'store mounted' : 'not loaded',
-              switchable: true,
-            },
-            {
-              key: 'computerUse',
-              name: 'ComputerUse',
-              role: '21 computer_use actions, native screen-wide takeover stroke',
-              on: components.computerUse === true,
-              note:
-                components.computerUse === true
-                  ? lease && lease.held
-                    ? 'lease held by ' + (lease.ownerId || 'unknown')
-                    : 'loaded, lease free'
-                  : 'not loaded',
-              switchable: true,
-            },
-            {
-              key: 'agentApi',
-              name: 'Agent API',
-              role: '标准化的 Agent 调用接口：信封、错误分级、只读状态与 agent run',
-              on: components.agentApi === true,
-              note: components.agentApi === true ? 'interface mounted' : 'not loaded',
-              switchable: true,
-            },
-            { key:'newMate', name:'NewMate', role:'MemoryLab 驱动的陪伴内核、持久任务与低成本文件测量', on:components.newMate === true, note:components.newMate ? 'kernel mounted' : 'not loaded', switchable:true },
-            { key:'heartBeat', name:'heartBeat', role:'DSH 全局重启与重启后向当前对话 / NewMate 投递任务', on:components.heartBeat === true, note:components.heartBeat ? 'restart delivery mounted' : 'not loaded', switchable:true },
-          ];
+          /** The pet's display size, written through the same route and read back from it. */
+          const [petScale, setPetScale] = React.useState(null);
+          const [petError, setPetError] = React.useState('');
+          const petWrite = React.useRef({ pending: null, busy: false, revision: 0, live: true });
+          React.useEffect(() => {
+            const control = petWrite.current;
+            control.live = true;
+            const read = async () => {
+              const revision = control.revision;
+              if (control.busy || control.pending !== null) return;
+              try {
+                const response = await fetch('/newmark-core/components?view=newMate');
+                const body = await response.json();
+                if (control.live && revision === control.revision && body.newMate) {
+                  setPetScale(body.newMate.sizeMultiplier);
+                  setPetError(body.newMate.ok ? '' : body.newMate.error);
+                }
+              } catch (error) { if (control.live) setPetError(error.message); }
+            };
+            read();
+            const timer = setInterval(read, 1000);
+            return () => { control.live = false; clearInterval(timer); };
+          }, []);
+          const savePetScale = async value => {
+            setPetScale(value);
+            const control = petWrite.current;
+            control.pending = value;
+            control.revision++;
+            if (control.busy) return;
+            control.busy = true;
+            try {
+              while (control.pending !== null) {
+                const next = control.pending;
+                control.pending = null;
+                const response = await fetch('/newmark-core/components', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ component: 'newMate', sizeMultiplier: next }) });
+                const result = await response.json();
+                if (!response.ok || !result.ok) throw Error(result.error || '大小保存失败');
+                if (control.live) setPetError('');
+              }
+            } catch (error) { if (control.live) setPetError(error.message); control.pending = null; }
+            finally { control.busy = false; }
+          };
 
-          return h(
-            'section',
-            { className: 'nmc-config' },
-            h('style', null, CONFIG_CSS+NEWMATE_SLIDER_CSS),
-            h('header',{className:'nmc-config-hero'},h('div',null,h('h2',null,'Newmark2DSH'),h('p',null,'记忆、执行与陪伴，在一处管理。')),h('div',{className:'nmc-config-hero-mark','aria-hidden':true},h('span',{style:{fontSize:23,fontWeight:600}},'N'))),
-            updatePrompt && h(UpdateModal, {
-              open: true, title: '更新 Newmark Core', closeLabel: '取消',
-              onClose: () => decideUpdate(false),
-              description: `当前 ${updatePrompt.current} → 最新 ${updatePrompt.latest}。所有组件将一并更新；安装成功后会结束当前 DSH 及其任务进程并重新启动。`,
-              footer: h(React.Fragment, null,
-                h(UpdateButton, { variant: 'outline', onClick: () => decideUpdate(false) }, '取消'),
-                h(UpdateButton, { variant: 'primary', onClick: () => decideUpdate(true) }, '更新并重启')),
-            }),
-            h('section',{className:'nmc-config-section','aria-label':'组件'},
-            h('h3', { className: 'nmc-config-head' }, '组件'),
-            h(
-              'ul',
-              { className: 'nmc-config-list' },
-              ...rows.map((row) => {
-                const answer = applied[row.key];
-                const answered = answer && answer.ok === true && typeof answer.mounted === 'boolean';
-                const on = answered ? answer.mounted : row.on;
-                const failed = answer && answer.ok === false;
-                // The mount receipt and the note must describe the same state, including
-                // after a hot enable when the original page had no Agent API injection.
-                const note = row.key === 'agentApi' ? (on ? 'interface mounted' : 'not loaded')
-                  : row.key === 'memoryLab' ? (on ? 'store mounted' : 'not loaded')
-                  : row.key === 'newMate' ? (on ? 'kernel mounted' : 'not loaded')
-                  : row.key === 'heartBeat' ? (on ? 'restart delivery mounted' : 'not loaded')
-                  : row.key === 'computerUse' ? (on ? (lease ? (lease.held ? 'lease held by ' + (lease.ownerId || 'unknown') : 'loaded, lease free') : 'loaded, lease state unavailable') : 'not loaded')
-                  : row.note;
-                return h(
-                  'li',
-                  { key: row.key, className: 'nmc-config-row' },
-                  h('span', { className: on ? 'nmc-config-dot nmc-config-on' : 'nmc-config-dot' }),
-                  h(
-                    'span',
-                    { className: 'nmc-config-text' },
-                    h('span', { className: 'nmc-config-name' }, row.name),
-                    h('span', { className: 'nmc-config-role' }, row.role),
-                  ),
-                  h(
-                    'span',
-                    { className: 'nmc-config-state' },
-                    // One vocabulary across the panel: 已启用 / 已禁用, 启用 / 禁用. Every row
-                    // that carries a switch is a composed component, and its `note` says what
-                    // that component is; the words do not vary, the notes do.
-                    failed ? '切换失败' : on ? row.stateOn || '已启用' : row.stateOff || '已禁用',
-                  ),
-                  row.switchable
-                    ? h(
-                        'button',
-                        {
-                          className: 'nmc-config-switch',
-                          type: 'button',
-                          disabled: pending === row.key || !loaded,
-                          'aria-pressed': on,
-                          onClick: () => toggle(row.key, !on),
-                        },
-                        pending === row.key
-                          ? '…'
-                          : on
-                            ? row.actionOn || '禁用'
-                            : row.actionOff || '启用',
-                      )
-                    : null,
-                  h(
-                    'span',
-                    { className: 'nmc-config-note' },
-                    // On failure show everything the Host said: the status identifies a
-                    // rejected request, `error` names the branch, `detail` carries the
-                    // underlying message. Showing only one of them has already cost a
-                    // diagnosis round.
-                    failed
-                      ? [
-                          answer.httpStatus ? 'HTTP ' + answer.httpStatus : null,
-                          answer.error ? String(answer.error) : null,
-                          answer.detail ? String(answer.detail) : null,
-                        ]
-                          .filter(Boolean)
-                          .join(' · ') || 'failed'
-                      : // On success the Host's own `detail` wins over the row's prose: it
-                        // is what the file holds, named by line, and a state the panel
-                        // cannot see is exactly the failure this row exists to show.
-                        (answered && answer.detail ? String(answer.detail) : note),
-                  ),
-                );
-              }),
-            ),
-            ),
-            h('section',{className:'nmc-config-section','aria-label':'配置'},
-            h('div',{className:'nmc-config-section-heading'},h('h3',{className:'nmc-config-head'},'配置'),h('p',{className:'nmc-config-description'},'设置智能体使用的模型与 NewMate 的桌面显示。')),
-            h('div',{className:'nmc-config-settings'},
-            h('section',{className:'nmc-config-card','aria-label':'准用模型'},
-            h('span',{className:'nmc-config-category'},'智能体'),
-            h(
-              'h4',
-              { className: 'nmc-config-subhead' },
-              '准用模型',
-            ),
-            h(
-              'div',
-              { className: 'nmc-config-model' },
-              // ---- what is authorised right now, in words ------------------------------
-              //
-              // Four states, kept apart on purpose: not read yet, nothing authorised,
-              // authorised and listed, authorised and GONE. The last two must never look
-              // alike — a stale selection that reads as fine fails at run time with the
-              // provider's own error, which is the expensive way to learn it.
-              h(
-                'div',
-                { className: 'nmc-config-model-current' },
-                modelState === null
-                  ? '读取中…'
-                  : modelState.selected
-                    ? `已准用：${modelState.selected.provider} / ${modelState.selected.model}`
-                    : '尚未准用任何模型 —— agent-api 会以 model_not_selected 拒绝运行，不会替用户选择',
-              ),
-              modelState !== null && modelState.selected && modelState.selectedListed === false
-                ? h(
-                    'div',
-                    { className: 'nmc-config-model-warn' },
-                    '⚠ 已准用的模型当前不在 DSH 的可用列表中：provider 已移除、凭据失效或模型已下线。运行会在开始前被拒绝（model_unavailable），请重新准用一个。',
-                  )
-                : null,
-              modelState !== null && modelState.selected && modelState.selectedListed === null
-                ? h(
-                    'div',
-                    { className: 'nmc-config-model-warn' },
-                    '该模型所属的 provider 这次未能枚举，因此它是否仍可用未经验证（不是「已失去」）：运行会照常尝试，若 provider 真的不在，失败会带 provider 自己的报错。',
-                  )
-                : null,
-              // ---- the control ---------------------------------------------------------
-              //
-              // `value` is the authorised pair and never a click: the Host's answer is what
-              // the control shows. An authorised model that is no longer offered is added as
-              // its own option and labelled, so the control shows the truth instead of
-              // falling back to some other model's name — the silent substitution this page
-              // exists to make impossible.
-              (() => {
-                if (modelState === null) return null;
-                if (modelState.ok !== true) {
-                  return h(
-                    'div',
-                    { className: 'nmc-config-model-warn' },
-                    `无法读取 DSH 的可用模型列表：${modelState.detail || modelState.error || 'unknown'}。模型选择不可用；上面的组件开关不受影响。`,
-                  );
+          /** Install the named release, then restart through the restart helper. */
+          const updateCore = async () => {
+            if (updateLock.current) return;
+            updateLock.current = true;
+            setUpdateBusy(true);
+            let requested = false;
+            try {
+              const manager = coreUpdateManager;
+              if (!manager) throw new Error('当前宿主的插件管理服务尚未就绪');
+              const response = await fetch('/newmark-core/update', { cache: 'no-store', credentials: 'same-origin' });
+              if (response.status === 404 || response.status === 405) throw new Error('当前宿主尚未加载更新接口，请完全退出并重启 DSH');
+              if (response.status === 401 || response.status === 403) throw new Error('当前页面认证已失效，请重新打开 DSH 插件配置页');
+              const text = await response.text();
+              if (!text.trim()) throw new Error('更新接口返回空响应（HTTP ' + response.status + '），请完全重启 DSH 后重试');
+              let latest;
+              try { latest = JSON.parse(text); }
+              catch { throw new Error('更新接口返回非 JSON 响应（HTTP ' + response.status + '），请完全重启 DSH 后重试'); }
+              if (!response.ok || !latest.ok) throw new Error(latest.error || '无法查询最新版');
+              const installed = await manager.listBundles();
+              if (!installed.ok) throw new Error(installed.error?.message || '无法读取已安装版本');
+              const currentVersion = installed.value.find(bundle => bundle.name === 'newmark2dsh')?.version;
+              if (/^\d+\.\d+\.\d+$/.test(currentVersion || '')) {
+                const currentParts = currentVersion.split('.').map(Number), nextParts = latest.latest.split('.').map(Number);
+                const different = currentParts.findIndex((part, index) => part !== nextParts[index]);
+                if (different >= 0 && currentParts[different] > nextParts[different]) {
+                  setUpdateMessage('已安装 ' + currentVersion + '，官方 latest 暂为 ' + latest.latest + '；未执行降级。');
+                  return;
                 }
-                const chosen = modelState.selected ? `${modelState.selected.provider}\u0000${modelState.selected.model}` : '';
-                const groups = Array.isArray(modelState.groups) ? modelState.groups : [];
-                const offered = groups.some((group) =>
-                  (group.models || []).some((entry) => `${entry.provider}\u0000${entry.id}` === chosen),
-                );
-                const options = [];
-                if (chosen && !offered) {
-                  options.push(
-                    h(
-                      'option',
-                      { key: 'gone', value: chosen },
-                      `${modelState.selected.provider} / ${modelState.selected.model} —— 不在当前可用列表中`,
-                    ),
-                  );
-                }
-                for (const group of groups) {
-                  options.push(
-                    h(
-                      'optgroup',
-                      { key: group.id, label: group.name || group.id },
-                      ...(group.models || []).map((entry) =>
-                        h(
-                          'option',
-                          { key: `${entry.provider}\u0000${entry.id}`, value: `${entry.provider}\u0000${entry.id}` },
-                          entry.name && entry.name !== entry.id ? `${entry.name} (${entry.id})` : entry.id,
-                        ),
-                      ),
-                    ),
-                  );
-                }
-                if (chosen && !offered) {
-                  // An empty value would select the first offered model, which is the silent
-                  // substitution again. A disabled placeholder keeps the control on the pair
-                  // that is really authorised while showing that it is gone.
-                  options.unshift(h('option', { key: 'empty', value: '', disabled: true }, '— 请重新选择 —'));
-                }
-                return h(
-                  'div',
-                  { className: 'nmc-config-model-pick' },
-                  h('span', { className: 'nmc-config-model-label' }, '模型'),
-                  h(
-                    'select',
-                    {
-                      className: 'nmc-config-select',
-                      // '' is not a selection: with nothing authorised the control sits on
-                      // the placeholder, and choosing is a deliberate act.
-                      value: chosen,
-                      disabled: modelBusy || !loaded || modelState.editable === false,
-                      onChange: (event) => {
-                        const [provider, model] = String(event.target.value || '').split('\u0000');
-                        saveModel(provider, model);
-                      },
-                    },
-                    ...(chosen ? [] : [h('option', { key: 'none', value: '' }, '— 尚未准用 —')]),
-                    ...options,
-                  ),
-                  modelBusy ? h('span', { className: 'nmc-config-model-label' }, '写入中…') : null,
-                );
-              })(),
-              // ---- everything the Host said about the catalogue ------------------------
-              //
-              // A provider whose enumeration failed is named, with its own message. Left out,
-              // a partial catalogue would be indistinguishable from a complete one, and the
-              // one provider that matters could be the one missing.
-              modelState !== null && Array.isArray(modelState.failures) && modelState.failures.length > 0
-                ? h(
-                    'div',
-                    { className: 'nmc-config-model-note' },
-                    'provider 枚举失败：' +
-                      modelState.failures.map((failure) => `${failure.id || failure.name}: ${failure.message}`).join(' · '),
-                  )
-                : null,
-              modelState !== null && modelState.ok === true && (modelState.models || []).length === 0 && (modelState.failures || []).length === 0
-                ? h('div', { className: 'nmc-config-model-note' }, 'DSH 当前没有列出任何可用模型。')
-                : null,
-              modelState !== null && modelState.defaultSelection
-                ? h(
-                    'div',
-                    { className: 'nmc-config-model-note' },
-                    `DSH 的默认模型是 ${modelState.defaultSelection.provider} / ${modelState.defaultSelection.model}（仅供参考；本 bundle 只用上面准用的模型，未准用时拒绝运行）。`,
-                  )
-                : null,
-              modelState !== null && modelState.editable === false
-                ? h(
-                    'div',
-                    { className: 'nmc-config-model-note' },
-                    '此 profile 的配置编辑器不可用，因此这个选择无法写入 profile patch；开关不受影响。',
-                  )
-                : null,
-              modelError ? h('div', { className: 'nmc-config-model-warn' }, modelError) : null,
-            ),
-            ),
-            h('section',{className:'nmc-config-card','aria-label':'NewMate'},
-            h('span',{className:'nmc-config-category'},'桌面助手'),
-            h('h4',{className:'nmc-config-subhead'},'NewMate'),
-            h('p',{className:'nmc-config-description'},'显示大小在此调整并自动保存；桌宠右键可退出伴随或打开设置。'),
-            h(NewMateSizeControl,{value:petScale??1,onChange:savePetScale,disabled:petScale===null,title:'显示大小'}),
-            h('div',{className:petError?'nmc-config-model-warn':'nmc-config-footnote',role:petError?'alert':undefined},petError || '默认 100% · 自动保存，启动时恢复上次大小'),
-            ),
-            ),
-            h('section', { className: 'nmc-config-card nmc-update-card', 'data-newmark-core-update': '', 'aria-label': '插件更新' },
-              h('div', { className: 'nmc-update-header' },
-                h('div', { className: 'nmc-update-title' },
-                  h('span', { className: 'nmc-config-category' }, '版本管理'),
-                  h('h4', { className: 'nmc-config-subhead' }, 'Newmark Core'),
-                  h('p', { className: 'nmc-config-description' }, '统一更新五个组件，重启后任务由 heartBeat 接续。')),
-                h('button', { type: 'button', className: 'nmc-config-switch nmc-update-button', disabled: updateBusy, onClick: updateCore }, updateBusy ? '处理中…' : '检查更新')),
-              h('p', { className: 'nmc-config-footnote nmc-update-status', role: 'status', 'aria-live': 'polite', 'aria-busy': updateBusy }, updateMessage)),
-            ),
-          );
+              }
+              if (currentVersion === latest.latest) {
+                setUpdateMessage('已安装最新版本 ' + latest.latest + '；若刚完成更新，请完全重启 DSH。');
+                return;
+              }
+              if (!UpdateModal || !UpdateButton) throw new Error('当前宿主的确认弹窗组件不可用');
+              setUpdateMessage('发现新版本 ' + latest.latest + '，等待确认。');
+              const confirmed = await new Promise(resolve => {
+                updateDecision.current = resolve;
+                setUpdatePrompt({ current: currentVersion || latest.current, latest: latest.latest });
+              });
+              if (!confirmed) { setUpdateMessage('已取消更新。'); return; }
+              const restartRequest = async input => {
+                const answer = await fetch('/newmark-core/update', {
+                  method: 'POST', credentials: 'same-origin',
+                  headers: { 'content-type': 'application/json', 'x-newmark-restart': '1' },
+                  body: JSON.stringify(input),
+                });
+                const body = await answer.text();
+                let result;
+                try { result = JSON.parse(body); } catch { throw new Error('重启辅助宿主返回无效响应'); }
+                if (!answer.ok || !result.ok) throw new Error(result.error || '重启辅助宿主未就绪');
+                return result;
+              };
+              const restart = await restartRequest({ action: 'prepare', version: latest.latest });
+              setUpdateMessage('正在更新 Newmark Core 至 ' + latest.latest + '…');
+              requested = true;
+              // The authoritative tarball names exactly the selected release. It avoids
+              // pnpm's bare-name age fallback without changing the user's pnpm policies.
+              const answer = await manager.installBundle(latest.tarball, {
+                enabled: true, registry: latest.registry, requestId: crypto.randomUUID(),
+              });
+              if (!answer.ok) throw new Error(answer.error?.message || '安装结果不可用，请查看 DSH 插件管理记录');
+              const receipt = answer.value;
+              if (!['applied', 'restart-required'].includes(receipt.application)) {
+                throw new Error(receipt.error?.diagnostic || '安装返回状态：' + receipt.application);
+              }
+              const after = await manager.listBundles();
+              if (!after.ok || after.value.find(bundle => bundle.name === 'newmark2dsh')?.version !== latest.latest) {
+                throw new Error('安装后的版本核验未通过，请查看 DSH 插件管理记录');
+              }
+              setUpdateMessage('已安装 ' + latest.latest + '，正在完整重启 DSH…');
+              await restartRequest({ action: 'restart', ticket: restart.ticket });
+            } catch (error) {
+              setUpdateMessage((requested ? '更新未确认' : '更新失败') + '：' + (error.message || error) + '。未回退旧版本。');
+            } finally { updateLock.current = false; setUpdateBusy(false); }
+          };
+
+          // true / false / null. null means NOTHING HAS BEEN READ: the page snapshot is absent and
+          // the control route has not answered, so "off" would be a guess the user reads as a fact.
+          const on = key => {
+            if (key === 'core') return hostCompose === null ? (payload ? Boolean(payload.root) : null) : hostCompose;
+            if (components[key] === true) return true;
+            return payload ? false : null;
+          };
+          const note = (key, running) => {
+            if (key === 'core') return payload && payload.root ? payload.root : 'no snapshot on this page';
+            if (key === 'computerUse') {
+              return running
+                ? lease ? (lease.held ? 'lease held by ' + (lease.ownerId || 'unknown') : 'loaded, lease free') : 'loaded, lease state unavailable'
+                : 'not loaded';
+            }
+            const entry = CONFIG_COMPONENTS.find(row => row.key === key) || {};
+            return running ? entry.mounted || 'loaded' : entry.absent || 'not loaded';
+          };
+
+          return {
+            components: { applied, pending, loaded, on, note, toggle },
+            model: { state: modelState, busy: modelBusy, error: modelError, save: saveModel, loaded },
+            desktop: { scale: petScale, error: petError, save: savePetScale },
+            update: { message: updateMessage, busy: updateBusy, check: updateCore, prompt: updatePrompt, decide: decideUpdate },
+          };
+        }
+        /**
+         * The companion settings, read and written through NewMate's own route.
+         *
+         * The route validates the patch (an unknown key is refused outright), so the page
+         * sends the smallest patch and then shows whatever the next read says. It keeps no
+         * local copy of the settings: two copies of a settings object is how a page starts
+         * disagreeing with the store it is supposed to be describing.
+         */
+        function useCompanionSurface() {
+          const [snapshot, setSnapshot] = React.useState(null);
+          const [busy, setBusy] = React.useState(false);
+          const [error, setError] = React.useState('');
+          const read = async () => {
+            const response = await fetch('/newmark-newmate', { cache: 'no-store' });
+            const body = await response.json();
+            if (!response.ok || !body.ok) throw Error(body.error || '读取失败');
+            setSnapshot(body);
+            return body;
+          };
+          React.useEffect(() => {
+            let live = true;
+            read().catch(failure => { if (live) setError(failure.message || String(failure)); });
+            return () => { live = false; };
+          }, []);
+          const post = async input => {
+            const response = await fetch('/newmark-newmate', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'x-newmark-newmate': '1' },
+              body: JSON.stringify(input),
+            });
+            const body = await response.json();
+            if (!response.ok || !body.ok) throw Error(body.error || '提交失败');
+            return body;
+          };
+          const write = async input => {
+            setBusy(true);
+            setError('');
+            try { await post(input); await read(); }
+            catch (failure) { setError(failure.message || String(failure)); }
+            finally { setBusy(false); }
+          };
+          return {
+            settings: (snapshot && snapshot.settings) || {},
+            watch: (snapshot && snapshot.watch) || {},
+            wechat: (snapshot && snapshot.wechat) || {},
+            busy, error,
+            save: settings => write({ action: 'settings', settings }),
+            connectWechat: () => write({ action: 'wechat-connect' }),
+            refresh: () => { read().catch(() => {}); },
+          };
         }
 
+        /** How WeChat's own state reads in one word; the long sentence lives in wechatHint. */
+        function wechatPhaseText(wechat) {
+          if (!wechat || !wechat.phase || wechat.phase === 'disconnected') return '未连接';
+          if (wechat.phase === 'connected') return '已连接';
+          if (wechat.phase === 'waiting_scan') return '等待扫码…';
+          if (wechat.phase === 'error') return '出错 ' + (wechat.error || '');
+          return '未连接';
+        }
+
+        /** What a connection means while it is being made and after it is. */
+        function wechatHint(wechat) {
+          if (!wechat || !wechat.connected) {
+            return '未连接。点「发起连接」弹出二维码；绑定信息只保存在本机，重启后自动恢复；点「重新连接」会清除旧登录并重新扫码。';
+          }
+          return '已连接。微信里发来的话等于你在页面上发信（运行中同样插入引导）；发来的图片、视频与文件也会存到本机，和页面上传共用同一套存储（图片与文档本身不解析，只按名称与字节数转述）。NewMate 的最终回复只以纯文字气泡发回微信，不转发思考、工具或主动消息。';
+        }
+
+        /**
+         * How the plugin page opens the other mount. Written by `apply`, which owns `ctx`; a
+         * factory-scope seat keeps the registration line naming the component itself instead of
+         * a wrapper. Null until `apply` runs, which is why the action is conditional.
+         */
+        let openNewMateSeat = null;
+
+        /**
+         * The bundle's page, in the seat the shell gives a bundle (`plugins.bundle.config`).
+         *
+         * It renders the catalogue, and its one hero action points at the other mount of the
+         * same catalogue: NewMate's own settings view. That is the direction the two pages are
+         * locked in — this page can open the other, and both are built from one list.
+         */
+        function NewmarkConfigPanel() {
+          const openNewMate = openNewMateSeat;
+          const core = useCoreSurface();
+          const companion = useCompanionSurface();
+          return h(ConfigSurface, {
+            mount: 'plugin',
+            core,
+            companion,
+            actions: [
+              openNewMate
+                ? h(ConfigButton, { variant: 'outline', onClick: openNewMate, title: '在 NewMate 里打开同一份设置' }, 'NewMate 设置')
+                : null,
+            ],
+          });
+        }
+
+        /**
+         * The NewMate settings view: the same catalogue, mounted inside the NewMate panel.
+         *
+         * Its companion surface is the panel's own live state rather than a second read of
+         * the same route, because this view already renders inside a page that polls it every
+         * two seconds. The component, model, desktop and update sections come from the same
+         * hook the plugin page uses — a switch here and a switch there are one switch.
+         */
+        function NewMateSettingsView({ state, act, busy, error, onBack }) {
+          const core = useCoreSurface();
+          const settings = (state && state.settings) || {};
+          const watch = (state && state.watch) || {};
+          const wechat = (state && state.wechat) || {};
+          const companion = {
+            settings, watch, wechat, busy: busy === true, error: error || '',
+            save: patch => act({ action: 'settings', settings: patch }),
+            connectWechat: () => act({ action: 'wechat-connect' }),
+          };
+          return h('div', { className: 'nmc-mount' },
+            h(ConfigSurface, {
+              mount: 'newmate',
+              core,
+              companion,
+              actions: [h(ConfigButton, { variant: 'outline', onClick: onBack }, '返回 NewMate')],
+            }));
+        }
         // ------------------------------------------------------------ the config page
         //
         // This bundle owns its own page. The rows the card draws are Loader
@@ -3212,6 +3479,21 @@ function readPageGlobals() {
         // thing to show a person. The names that matter are the components, and what
         // matters about them is whether they are running — so they are rendered here, by
         // their product names, from the same page globals the rest of this half reads.
+        /**
+         * Open NewMate's own settings view from the plugin page.
+         *
+         * The seat is a function rather than a prop because the panel is registered by the
+         * same `apply` that owns `ctx`, and the registration line names the component itself.
+         * A layout without selectPanel still dispatches the event: the NewMate panel listens for
+         * it wherever it is rendered, so the half that can work is not withheld by the half that
+         * cannot.
+         */
+        openNewMateSeat = () => {
+          const layout = ctx.get?.('layout') || ctx.layout;
+          layout?.selectPanel?.('newmate');
+          window.dispatchEvent(new CustomEvent('newmark-newmate-open-chat', { detail: { settings: true } }));
+        };
+
         ctx.effect(
           () =>
             ctx.slots.inject('plugins.bundle.config', () =>

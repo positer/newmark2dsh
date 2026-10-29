@@ -1,6 +1,6 @@
 {
   "name": "newmark2dsh-heartbeat",
-  "version": "0.3.67",
+  "version": "0.3.70",
   "private": true,
   "type": "module",
   "exports": {

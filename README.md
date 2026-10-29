@@ -98,18 +98,10 @@ NewMate 是一位亲近、务实的私人秘书式 Agent。它拥有独立聊天
 
 | 方式 | 到期后的行为 | 适合的需求 |
 | --- | --- | --- |
-| `conversation`（新待办默认） | 把到期内容交给 NewMate，并以原生记忆和已有上下文运行一轮 | “明天九点，结合已有计划帮我梳理今天要推进的事情” |
+| `conversation`（新待办默认） | 在关注保护允许时，以原生记忆和已有上下文运行一轮 NewMate | “明天九点，结合已有计划帮我梳理今天要推进的事情” |
 | `reminder` | 投递保存的原文，不额外调用模型 | “明天九点提醒我提交材料” |
 
-**两种到期方式共用同一道闸（0.3.65 起）**：只要求陪伴开关开启 + **NewMate 自己空闲**（没有正在运行或排队的对话轮次）。DSH 宿主有没有别的会话在跑、桌宠是否就绪、页面是否在阅读、键鼠是否在动、有没有草稿、是否静默或暂停，**都不参与**——它们回答的是“要不要弹出来”，由通知决定，不由投递决定。
-
-**“什么都没尝试”不会消耗你的待办**：若到期时宿主还没准用模型（`model_not_selected`），这条待办会回到待发状态并在面板上写明“模型尚未就绪”，五分钟后自动重试，而不是记成失败。静默时段与暂停只静音气泡，消息照常落盘。
-
-**到期的东西也会到手机上**：微信 ClawBot 连上之后，`reminder` 的原文与 `conversation` 激活那一轮的回答都会发到微信，各只发一次（0.3.67 起；此前激活的回答只落在页面与桌宠气泡）。不请自来的主动关怀仍然不会发到微信。
-
-**提醒不等宿主**：投递一条原文提醒不花模型、不打断任何人的回合，所以「别的会话正在跑」不会让提醒迟到。**静默时段与暂停只静音气泡，不延迟消息**——消息与回执照常落盘，「它到了」和「它打扰你了」是两件可以分开说的事。
-
-被拦下时面板会说出原因（`todo.deferred`：等陪伴开启 / 等 NewMate 空闲 / 等宿主空闲 / 静默时段 / 已暂停 …），而不是笼统一句「等待合适时机」。稳定任务身份和消息回执用于防止重启后重复激活或提醒；失败和运行中崩溃不会自动重试。
+待办复用静默、暂停、输入与阅读保护，陪伴关闭时等待开启，所以**到期表示最早可激活时间，不保证精确到秒送达**。稳定任务身份和消息回执用于防止重启后重复激活或提醒；失败和运行中崩溃不会自动重试，已有旧提醒保留原语义。
 
 主要工具：`newmate_chat`、`newmate_task_status`、`newmate_memory_context`、`newmate_state`、`newmate_message`、`newmate_todo_add`、`newmate_todo_list`、`newmate_todo_cancel`、`newmate_mcp_info`。有宿主绑定的原对话时，`newmate_task` 可把具体后续任务交回该对话；模型参数不能另选目标。
 
@@ -140,7 +132,7 @@ heartBeat 负责持久化重启后任务与消费回执，也为插件更新流�
 ## 快速开始
 
 1. 在 DSH 配置好模型供应商，确认所选模型可用。
-2. 通过 DSH 插件管理器安装 **`newmark2dsh`**。安装时可显式指定版本，避免宿主的新发布包等待策略选中较旧的包。
+2. 通过 DSH 插件管理器安装 **`newmark2dsh@0.3.14`**。使用明确版本可避免宿主新发布包等待策略选中较旧版本。
 3. 打开 **Newmark Core** 配置页，选择允许插件使用的供应商／模型，并开启需要的组件。
 4. 从侧栏打开 **MemoryLab** 维护记忆，或打开 **NewMate** 开始聊天；需要桌宠陪伴时，再开启陪伴设置；桌面操作则通过 `computer_use` 发起。
 5. 更换已经加载的后端或原生代码后重启宿主；官方 Windows 容器可使用启用的 heartBeat 完成交接。
@@ -161,7 +153,7 @@ heartBeat 负责持久化重启后任务与消费回执，也为插件更新流�
 
 | 平台 | 当前桌面路径 | 已有验证与使用前提 |
 | --- | --- | --- |
-| **Windows** | 真实／隐藏桌面、UIA 与像素观察、共享桌宠与窗口呈现；官方容器自动重启 | 已在官方 Windows DSH 安装并核对包内容，通过完整验收及原生预览、菜单、待办、MCP、重启恢复检查；原生辅助程序使用系统 .NET Framework 编译并按源码缓存 |
+| **Windows** | 真实／隐藏桌面、UIA 与像素观察、共享桌宠与窗口呈现；官方容器自动重启 | 0.3.14 已在官方 Windows DSH 安装并核对包内容，通过完整验收及原生预览、菜单、待办、MCP、重启恢复检查；原生辅助程序使用系统 .NET Framework 编译并按源码缓存 |
 | **macOS · Apple Silicon** | 像素／AX 双通道、用户准备的 Mission Control Space、共享桌宠与真实桌面接管包边 | macOS 14／15／26 ARM 云端原生与网页矩阵、真实双 Space 夹具及 1x／2x 渲染检查；按所用通道授予 Accessibility／屏幕采集权限 |
 | **Linux / WSLg · X11** | 真实 X11 应用观察与输入、带认证的 Xvfb 隔离会话、Qt 桌宠及呈现映射 | 已有 X11／WSLg 路径验证；依赖 Xvfb、xauth、Openbox、xdotool、wmctrl、Python Xlib／PIL／PyQt5；WSLg 路径针对 Linux GUI 应用，原生 Wayland 控制尚不支持 |
 
@@ -220,11 +212,11 @@ node scripts/check-release-bundle.mjs .
 
 此检查核对五组件自包含装配，平台原生行为和真实模型运行需执行各自专项验证。更多文件职责见 [OVERVIEW.md](https://github.com/positer/newmark2dsh/blob/main/OVERVIEW.md)，后续文档与实现遵循 [taste.md](https://github.com/positer/newmark2dsh/blob/main/taste.md)。
 
-## 更新与版本
+## 当前版本与更新
 
-README 只描述当前功能，不标注具体版本号：每个版本带来了什么、何时验收，以 [GitHub Releases](https://github.com/positer/newmark2dsh/releases) 为准；更早的 CHANGELOG 留在本地归档中。
+**当前版本：0.3.14；本文于 2026-10-14 核对。** 本版本带来 NewMate 待办的记忆驱动对话激活、Mac 包边与桌宠比例调整，以及 Windows 陪伴继承现有 CU 桌面。详细版本变化与验收说明见 [0.3.14 Release](https://github.com/positer/newmark2dsh/releases/tag/v0.3.14)，其他版本可在 [GitHub Releases](https://github.com/positer/newmark2dsh/releases) 中查看。
 
-文档更新不代表重新发布 npm 包，也不改变你已经安装的版本；需要版本号时，请以插件管理器显示的已安装版本或 GitHub Releases 为准。
+README 按当前功能维护；公开版本历史集中保存在 GitHub Releases，历史 CHANGELOG 留在本地归档中。文档更新不代表重新发布 npm 包或改变已经安装的版本。
 
 ## 许可与反馈
 
