@@ -6,6 +6,12 @@
  * is stored. Nothing here reaches into NewMate's run: inbound goes through mate.chat(), which is
  * the same function the page's POST arrives at, and outbound reads mate.state() and forwards the
  * `plain` bubble of the assistant message whose id equals the task id.
+ *
+ * Two outbound shapes exist, and both are the user's own request rather than an unprompted push:
+ *   - a REPLY to a WeChat message he sent (forwardReplies, keyed by the task id);
+ *   - a SCHEDULED item he set a time for (forwardScheduled, keyed by `todo:<todoId>`) — a plain
+ *     reminder's saved text and, since 0.3.67, the model's answer to a conversation activation.
+ * A proactive check-in that nobody asked for is still never sent here.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -418,26 +424,42 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
   }
 
   /**
-   * Reminder deliveries are NOT replies to anything this channel sent: NewMate pushes them as
+   * SCHEDULED deliveries are NOT replies to anything this channel sent: NewMate pushes them as
    * assistant messages whose id is `todo:<todoId>`, with no task behind them, so forwardReplies()
    * never sees them — that is why a plain-text reminder reached the page and the desktop bubble but
-   * never the phone. They still belong to the user: forward the saved text as the same plain
-   * bubble, but only for todos whose mode is `reminder`, and only newer than the watermark so a
-   * fresh install does not replay every reminder ever delivered.
+   * never the phone.
+   *
+   * Both due modes are forwarded, because they are the same promise to the user: he scheduled
+   * something and it is now due. 0.3.67 extends this from `reminder` to a `conversation`
+   * activation too: measured 2026-10-29 11:20, an activation due at 03:20:18.425 was delivered to
+   * the page and the bubble (1.4 s) and NOT to WeChat — `stats.replies` stayed 31, no `sent`
+   * receipt — because this function filtered on `mode === 'reminder'` and forwardReplies() only
+   * knows tasks a WeChat message created. The model's answer is the thing he asked for, so it goes
+   * out as the same plain bubble as a reminder.
+   *
+   * Guards kept as they were: a message is forwarded once (`sent`), only newer than the watermark
+   * (a fresh install must not replay history), and only within 30 minutes of being produced.
    */
-  async function forwardReminders() {
+  async function forwardScheduled() {
     const snapshot = mate.state();
     const messages = Array.isArray(snapshot.messages) ? snapshot.messages : [];
     const todos = Array.isArray(snapshot.todos) ? snapshot.todos : [];
     if (!messages.length) return;
-    const reminderTodos = new Set(todos.filter((todo) => todo && todo.mode === 'reminder').map((todo) => String(todo.id)));
+    const reminderTodos = new Set(todos.filter((todo) => todo && (todo.mode === 'reminder' || todo.mode === 'conversation')).map((todo) => String(todo.id)));
     if (!reminderTodos.size) return;
     for (const message of messages) {
       if (!message || message.role !== 'assistant' || !message.id) continue;
       const todoId = message.todoId ? String(message.todoId) : (typeof message.id === 'string' && message.id.startsWith('todo:') ? message.id.slice(5) : '');
       if (!todoId || !reminderTodos.has(todoId)) continue;
       if (state.sent[message.id]) continue;
-      if (Number(message.at || 0) <= Number(state.reminderWatermark || 0)) continue;
+      /**
+       * STRICTLY OLDER than the watermark, not "at or older": two scheduled items can carry the SAME
+       * millisecond (measured in this gate: a reminder and an activation stamped `future` together),
+       * and advancing the watermark to that instant then skipped the second one forever. Duplicates
+       * are already excluded by `state.sent[message.id]` above, so the watermark only has to say
+       * "history from before this channel started".
+       */
+      if (Number(message.at || 0) < Number(state.reminderWatermark || 0)) continue;
       if (Date.now() - Number(message.at || 0) > 30 * 60 * 1000) continue;   // too old to be useful
       // The reminder body is the user's own text: strip anything that would render oddly but keep
       // it whole (the 80-character bubble limit would cut a real sentence in half).
@@ -450,7 +472,7 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       if (!peer || !peer.to) {
         // Do not mark it: a reminder that arrived before any WeChat peer existed must still go
         // out once one does. The age guard below stops ancient ones from being replayed.
-        log('wechat: reminder ' + message.id + ' has no WeChat recipient yet, will retry');
+        log('wechat: scheduled message ' + message.id + ' has no WeChat recipient yet, will retry');
         continue;
       }
       // Claim first: the timer can tick again while the send is in flight.
@@ -462,12 +484,12 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
         state.sent[message.id] = { at: Date.now(), messageId: sent.messageId, chars: value.length, reminder: true };
         state.reminderWatermark = Math.max(Number(state.reminderWatermark || 0), Number(message.at || 0));
         save();
-        log('wechat: forwarded reminder ' + message.id + ' (' + value.length + ' chars)');
+        log('wechat: forwarded scheduled message ' + message.id + ' (' + value.length + ' chars)');
       } else {
         state.stats.sendFailed += 1;
         delete state.sent[message.id];
         save();
-        log('wechat: reminder send failed ret=' + (sent.ret === undefined ? '(none)' : sent.ret) + ' ' + (sent.errmsg || sent.error || ''));
+        log('wechat: scheduled send failed ret=' + (sent.ret === undefined ? '(none)' : sent.ret) + ' ' + (sent.errmsg || sent.error || ''));
       }
     }
   }
@@ -637,7 +659,7 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       // Reminders arrive without any outstanding task, so the guard cannot be 'awaiting is empty'.
       if (stopped || forwarding) return;
       forwarding = true;
-      try { await forwardReplies(); await forwardReminders(); } catch (error) { log('wechat/replies: ' + error.message); } finally { forwarding = false; }
+      try { await forwardReplies(); await forwardScheduled(); } catch (error) { log('wechat/replies: ' + error.message); } finally { forwarding = false; }
     }, REPLY_POLL_MS);
     if (replyTimer.unref) replyTimer.unref();
   }

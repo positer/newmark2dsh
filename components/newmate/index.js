@@ -44,8 +44,10 @@ export function apply(ctx, config) {
   const mate = createNewMate({ root: resolveRoot(config), tools: ctx.tools, agents: () => ctx.get?.('agents'), goals: () => ctx.get?.('goals'), logger:ctx.logger,onCompanion:companion,onNotify:notifyDesktopPet,onPresence:updateDesktopPetFocus,environment });
   /**
    * The WeChat ClawBot channel. Driven from the settings page (one button, two states) and
-   * independent of the companion switches: it only ever forwards the final reply of a run the
-   * WeChat message itself started, and it never sends a proactive message.
+   * independent of the companion switches: it forwards the final reply of a run the WeChat message
+   * itself started, and it forwards a SCHEDULED item the user set a time for (a plain reminder's
+   * saved text, and since 0.3.67 a conversation activation's answer). A proactive check-in nobody
+   * asked for is still never sent.
    */
   const wechat = createWechatChannel({ root: resolveRoot(config), mate, log: (line) => ctx.logger?.info?.(line) });
   ctx.effect(()=>{if(mate.state().settings.companion)companion(true).catch(e=>mate.failure('newmate/pet',e));return()=>{disposed=true;stopDesktopPet('companion_disposed','companion').catch(e=>ctx.logger?.warn?.(e.message));};},'newmate-companion-pet');
