@@ -184,24 +184,18 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
    *
    * A gate that only says "not yet" is indistinguishable from a broken gate: on 2026-10-28 14:00 a
    * reminder read "已到期 · 等待合适时机" for 12m47s and nothing anywhere said what it waited for.
-   * The codes below are the complete answer; `null` means the conversation gate would let it run.
+   * The codes below are the complete answer, and only the two conditions a due item can actually
+   * wait for are in it (2026-10-29).
    */
-  const DEFERRAL = {companion_off:'陪伴未开启',newmate_running:'NewMate 正在运行',newmate_busy:'NewMate 队列未空',quiet_hours:'静默时段',snoozed:'已暂停',desktop_unavailable:'桌宠未就绪',host_busy:'宿主有会话在运行',reading:'正在阅读',input:'正在输入',draft:'有未发送草稿'};
-  /** The first condition that refuses a conversation activation, in the order it is evaluated. */
-  function activationBlocker(){
-    const s=store.read(),env=environment();
-    if(s.settings.companion!==true)return 'companion_off';
-    if(isQuiet(s.settings,now()))return 'quiet_hours';
-    if(s.settings.snoozeUntil>now())return 'snoozed';
-    if(env.ready===false)return 'desktop_unavailable';
-    if(env.busy)return 'host_busy';
-    if(env.readerFocused||readingUntil>now())return 'reading';
-    if(!(env.idleMs>=MINUTE))return 'input';
-    if(s.attention?.[s.activeThreadId]?.draftUntil>now())return 'draft';
-    return null;
-  }
-  /** One predicate, one order: activation is allowed exactly when nothing refuses it. */
-  function todoActivationReady(){return activationBlocker()===null;}
+  const DEFERRAL = {companion_off:'陪伴未开启',newmate_running:'NewMate 正在运行',newmate_busy:'NewMate 队列未空',queue_full:'任务队列已满',model_unavailable:'模型尚未就绪'};
+  /**
+   * "Nothing was attempted" - agent-api exit 3. It is not an answer and it is not the user's fault:
+   * on 2026-10-29 09:04 the user's 07:30 activation ran for 204 ms, hit `model_not_selected` (a fresh
+   * bundle has authorised no model yet) and was written `failed`, which never retries. The item was
+   * asked for by the user, so it goes back to pending with a short backoff instead of being burned.
+   */
+  const NOTHING_ATTEMPTED = /no model has been (?:authorised|selected)|model_not_selected/i;
+  const NOTHING_ATTEMPTED_RETRY_MS = 5 * MINUTE;
   /**
    * NewMate's own queue: is this companion busy with, or about to start, a turn of its own?
    * Deliberately does NOT consult the DSH host - a turn running in another workspace is not NewMate
@@ -214,19 +208,27 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
   /** Idle means this companion is not working; the DSH host is deliberately not consulted. */
   function newmateIdle(){return newmateBusyReason()===null;}
   /**
-   * The reminder gate: exactly the two things the user named - the companion switch, and NewMate
-   * being idle. Nothing about the host, the desktop, the keyboard, reading or drafts.
+   * The one gate every due item obeys: the companion switch, and NewMate being idle.
    *
-   * Rationale, because the asymmetry with activation is intentional:
-   *   - a REMINDER is a message the user scheduled. Delivering it spends no model and interrupts
-   *     nobody's turn, so every condition beyond these two was an unasked-for delay;
-   *   - an ACTIVATION starts a model run in a conversation, so it keeps the full attention gate
-   *     (activationBlocker above).
+   * The user's rule, in their words (2026-10-29): a todo that activates a NewMate conversation
+   * "应该和 dsh 本体的会话没有任何关系，只需要投递给 newMate 并激活 newMate 的对话即可". So the
+   * DSH host is not consulted here, and neither are quiet hours, snooze, the desktop, reading,
+   * typing or drafts. Both modes therefore wait for exactly the same two things; what differs is
+   * only what happens at the end - store the text, or run one turn.
    * Quiet hours and snooze are NOT here on purpose: they belong to notify(), which mutes the BUBBLE
    * while the message is still stored. Refusing delivery there would merge two different promises -
    * "it arrived" and "it interrupted you" - and the receipt records which of the two happened.
+   *
+   * What the old ladder cost, measured on the user's own record: an item due 2026-10-29 07:30 was
+   * still pending at 08:49 reading "已到期 · 等宿主有会话在运行", because a session in another
+   * workspace was running. A gate waits for what the action needs, not for what the host is.
    */
-  function reminderReady(){return store.read().settings.companion===true&&newmateIdle();}
+  function deliveryBlocker(){
+    if(store.read().settings.companion!==true)return 'companion_off';
+    return newmateBusyReason();
+  }
+  /** One predicate, one order: an item runs exactly when nothing refuses it. */
+  function deliveryReady(){return deliveryBlocker()===null;}
   /**
    * Record why an item is waiting, and only when the reason CHANGES: the tick runs every 1.5 s, and
    * rewriting the same code on every pass would turn a diagnostic into a disk-thrash.
@@ -238,30 +240,40 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
   }
   async function deliverDueTodo(){
     const state=store.read();
-    const item=state.todos.filter(t=>t.status==='pending'&&t.activateAt<=now()).sort((a,b)=>a.activateAt-b.activateAt||a.created-b.created)[0];if(!item)return;
     /**
-     * Two gates, deliberately different, and neither of them guesses:
+     * Due items, in order, but the FIRST ONE THAT CAN RUN wins - a blocked item must not hold the
+     * queue behind it. Measured 2026-10-29: with the task queue full, a conversation item returned
+     * silently and the reminder behind it was never delivered either.
      *
-     *   activation -> newmateBusyReason() then activationBlocker(): the full attention gate, because
-     *                 it starts a model run inside a conversation;
-     *   reminder   -> reminderReady(): only the companion switch and NewMate's own queue, because it
-     *                 costs no model and interrupts no turn.
-     *
-     * Whichever condition refuses, it is written to the item, so the panel can say WHY instead of
-     * showing a bare "waiting for a good moment" (the 2026-10-28 14:00 report).
+     * `retryAfter` is the backoff a failed-before-attempting activation leaves behind: the user
+     * scheduled that item, so an outage is not an answer (see the catch below).
      */
+    const due=state.todos.filter(t=>t.status==='pending'&&t.activateAt<=now()&&!(t.retryAfter>now())).sort((a,b)=>a.activateAt-b.activateAt||a.created-b.created);
+    if(!due.length)return;
+    let item=null;
+    for(const candidate of due){
+      const refusal=deliveryBlocker();
+      if(refusal){defer(candidate,refusal);break;}
+      if(candidate.mode==='conversation'&&(state.tasks.length>=2000||state.tasks.filter(t=>['pending','running'].includes(t.status)).length>=100)){defer(candidate,'queue_full');continue;}
+      item=candidate;break;
+    }
+    if(!item)return;
+    /**
+     * One gate, both modes (2026-10-29). An activation is held by nothing a reminder is not held by,
+     * because neither of them needs the host: the only two facts that can refuse a due item are "the
+     * companion is off" and "NewMate is busy with a turn of its own". Whichever refuses is written to
+     * the item, so the panel can say WHY instead of showing a bare "waiting for a good moment"
+     * (the 2026-10-28 14:00 report).
+     */
+    const blocker=deliveryBlocker();
+    if(blocker){defer(item,blocker);return;}
     if(item.mode==='conversation'){
-      const busy=newmateBusyReason();if(busy){defer(item,busy);return;}
-      const blocker=activationBlocker();
-      if(blocker){defer(item,blocker);return;}
-      delete state.todos.find(t=>t.id===item.id)?.deferred;
-      if(state.tasks.length>=2000||state.tasks.filter(t=>['pending','running'].includes(t.status)).length>=100)return;
+      const claimedTodo=state.todos.find(t=>t.id===item.id);if(claimedTodo){delete claimedTodo.deferred;delete claimedTodo.retryAfter;}
       thread();const destination=rotateForMessage('todo',item.content),id=todoMessageId(item.id);
       store.change(s=>{const t=s.todos.find(t=>t.id===item.id);if(t?.status!=='pending')return;if(!s.tasks.some(task=>task.id===id))s.tasks.push({id,todoId:item.id,kind:'todo_activation',prompt:item.content,destination:'newmate',threadId:destination,status:'pending',created:now(),...(item.origin?.startsWith('dsh-session:')?{origin:item.origin.slice('dsh-session:'.length)}:{})});Object.assign(t,{status:'activated',activatedAt:now(),taskId:id,threadId:destination});});
       return;
     }
-    if(!reminderReady()){defer(item,store.read().settings.companion===true?newmateBusyReason():'companion_off');return;}
-    let claimed=false;store.change(s=>{const t=s.todos.find(t=>t.id===item.id);if(t?.status==='pending'){delete t.deferred;t.status='delivering';claimed=true;}});if(!claimed)return;
+    let claimed=false;store.change(s=>{const t=s.todos.find(t=>t.id===item.id);if(t?.status==='pending'){delete t.deferred;delete t.retryAfter;t.status='delivering';claimed=true;}});if(!claimed)return;
     try{
       let message=store.read().messages.find(m=>m.id===todoMessageId(item.id));
       if(!message){thread();const destination=rotateForMessage('todo',item.content);message={id:todoMessageId(item.id),todoId:item.id,threadId:destination,role:'assistant',text:item.content,at:now(),proactive:true,unread:true};store.change(s=>{s.messages.push(message);s.threads.find(t=>t.id===destination).updated=now();});await notify(message);}
@@ -373,21 +385,28 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     // cannot deliver (companion_off included), and a reason nobody ever computes is not a reason.
     const todoState=store.read();if(todoState.todos.some(t=>t.status==='pending'&&t.activateAt<=now())){todoDelivering=true;try{await deliverDueTodo();}finally{todoDelivering=false;}if(stopped)return;}
     if(now()-lastProbeAt>=MINUTE){lastProbeAt=now();probeInitiative();}
-    const task = store.read().tasks.find(t => t.kind==='chat'&&t.status==='pending')||store.read().tasks.find(t => t.status === 'pending'&&(t.kind!=='todo_activation'||todoActivationReady()));
-    if (!task) return;
     /**
-     * A wake (`newmate_task`) hands work back into a DSH conversation and the host runs a turn
-     * there. That turn is the user's, so a conversation the user PAUSED must not be woken - the same
-     * rule heartbeat already enforces for restart participants. The answer is asked before the run
-     * starts, not after: deferring needs no live view, and the task simply stays pending and is
-     * re-checked on the next tick, so resuming the goal releases the delivery without a new request.
-     * An unloaded conversation has no goal to read (agents.get is undefined), and that is not
-     * evidence of a pause: deliver.
+     * Pick the first task that can actually run - and SKIP a paused target instead of returning.
+     *
+     * It used to `return` on a paused wake, which meant one pending wake into a PAUSED conversation
+     * starved everything behind it: measured 2026-10-29 (independent audit), a due activation sat at
+     * `activated` with zero model calls across restarts while a paused wake was queued in front of
+     * it. A DSH fact (someone paused that conversation's goal) must not decide whether NewMate can
+     * run the turn the user scheduled.
      */
-    if (task.destination !== 'newmate' && conversationPaused(goals(), agents()?.get?.(task.destination))) {
-      store.change(s => { Object.assign(s.tasks.find(t => t.id === task.id), { deferred: 'target_paused' }); });
-      return;
+    const pending = store.read().tasks.filter(t => t.status === 'pending');
+    const candidates = [...pending.filter(t => t.kind === 'chat'), ...pending.filter(t => t.kind !== 'chat')]
+      .filter(t => t.kind !== 'todo_activation' || deliveryReady());
+    let task = null;
+    for (const candidate of candidates) {
+      if (candidate.destination !== 'newmate' && conversationPaused(goals(), agents()?.get?.(candidate.destination))) {
+        store.change(s => { Object.assign(s.tasks.find(t => t.id === candidate.id), { deferred: 'target_paused' }); });
+        continue;
+      }
+      task = candidate;
+      break;
     }
+    if (!task) return;
     running = true; active = new AbortController();activeTask=task;manualRestart=false;userPreempted=false;guide={pending:[],drain(){return this.pending.splice(0);}};
     /**
      * `update_report` is a task the restart pipeline ASKED for, not the companion deciding to
@@ -396,7 +415,13 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
      * 2026-10-27, four post-restart reports were suppressed as `proactive_format` and the user
      * never saw them. Requested reports are displayed; only the capability-whine gate applies.
      */
-    const report=task.kind==='update_report',automatic=task.kind==='measurement'||task.kind==='self_activation',delegated=task.kind==='todo_activation',unsolicited=task.kind!=='chat'&&!report;activeAutomatic=automatic||delegated;
+    const report=task.kind==='update_report',automatic=task.kind==='measurement'||task.kind==='self_activation',delegated=task.kind==='todo_activation',unsolicited=task.kind!=='chat'&&!report&&!delegated;activeAutomatic=automatic||delegated;
+    /**
+     * A delegation is SOLICITED: the user asked for that turn at that time, so the 240-character /
+     * no-list rule of a proactive message has no business judging the answer. Measured 2026-10-29
+     * (independent audit): a 241-character reply, or a reply with a bullet list, was suppressed as
+     * `proactive_format` and the todo was written `failed` - the model ran, the user got nothing,
+     * and nothing retried it. */
     try {
       if(automatic){const s=store.read();if(!s.settings.companion||!s.settings.initiative||task.threadId!==s.activeThreadId){store.change(s=>{Object.assign(s.tasks.find(t=>t.id===task.id),{status:'paused',finished:now()});});return;}}
       store.change(s => { s.tasks.find(t => t.id === task.id).status = 'running'; });
@@ -462,8 +487,24 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
       store.change(s => { const settled=s.tasks.find(t => t.id === task.id);Object.assign(settled,{status:'completed',finished:now()});delete settled.deferred;if(task.todoId){const todo=s.todos.find(t=>t.id===task.todoId),stored=s.messages.some(m=>m.id===task.id);if(todo){const next=stored&&todo.repeat?nextActivation(todo.repeat,now()):null;delete todo.deferred;Object.assign(todo,stored?(next?{status:'pending',activateAt:next,lastDeliveredAt:now(),messageId:task.id,deliveries:(todo.deliveries||0)+1}:{status:'completed',completedAt:now(),messageId:task.id}):{status:'failed',completedAt:now(),error:'运行已结束，但回复被主动消息格式规则抑制'});}} });
     } catch (error) {
       const paused=automatic&&active.signal.aborted&&!stopped;
-      if (!stopped&&!paused&&!manualRestart&&!userPreempted) failures.record({where:'newmate/task',code:error.code || 'task_failed',message:String(error.message),fields:{taskId:task.id}});
-      store.change(s => { const attempted=s.tasks.find(t => t.id === task.id);delete attempted.deferred;Object.assign(attempted, { status: manualRestart?'pending':userPreempted?'interrupted':paused?'paused':stopped ? 'interrupted' : 'failed', error: manualRestart?'已切换为用户引导':userPreempted?'用户已切换到新对话':paused?'主动陪伴已暂停':String(error.message), finished: now() });if(task.todoId&&!manualRestart)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:'failed',error:String(error.message)});if(automatic)s.initiative.lastOutcome=manualRestart?'user_steer':paused?'paused':stopped?'interrupted':'failed'; });
+      /**
+       * A refusal before anything was attempted is not the answer to a scheduled item (2026-10-29).
+       * The todo returns to `pending` with a backoff and a reason the panel shows, and the attempt
+       * record is removed because the next tick re-creates the same deterministic task id - that is
+       * why this is not a silent retry of a failure: nothing was tried, so nothing failed.
+       */
+      const nothingAttempted = !stopped && !manualRestart && !userPreempted && Boolean(task.todoId)
+        && (NOTHING_ATTEMPTED.test(String(error.message || '')) || String(error.code || '') === 'model_not_selected');
+      if (!stopped&&!paused&&!manualRestart&&!userPreempted) failures.record({where:'newmate/task',code:error.code || (nothingAttempted ? 'nothing_attempted' : 'task_failed'),message:String(error.message),fields:{taskId:task.id,...nothingAttempted?{retryInMs:NOTHING_ATTEMPTED_RETRY_MS}:{}}});
+      store.change(s => {
+        if(nothingAttempted){
+          const todo=s.todos.find(t=>t.id===task.todoId);
+          s.tasks=s.tasks.filter(t=>t.id!==task.id);
+          if(todo)Object.assign(todo,{status:'pending',retryAfter:now()+NOTHING_ATTEMPTED_RETRY_MS,deferred:{code:'model_unavailable',at:now(),reason:DEFERRAL.model_unavailable}});
+          if(automatic)s.initiative.lastOutcome='nothing_attempted';
+          return;
+        }
+        const attempted=s.tasks.find(t => t.id === task.id);delete attempted.deferred;Object.assign(attempted, { status: manualRestart?'pending':userPreempted?'interrupted':paused?'paused':stopped ? 'interrupted' : 'failed', error: manualRestart?'已切换为用户引导':userPreempted?'用户已切换到新对话':paused?'主动陪伴已暂停':String(error.message), finished: now() });if(task.todoId&&!manualRestart)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:'failed',error:String(error.message)});if(automatic)s.initiative.lastOutcome=manualRestart?'user_steer':paused?'paused':stopped?'interrupted':'failed'; });
     } finally {
       // A lease outlives the turn that took it, so it is released HERE, before the task is
       // reported settled: an unattended companion must not leave the desktop in takeover.
@@ -662,7 +703,7 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     todoAdd(input,execution,source='agent'){const value=todoInput(input,now()),id=randomUUID();store.change(s=>{if(s.todos.length>=2000||s.todos.filter(t=>['pending','delivering'].includes(t.status)).length>=100)throw Error('待办列表已达到容量上限');s.todos.push({id,...value,created:now(),status:'pending',source,origin:computerUseCaller(execution)||undefined});});return{ok:true,todo:store.read().todos.find(t=>t.id===id)};},
     todoList(){return{ok:true,todos:store.read().todos};},
     todoCancel(id){store.change(s=>{const t=s.todos.find(t=>t.id===id);if(!t||!['pending','failed'].includes(t.status))throw Error('该待办不存在、已投递或正在投递');t.status='cancelled';t.cancelledAt=now();delete t.deferred;});return{ok:true,id};},
-    state: store.read, activationBlocker, newmateIdle, reminderReady, loopStatus: () => live.snapshot(), ask, answerQuestion, pendingQuestion, enqueue, tick, initiativeStatus(){const s=store.read(),env=environment();return{...initiativeGate(s.settings,s.initiative,now(),{...env,busy:env.busy||running||s.tasks.some(t=>['pending','running'].includes(t.status))},engagedAt,bootReadyAt),nextAttemptAt:s.initiative.nextAttemptAt,lastReason:s.initiative.lastReason,lastOutcome:s.initiative.lastOutcome};},stop() { stopped = true; settleAsk({ ok: false, code: 'question_aborted', error: 'the companion stopped before the user answered', questionId: null }); active?.abort(); },
+    state: store.read, deliveryBlocker, deliveryReady, newmateIdle, loopStatus: () => live.snapshot(), ask, answerQuestion, pendingQuestion, enqueue, tick, initiativeStatus(){const s=store.read(),env=environment();return{...initiativeGate(s.settings,s.initiative,now(),{...env,busy:env.busy||running||s.tasks.some(t=>['pending','running'].includes(t.status))},engagedAt,bootReadyAt),nextAttemptAt:s.initiative.nextAttemptAt,lastReason:s.initiative.lastReason,lastOutcome:s.initiative.lastOutcome};},stop() { stopped = true; settleAsk({ ok: false, code: 'question_aborted', error: 'the companion stopped before the user answered', questionId: null }); active?.abort(); },
     async configure(settings) {
       if(!settings||Object.keys(settings).some(k=>!['companion','notifications','watchEnabled','watchIntervalMinutes','watchDepth','watchDshWeight',...Object.keys(INITIATIVE_DEFAULTS)].includes(k)))throw Error('陪伴设置无效');
       for(const [key,value]of Object.entries(settings)){if(['companion','notifications','initiative'].includes(key)&&typeof value!=='boolean')throw Error('开关无效');if(key==='pace'&&(typeof value!=='string'||!Object.hasOwn(PACES,value)))throw Error('陪伴频率无效');if(['quietStart','quietEnd'].includes(key)&&(!Number.isInteger(value)||value<0||value>23))throw Error('静默时间无效');if(key==='watchEnabled'&&typeof value!=='boolean')throw Error('监控开关无效');if(key==='watchIntervalMinutes'&&(!Number.isInteger(value)||value<5||value>1440))throw Error('监控间隔须为 5–1440 分钟');if(key==='watchThreshold')throw Error('监控阈值已并入主动性选择，请改 pace');if(key==='watchDepth'&&(!Number.isInteger(value)||value<0||value>6))throw Error('监控深度须为 0–6');if(key==='watchDshWeight'&&(!Number.isFinite(value)||value<0||value>1))throw Error('DSH 变动权重须在 0–1 之间');if(key==='snoozeUntil'&&(!Number.isFinite(value)||value<0||value>now()+7*DAY))throw Error('暂停期限无效');}
