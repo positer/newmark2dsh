@@ -75,8 +75,8 @@ export const NEWMATE_RUN_TOOLS = Object.freeze([
   'shortMemory_add', 'shortMemory_recall', 'shortMemory_where', 'shortMemory_size',
   'newmate_todo_add', 'newmate_todo_list', 'newmate_todo_cancel',
   'computer_use', 'screen_capture', NEWMATE_SEARCH_TOOL, NEWMATE_ASK_TOOL, 'compact_context', 'newmate_task',
-  'newmate_wechat_send_file', 'newmate_attachment_read',
-  'newmate_conversation_new', 'newmate_conversation_send', 'newmate_conversation_read',
+  'newmate_wechat_send_file', 'newmate_wechat_send_text', 'newmate_attachment_read',
+  'newmate_conversation_list', 'newmate_conversation_new', 'newmate_conversation_send', 'newmate_conversation_read',
 ]);
 
 /** The two ComputerUse tools, and the owner label every NewMate lease carries. */

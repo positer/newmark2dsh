@@ -28,14 +28,25 @@ const REPLY_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_DELIVERY_ATTEMPTS = 2;
 const RETRY_MS = 2000;
 const MAX_QR_REFRESH = 3;
+/*
+ * A REPORT is NewMate telling the user something it found out on its own (a scheduled item finished,
+ * work handed to a conversation came back, a real problem it cannot solve, a task that failed).
+ * The bounds below are what keeps "report" from becoming "chatter": 800 characters is one
+ * paragraph, six an hour is more than a working day needs, and an identical text inside ten
+ * minutes is a retry loop rather than news.
+ */
+const MAX_REPORT_CHARS = 800;
+const REPORT_WINDOW_MS = 60 * 60 * 1000;
+const MAX_REPORTS_PER_HOUR = 6;
+const DUPLICATE_REPORT_MS = 10 * 60 * 1000;
 
 function emptyState() {
   return {
     schema: 1, phase: 'disconnected',
     token: '', botId: '', baseUrl: ILINK_BASE, ilinkUserId: '',
-    cursor: '', ledger: {}, pending: [], awaiting: {}, sent: {},
+    cursor: '', ledger: {}, pending: [], awaiting: {}, sent: {}, reports: [],
     qrcode: '', qrAt: 0, error: '', connectedAt: 0, updatedAt: 0,
-    stats: { inbound: 0, acked: 0, skipped: 0, replies: 0, sendFailed: 0, files: 0, fileFailed: 0, media: 0, mediaBytes: 0, mediaFailed: 0, voiceUnsupported: 0 },
+    stats: { inbound: 0, acked: 0, skipped: 0, replies: 0, sendFailed: 0, files: 0, fileFailed: 0, reports: 0, reportFailed: 0, media: 0, mediaBytes: 0, mediaFailed: 0, voiceUnsupported: 0 },
   };
 }
 
@@ -47,7 +58,7 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
       // stats MERGE rather than replace: a state file written by an older version has no
       // `files` counter, and copying it wholesale would answer `undefined` for a number the page
       // and the tool report. The same reason keeps every other counter a number.
-      return { ...emptyState(), ...value, ledger: value.ledger || {}, awaiting: value.awaiting || {}, sent: value.sent || {}, pending: Array.isArray(value.pending) ? value.pending : [], stats: { ...emptyState().stats, ...(value.stats || {}) } };
+      return { ...emptyState(), ...value, ledger: value.ledger || {}, awaiting: value.awaiting || {}, sent: value.sent || {}, reports: Array.isArray(value.reports) ? value.reports : [], pending: Array.isArray(value.pending) ? value.pending : [], stats: { ...emptyState().stats, ...(value.stats || {}) } };
     } catch (error) {
       if (error.code === 'ENOENT') return emptyState();
       log('wechat/state-read: ' + error.message);
@@ -590,6 +601,56 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     };
   }
 
+  /* --------------------------------------------------------------- reports */
+
+  /**
+   * Send ONE short text to the bound WeChat user, outside any reply or schedule.
+   *
+   * This is the third outbound shape and the only one NewMate itself may initiate: a scheduled item
+   * finished, work it handed to a conversation came back, a problem it cannot solve, a task that
+   * failed. It is a REPORT, not care - the persona asks for the fact and the next step - and the
+   * bounds in this function are what keep a report from turning into chatter.
+   *
+   * Refusals are named for the same reason every other path names them: "did not send" with no
+   * reason cannot be acted on. A rate limit is a refusal rather than a silent drop, because a model
+   * that is looping has to be told it is looping or it will loop again.
+   */
+  async function sendText({ text: body = '', receiver = '' } = {}) {
+    const value = String(body ?? '').replace(/\r?\n+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!value) return { ok: false, code: 'empty_text', error: '汇报内容为空，没有可发的东西。' };
+    if (value.length > MAX_REPORT_CHARS) return { ok: false, code: 'text_too_long', chars: value.length, limit: MAX_REPORT_CHARS, error: '汇报最长 ' + MAX_REPORT_CHARS + ' 字（当前 ' + value.length + '）：细节留在页面，微信只说结论与下一步。' };
+    if (!state.token) return { ok: false, code: 'wechat_not_connected', error: '微信 ClawBot 未连接：先在 NewMate 设置页「发起连接」并扫码，再汇报。' };
+    if (state.phase === 'error' && state.error === 'session_paused') return { ok: false, code: 'wechat_session_paused', error: '微信侧会话已暂停（errcode=-14）：需要人工重新扫码，重启不会自动恢复。' };
+    const to = String(receiver || '').trim() || (state.lastPeer && state.lastPeer.to) || state.ilinkUserId || '';
+    if (!to) return { ok: false, code: 'receiver_unavailable', error: '没有可用的微信接收者：先让用户给 ClawBot 发一条消息，或完成扫码登录。' };
+    const now = Date.now();
+    const reports = Array.isArray(state.reports) ? state.reports : [];
+    const recent = reports.filter((entry) => now - Number(entry.at || 0) < REPORT_WINDOW_MS);
+    if (recent.length >= MAX_REPORTS_PER_HOUR) {
+      const oldest = Math.min(...recent.map((entry) => Number(entry.at || 0)));
+      return { ok: false, code: 'report_rate_limited', limit: MAX_REPORTS_PER_HOUR, retryAfterMs: Math.max(0, oldest + REPORT_WINDOW_MS - now), error: '一小时最多 ' + MAX_REPORTS_PER_HOUR + ' 条汇报：把几件事合成一条，或者等这个窗口过去。' };
+    }
+    const duplicate = recent.find((entry) => entry.text === value && now - Number(entry.at || 0) < DUPLICATE_REPORT_MS);
+    if (duplicate) return { ok: false, code: 'duplicate_report', error: '十分钟内已经发过一模一样的内容，这次没有重复发送。' };
+    const sent = await ilink.sendText({ to, text: value, contextToken: (state.lastPeer && state.lastPeer.contextToken) || '' });
+    if (!sent.ok) {
+      state.stats.reportFailed = Number(state.stats.reportFailed || 0) + 1;
+      save();
+      return { ok: false, code: sent.code || 'send_failed', error: String(sent.error || sent.errmsg || ('发送失败 ret=' + sent.ret)) };
+    }
+    state.reports = [...recent, { at: now, chars: value.length, text: value, messageId: sent.messageId || null }].slice(-50);
+    state.stats.reports = Number(state.stats.reports || 0) + 1;
+    save();
+    log('wechat: sent report (' + value.length + ' chars) as ' + (sent.messageId || 'no message id'));
+    return {
+      ok: true,
+      receiver: to,
+      chars: value.length,
+      messageId: sent.messageId ?? null,
+      receipt: { accepted: true, serverMessageId: sent.messageId ?? null, remainingThisHour: Math.max(0, MAX_REPORTS_PER_HOUR - (recent.length + 1)) },
+    };
+  }
+
   async function receiveLoop(generation) {
     const stale = () => stopped || generation !== receiveGeneration;
     state.receiveSince = Date.now();
@@ -716,5 +777,5 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
     startReceive();
   }
 
-  return { status, connect, logout, stop, resume, sendFile, statePath: file };
+  return { status, connect, logout, stop, resume, sendFile, sendText, statePath: file };
 }

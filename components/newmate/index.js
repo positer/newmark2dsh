@@ -65,10 +65,25 @@ export function apply(ctx, config) {
    * host that does not carry one (persistence absent, no preset service) refuses by name instead of
    * failing to mount.
    */
-  const conversations=createConversationBridge({services:{agents:()=>ctx.get?.('agents'),presets:()=>ctx.get?.('agentPresets'),workspaces:()=>ctx.get?.('workspaceRegistry'),persistence:()=>ctx.get?.('sessionPersistence'),goals:()=>ctx.get?.('goals'),model:()=>{const selection=readCoreSelection({core});return selection?.ok?{provider:selection.provider,model:selection.model,...selection.reasoningEffort?{reasoningEffort:selection.reasoningEffort}:{}}:undefined;}},log:(where,error)=>ctx.logger?.warn?.(where+': '+error?.message)});
+  const conversations=createConversationBridge({services:{agents:()=>ctx.get?.('agents'),presets:()=>ctx.get?.('agentPresets'),workspaces:()=>ctx.get?.('workspaceRegistry'),persistence:()=>ctx.get?.('sessionPersistence'),sessionQuery:()=>ctx.get?.('sessionQuery'),goals:()=>ctx.get?.('goals'),model:()=>{const selection=readCoreSelection({core});return selection?.ok?{provider:selection.provider,model:selection.model,...selection.reasoningEffort?{reasoningEffort:selection.reasoningEffort}:{}}:undefined;}},log:(where,error)=>ctx.logger?.warn?.(where+': '+error?.message)});
   const privateTools={...(globalThis[Symbol.for("newmark.newmate.privateTools")] || {})};
   for(const definition of conversations.definitions)privateTools[definition.name]=definition;
-  globalThis[Symbol.for("newmark.newmate.privateTools")] = { ...privateTools, newmate_search: search.definition, compact_context: { name: "compact_context", description: "Compress earlier turns into the summary you provide; the run loop replaces its own history.", parameters: { type: "object", properties: { summary: { type: "string", minLength: 1, maxLength: 12000 }, keepRecent: { type: "integer", minimum: 2, maximum: 40 } }, required: ["summary"], additionalProperties: false }, execute: () => ({ ok: false, error: "compact_context is applied by the run loop" }) } };
+  /**
+   * The report path: NewMate telling the user something it found out by itself.
+   *
+   * It is a PRIVATE tool (NewMate's run only) rather than a shared registration, because it speaks
+   * in NewMate's voice about NewMate's work. It is deliberately NOT a request tool: an autonomous
+   * check-in that discovers a real problem is exactly the case the user asked for. The bounds live
+   * in the channel (800 chars, 6 an hour, no identical text twice in 10 minutes), so the tool body
+   * stays one call and every refusal stays a named code the model can act on.
+   */
+  const reportTool = {
+    name: 'newmate_wechat_send_text',
+    description: '主动向用户的微信（ClawBot）发一条简短汇报：定时项跑完、交给某个对话的工作有了结论、你发现并确认的真实问题、某个任务失败或你做不了的原因。一句话到一小段（≤800 字），说清「发生了什么 + 需要用户做什么」；不要用它寒暄、道谢或罗列权限和能力。同一内容十分钟内不会重复发送，一小时最多 6 条；未连接时返回 wechat_not_connected。',
+    parameters: { type: 'object', properties: { text: { type: 'string', minLength: 1, maxLength: 800 } }, required: ['text'], additionalProperties: false },
+    execute: (args) => wechat.sendText(args),
+  };
+  globalThis[Symbol.for("newmark.newmate.privateTools")] = { ...privateTools, newmate_wechat_send_text: reportTool, newmate_search: search.definition, compact_context: { name: "compact_context", description: "Compress earlier turns into the summary you provide; the run loop replaces its own history.", parameters: { type: "object", properties: { summary: { type: "string", minLength: 1, maxLength: 12000 }, keepRecent: { type: "integer", minimum: 2, maximum: 40 } }, required: ["summary"], additionalProperties: false }, execute: () => ({ ok: false, error: "compact_context is applied by the run loop" }) } };
   const mcp=createNewMateMcp({root:resolveRoot(config),mate});
   for(const definition of mcp.definitions)ctx.effect(()=>ctx.tools.register(definition),`newmate-call-${definition.name}`);
   ctx.effect(()=>ctx.tools.register({name:'newmate_mcp_info',description:'Enable the NewMate MCP credential and return its endpoint path and local token file. The token is not returned in chat.',parameters:{type:'object',properties:{},additionalProperties:false},output:{schema:{type:'object'},render:(_,v)=>[{type:'text',text:JSON.stringify(v)}]},execute:mcp.info}),'newmate-mcp-info');

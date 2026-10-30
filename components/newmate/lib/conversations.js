@@ -5,8 +5,8 @@ import { conversationPaused, deliverConversation } from '../../../lib/conversati
 import { newMateContext } from '../../../lib/newmate-context.js';
 
 /**
- * NewMate's three conversation-level tools: start a NEW conversation in a workspace, hand a message
- * to an EXISTING conversation, and read a conversation's transcript.
+ * NewMate's four conversation-level tools: discover which conversations exist, start a NEW one in a
+ * workspace, hand a message to an EXISTING one, and read a transcript.
  *
  * These are the only tools in this bundle that act on something other than the companion's own
  * store, so every one of them is bounded and refuses by name:
@@ -17,14 +17,20 @@ import { newMateContext } from '../../../lib/newmate-context.js';
  *    capped per process - an autonomous loop must not be able to mint conversations without bound;
  *  - a delivery is the same contract `newmate_task` uses (stable `newmark-task:<id>` identity, host
  *    runner source, `sessions.flush` barrier) and obeys the same user-pause rule;
- *  - a read is bounded in messages and characters, reports what it dropped, and never writes.
+ *  - a read is bounded in messages and characters, reports what it dropped, and never writes;
+ *  - a listing is the discovery step that makes every id it hands out falsifiable: it is read-only,
+ *    page-bounded, reports the corpus size it paged and its source, and can be refused by name.
+ *    It exists because an id a model has to invent or remember is an id the host cannot vouch for -
+ *    and after a restart nothing live holds the old ones, which is how a read of a real conversation
+ *    came back 'unknown_conversation'.
  *
  * Definitions live in the private tool map (`newmark.newmate.privateTools`), so a DSH agent's own
  * catalog never lists them: they are NewMate's tools, admitted only by NewMate's run allow list.
  */
 
-/** The three names, in the order the persona introduces them. */
+/** The four names, in the order the persona introduces them. Discovery comes first. */
 export const CONVERSATION_TOOLS = Object.freeze([
+  'newmate_conversation_list',
   'newmate_conversation_new',
   'newmate_conversation_send',
   'newmate_conversation_read',
@@ -33,6 +39,9 @@ export const CONVERSATION_TOOLS = Object.freeze([
 /** Caps. Every one of these is a refusal, never a silent truncation of intent. */
 const MAX_PROMPT_CHARS = 16000;
 const MAX_SESSION_ID_CHARS = 100;
+const MAX_LIST_SESSIONS = 50;
+const DEFAULT_LIST_SESSIONS = 20;
+const MAX_TITLE_CHARS = 120;
 const MAX_LIVE_CONVERSATIONS = 16;
 const MAX_READ_MESSAGES = 60;
 const DEFAULT_READ_MESSAGES = 20;
@@ -93,6 +102,7 @@ export function createConversationBridge({ services, now = Date.now, log = () =>
   const presets = () => { try { return services?.presets?.(); } catch { return undefined; } };
   const workspaces = () => { try { return services?.workspaces?.(); } catch { return undefined; } };
   const persistence = () => { try { return services?.persistence?.(); } catch { return undefined; } };
+  const sessionQuery = () => { try { return services?.sessionQuery?.(); } catch { return undefined; } };
   /** Handles of the conversations this bridge created, so teardown can dispose exactly them. */
   const created = new Map();
   /** A created conversation is retained here; when the cap is reached creation is refused. */
@@ -145,6 +155,92 @@ export function createConversationBridge({ services, now = Date.now, log = () =>
     let bundled;
     try { bundled = services?.model?.(); } catch { bundled = undefined; }
     return usable(bundled);
+  }
+
+  /**
+   * Titles for ONE PAGE, in one batched fold. Never a reason to fail a listing, and never a guess: a
+   * host without the fold - or a session whose log carries no title - answers null.
+   */
+  async function titlesOf(query, ids) {
+    const titles = new Map();
+    if (!ids.length || typeof query?.readTitleSnapshots !== 'function') return titles;
+    try {
+      const results = await query.readTitleSnapshots(ids);
+      for (const result of Array.isArray(results) ? results : []) {
+        if (result?.status !== 'fulfilled') continue;
+        const title = result.value?.title?.title;
+        if (typeof result.sessionId === 'string' && typeof title === 'string' && title.trim()) titles.set(result.sessionId, title.trim().slice(0, MAX_TITLE_CHARS));
+      }
+    } catch { /* a host without a title fold still lists conversations */ }
+    return titles;
+  }
+
+  /**
+   * The discovery step: which conversations can this host actually see?
+   *
+   * Every id this tool hands out is one the host vouches for, which is the property the other three
+   * tools need: an id a model had to remember, or to guess from a file, is an id the host cannot
+   * confirm - and after a restart nothing live holds the old ones, which is exactly how a read of a
+   * real conversation came back 'unknown_conversation'.
+   *
+   * Two sources, named in the answer rather than conflated. `sessionQuery.listSessions()` is the
+   * host's unified live-preferred corpus (live and persisted, one record per stored session). A host
+   * older than that service falls back to the LIVE agents registry alone and says so, because a
+   * short list from a narrow source must not read as an empty disk.
+   *
+   * Read-only: nothing is opened for writing, resumed or created.
+   */
+  async function list(args = {}) {
+    const limit = Number.isInteger(args.limit) ? Math.min(Math.max(args.limit, 1), MAX_LIST_SESSIONS) : DEFAULT_LIST_SESSIONS;
+    const query = sessionQuery();
+    let records, source;
+    if (typeof query?.listSessions === 'function') {
+      try { records = await query.listSessions(); }
+      catch (error) { return refuse('list_unavailable', 'the host could not list its conversations: ' + String(error.message)); }
+      source = 'corpus';
+    } else {
+      const registry = agents();
+      if (typeof registry?.list !== 'function') return refuse('agents_unavailable', 'neither the session corpus nor the agents registry is reachable; no conversation can be listed');
+      try { records = registry.list().map((agent) => ({ header: agent?.session?.header, live: true, persisted: false })); }
+      catch (error) { return refuse('list_unavailable', 'the agents registry could not be listed: ' + String(error.message)); }
+      source = 'live';
+    }
+    // One row per id, newest creation first. `createdAt` is the only ordering key BOTH sources carry,
+    // so the page means the same thing whichever one answered.
+    const rows = [];
+    const seen = new Set();
+    for (const record of Array.isArray(records) ? records : []) {
+      const header = record?.header ?? {};
+      const sessionId = typeof header.id === 'string' ? header.id : '';
+      if (!sessionId || seen.has(sessionId)) continue;
+      seen.add(sessionId);
+      rows.push({ header, sessionId, createdAt: Number.isFinite(header.createdAt) ? header.createdAt : 0, live: record.live === true, persisted: record.persisted === true });
+    }
+    rows.sort((left, right) => right.createdAt - left.createdAt);
+    const page = rows.slice(0, limit);
+    const titles = await titlesOf(query, page.map((row) => row.sessionId));
+    const self = newMateContext()?.conversation?.origin;
+    return {
+      ok: true,
+      source,
+      total: rows.length,
+      returned: page.length,
+      truncated: rows.length > page.length,
+      conversations: page.map((row) => ({
+        sessionId: row.sessionId,
+        title: titles.get(row.sessionId) ?? null,
+        self: row.sessionId === self,
+        cwd: typeof row.header.cwd === 'string' ? row.header.cwd : null,
+        createdAt: row.createdAt || null,
+        live: row.live,
+        persisted: row.persisted,
+        ...(typeof row.header.agentPreset === 'string' ? { agentPreset: row.header.agentPreset } : {}),
+        ...(typeof row.header.parentSession === 'string' ? { parentSession: row.header.parentSession } : {}),
+        ...(row.header.origin === 'subagent'
+          ? { subagent: true, ...(Number.isInteger(row.header.delegationDepth) ? { delegationDepth: row.header.delegationDepth } : {}) }
+          : {}),
+      })),
+    };
   }
 
   async function create(args = {}) {
@@ -224,23 +320,40 @@ export function createConversationBridge({ services, now = Date.now, log = () =>
     if (!sessionId || sessionId.length > MAX_SESSION_ID_CHARS) return refuse('invalid_session', 'sessionId must be a non-empty session id');
     const limit = Number.isInteger(args.limit) ? Math.min(Math.max(args.limit, 1), MAX_READ_MESSAGES) : DEFAULT_READ_MESSAGES;
     const maxChars = Number.isInteger(args.maxChars) ? Math.min(Math.max(args.maxChars, 200), MAX_READ_CHARS) : MAX_READ_CHARS;
-    let header, events, from;
+    let header, events, from, title = null;
     const live = agents()?.get?.(sessionId);
     if (live?.session?.snapshotEvents) {
       events = live.session.snapshotEvents();
       header = live.session.header;
       from = 'live';
     } else {
-      const store = persistence();
-      if (!store?.load) return refuse('unknown_conversation', 'no live conversation and no session persistence to read it from');
-      // inspect() is the READ-ONLY read: load() commits cold recovery, which is a write, and a
-      // transcript read must not repair anything on disk. load() stays as the fallback for a host
-      // whose persistence service is older than inspect.
-      try {
-        const loaded = store.inspect ? await store.inspect(sessionId) : await store.load(sessionId);
-        events = loaded?.events; header = loaded?.meta; from = 'persisted';
+      const query = sessionQuery();
+      if (typeof query?.readSession === 'function') {
+        /**
+         * The host's own read of one complete logical log: live-preferred, replay-validated, no write
+         * ownership and no Agent constructed. It is the read the persistence service actually
+         * declares - `inspect`/`load` were never part of it, which is why every cold read on a real
+         * host answered 'unknown_conversation'.
+         */
+        try {
+          const snapshot = await query.readSession(sessionId);
+          events = snapshot?.events; header = snapshot?.session; from = 'persisted';
+        } catch (error) { return refuse('unknown_conversation', 'that conversation could not be read: ' + String(error.message)); }
+        if (typeof query.readTitle === 'function') {
+          try { const folded = await query.readTitle(sessionId); if (typeof folded?.title === 'string') title = folded.title.trim().slice(0, MAX_TITLE_CHARS) || null; }
+          catch { /* a log with no folded title is still a readable transcript */ }
+        }
+      } else {
+        // Legacy host only: inspect() was the read-only read; load() commits cold recovery, a write.
+        const store = persistence();
+        if (!store?.load) return refuse('unknown_conversation', 'no live conversation and no session persistence to read it from');
+        try {
+          const loaded = store.inspect ? await store.inspect(sessionId) : await store.load(sessionId);
+          events = loaded?.events; header = loaded?.meta; from = 'persisted';
+          if (typeof header?.title === 'string') title = header.title;
+        }
+        catch (error) { return refuse('unknown_conversation', 'that conversation could not be read: ' + String(error.message)); }
       }
-      catch (error) { return refuse('unknown_conversation', 'that conversation could not be read: ' + String(error.message)); }
     }
     const all = (Array.isArray(events) ? events : []).map(messageOf).filter(Boolean);
     const bounded = boundTranscript(all, { limit, maxChars });
@@ -250,7 +363,7 @@ export function createConversationBridge({ services, now = Date.now, log = () =>
       from,
       cwd: typeof header?.cwd === 'string' ? header.cwd : null,
       createdAt: Number.isFinite(header?.createdAt) ? header.createdAt : null,
-      title: typeof header?.title === 'string' ? header.title : null,
+      title: title ?? (typeof header?.title === 'string' ? header.title : null),
       total: all.length,
       messages: bounded.messages,
       chars: bounded.chars,
@@ -275,6 +388,12 @@ export function createConversationBridge({ services, now = Date.now, log = () =>
 
   const definitions = [
     {
+      name: 'newmate_conversation_list',
+      description: 'List the DSH conversations this host can see - live and persisted - newest first, with the sessionId you need to read or address one, its title when the log carries one, its workspace and creation time. Read-only: nothing here starts, resumes or writes anything. The page says how many it left out, self:true marks the conversation you are answering in (never address that one), and a title the host never folded is null rather than an invented name.',
+      parameters: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: MAX_LIST_SESSIONS, description: 'Page size, default ' + DEFAULT_LIST_SESSIONS + '. Older entries beyond it are left out and counted.' } }, additionalProperties: false },
+      execute: (args) => list(args),
+    },
+    {
       name: 'newmate_conversation_new',
       description: 'Start a new DSH conversation in a workspace and give it its first message. It becomes a real conversation the user can open, and it runs one model turn. Omit cwd to inherit the workspace of the conversation you are answering; the number of conversations you may create per process is capped.',
       parameters: { type: 'object', properties: { prompt: { type: 'string', minLength: 1, maxLength: MAX_PROMPT_CHARS }, cwd: { type: 'string', description: 'Absolute workspace directory. Omit to inherit the requesting conversation workspace.' } }, required: ['prompt'], additionalProperties: false },
@@ -294,5 +413,5 @@ export function createConversationBridge({ services, now = Date.now, log = () =>
     },
   ];
 
-  return { definitions, create, send, read, dispose, stop, created: () => [...created.keys()] };
+  return { definitions, list, create, send, read, dispose, stop, created: () => [...created.keys()] };
 }

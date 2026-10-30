@@ -1,6 +1,6 @@
 {
   "name": "newmark2dsh",
-  "version": "0.3.70",
+  "version": "0.3.73",
   "type": "module",
   "description": "Newmark Core for DeepSeek Harness：MemoryLab、ComputerUse、Agent API、NewMate 陪伴内核与 heartBeat 重启投递，五个独立开关，共用 ~/.Newmark 用户库。",
   "meta": {
