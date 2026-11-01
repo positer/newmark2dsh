@@ -1,5 +1,16 @@
 import {createHash} from 'node:crypto';
 export const MINUTE=60000,HOUR=60*MINUTE,DAY=24*HOUR;
+/**
+ * How many check-ins one piece of evidence may survive without producing a contact.
+ *
+ * The evidence a proactive check-in is about (a file change, a memory change) used to be cleared the
+ * moment a check-in was SCHEDULED, so a silent or refused check-in consumed the only proof that
+ * anything had happened. Keeping it is right; keeping it forever is not, because a change that is
+ * genuinely not worth mentioning would make every later check-in talk about the same thing. Three
+ * attempts is the bound: one judgement, one retry after the gap, one last chance - then the evidence
+ * expires and the expiry is recorded instead of the change being silently dropped.
+ */
+export const MAX_EVIDENCE_ATTEMPTS=3;
 export const INITIATIVE_DEFAULTS={initiative:true,pace:'balanced',quietStart:23,quietEnd:8,snoozeUntil:0};
 /**
  * The three initiative levels. They no longer carry "N messages per day" quotas: the user asked for

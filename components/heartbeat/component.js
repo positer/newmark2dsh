@@ -114,7 +114,7 @@ const GOAL_RESTORE_ATTEMPTS = 30;
 const GOAL_RESTORE_WINDOW_MS = 180000;
 const ADOPT_LIMIT = 8;
 
-export function createHeartBeat({ root, core, agents, goals = () => null, controller = createRestartController(root), probe = probeDesktop, pid = process.pid, version, logger, now = Date.now }) {
+export function createHeartBeat({ root, agents, goals = () => null, controller = createRestartController(root), probe = probeDesktop, pid = process.pid, version, logger, now = Date.now }) {
   const failures = createErrorLog({root,logger});
   /**
    * The version a restart should end up running: the one ON DISK, not the one this process was
@@ -502,22 +502,16 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
       return true;
     } catch (error) { ack(entry.view.sessionId, 'unreachable', 'notify', intent.id); note(entry.view.sessionId, 'notify:' + String(error.message), intent.id); return false; }
   }
-  /* Best effort by design. The companion is a courtesy channel, so a disabled switch or a silenced
-   * bubble must not become a reason a restart is refused — but it is recorded, because "we told the
-   * user" is a claim that has to be readable after the fact. */
-  async function notifyCompanion(intent) {
-    const mate = core()?.newMate;
-    if (!mate || typeof mate.message !== 'function') return 'no-companion';
-    try {
-      await mate.message(
-        'Newmark2DSH 准备重启（intentId=' + intent.id + '，' + intent.participants.length + ' 个运行中对话）。'
-        + '接续回执到齐后才会重启；到 ' + new Date(intent.deadline).toISOString() + ' 仍未到齐时按「'
-        + (intent.onTimeout === 'abort' ? '放弃重启' : '照常重启') + '」处理。'
-        + '放弃方式是让这次准备过期或提交一次会缺回执的 commit。',
-        { id: 'newmark-intent:' + intent.id, summary: 'Newmark2DSH 准备重启，等待接续回执' });
-      return 'sent';
-    } catch (error) { return 'skipped:' + String(error.message); }
-  }
+  /**
+   * THE COMPANION IS NOT PART OF A RESTART (0.3.79).
+   *
+   * This function used to push the barrier notice into NewMate as a proactive message
+   * ('newmark-intent:<id>'), which stored an assistant message reading "Newmark2DSH 准备重启…" inside
+   * the user's companion conversation - machinery talking in the companion's voice, in a thread that
+   * is supposed to be about the user's work. The user asked for the two to be completely decoupled:
+   * a restart is heartbeat's business, and the companion neither speaks for it nor records it.
+   * Nothing replaces the call: the intent record and the tools' receipts are the durable account.
+   */
   /* A session that is gone cannot answer, so it leaves the required set; its record stays, because
    * the continuation registered for it is still owed after the restart. A conversation that appeared
    * AFTER the broadcast is added instead of ignored: restarting it behind its back is the exact harm
@@ -568,7 +562,7 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
       id: randomUUID(), requesterSessionId, requesterPid: pid, createdAt: at, updatedAt: at,
       deadline: at + ackTimeoutMs, ackMode, onTimeout, force: options.force === true, reason,
       requesterModel: requester ? conversationModel(requester.agent) : null,
-      phase: 'preparing', ticket: null, folder: null, committedAt: null, delivery: null, bubble: null,
+      phase: 'preparing', ticket: null, folder: null, committedAt: null, delivery: null,
       participants: participants.map(entry => ({ ...entry.view, ack: 'pending', ackSource: null, ackAt: null, note: null })),
     };
     store.change(s => { s.intent = intent; s.intents ||= []; s.schema = 3; });
@@ -576,8 +570,7 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
       if (ackMode === 'auto') await cover(entry, intent);
       else if (entry.view.sessionId !== requesterSessionId) await notify(entry, intent);
     }
-    const bubble = await notifyCompanion(intent);
-    store.change(s => { if (s.intent?.id === intent.id) s.intent.bubble = bubble; s.schema = 3; });
+    store.change(s => { if (s.intent?.id === intent.id) s.schema = 3; });
     const current = store.read().intent;
     return {
       ok: true, phase: 'preparing', intentId: intent.id, ackMode, onTimeout, deadline: intent.deadline,
@@ -752,9 +745,10 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
     async restart(ticket, update = false) {
       const goalSnapshot = captureGoalSnapshot(update ? 'update' : 'immediate');
       const helper = await controller.restart(ticket);
-      // kind:'update_report' tells NewMate this report was REQUESTED, so it is displayed instead of
-    // being judged by the proactive-message format rule (240 chars, no lists) and dropped.
-    const updateId = update ? schedule('Newmark2DSH 更新后 DSH 已重启。请确认组件状态，报告未完成的持久任务；不要自动重复失败动作。', 'newmate', undefined, { kind: 'update_report' }).id : null;
+      /* NO COMPANION REPORT ON AN UPDATE RESTART (0.3.79). An update restart used to schedule a
+       * 'update_report' task into NewMate ("Newmark2DSH 更新后 DSH 已重启。请确认组件状态…"), which made
+       * the companion speak for the updater. The restart's own receipts are the account of what
+       * happened; the companion is not asked to narrate it and no task is created here. */
       // An UPDATE restart is issued by the panel or the update route, so there is no requesting
       // conversation to hand a continuation to — and until now NOTHING got one, which silently killed
       // work that was in flight: measured 2026-10-17, an update restart took the host down while this
@@ -779,7 +773,7 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
           store.change(s => { for (const t of s.tasks) if (t.status === 'waiting') Object.assign(t, { status: 'armed', restartPid:pid, folder: helper.folder }); });
           try { helper.commit(); finished = true; } catch (e) { store.change(s => { for (const t of s.tasks) if (t.folder === helper.folder) t.status = 'waiting'; }); helper.cancel(); throw e; }
         },
-        cancel() { if (!finished) { finished = true; helper.cancel(); if (updateId) store.change(s => { s.tasks.find(t => t.id === updateId).status = 'cancelled'; }); } },
+        cancel() { if (!finished) { finished = true; helper.cancel(); } },
       };
     },
     async globalRestart() {
@@ -864,12 +858,14 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
          * Deliver once, then consume the record; a failure is counted like any other and the task is
          * terminated after DELIVERY_FAILURE_LIMIT so a destination that can never be resumed does not
          * retry for the life of the machine. */
+        /* ARCHIVED COUPLING (0.3.79): heartbeat no longer schedules tasks for the companion, and no
+         * longer delivers one whose destination is 'newmate'. A task left behind by an older state is
+         * retired here with a name, instead of being retried against a destination this component no
+         * longer understands. */
+        for (const task of store.read().tasks.filter(t => t.destination === 'newmate')) terminateTask(task, 'newmate_decoupled', task.failures || 0);
         for (const task of store.read().tasks.filter(t => t.status === 'armed' && !t.folder)) {
           try {
-            if (task.destination === 'newmate') {
-              if (!core()?.newMate) continue;
-              core().newMate.enqueue(task.prompt, 'newmate', task.id, undefined, task.kind ? { kind: task.kind } : undefined);
-            } else await deliverConversation(agents(), task.destination, task);
+            await deliverConversation(agents(), task.destination, task);
             delivered.push(task.id);
             store.change(s => { s.receipts ||= []; if (!s.receipts.some(r => r.id === task.id)) s.receipts.push({ id: task.id, delivered: Date.now(), adopted: true }); s.tasks = s.tasks.filter(t => t.id !== task.id); s.schema = 3; });
           } catch (error) {
@@ -902,10 +898,7 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
             const owner = await probe();
             if (stopped) return;
             if (owner.path !== job.owner.path || owner.created === job.owner.created) continue;
-            if (task.destination === 'newmate') {
-              if (!core()?.newMate) continue;
-              core().newMate.enqueue(task.prompt, 'newmate', task.id, undefined, task.kind ? { kind: task.kind } : undefined);
-            } else await deliverConversation(agents(), task.destination, task);
+            await deliverConversation(agents(), task.destination, task);
             delivered.push(task.id);
             // One atomic durable mutation consumes the executable record and leaves only its ID.
             store.change(s => {s.receipts ||= [];if(!s.receipts.some(r=>r.id===task.id))s.receipts.push({id:task.id,delivered:Date.now()});s.tasks=s.tasks.filter(t=>t.id!==task.id);s.schema=3;});

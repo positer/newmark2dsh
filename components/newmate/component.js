@@ -5,7 +5,7 @@ import { durableState } from '../../lib/durable-state.js';
 import { currentConversation, deliverConversation, conversationPaused, conversationModel } from '../../lib/conversation-delivery.js';
 import { classifyToolResult } from '../agent-api/lib/contract.js';
 import { createErrorLog } from '../../lib/errors.js';
-import { withNewMateContext } from '../../lib/newmate-context.js';
+import { withNewMateContext, newMateContext } from '../../lib/newmate-context.js';
 import { createMemoryContext } from './lib/memory-context.js';
 import { computerUseCaller, withComputerUseCaller, withComputerUseOwner } from '../../lib/cu-caller.js';
 import { createLoopStatus } from './lib/agent-loop.js';
@@ -13,9 +13,10 @@ import { NEWMATE_SEARCH_TOOL } from './lib/web-search.js';
 import { NEWMATE_ASK_TOOL, ASK_MIN_OPTIONS, ASK_MAX_OPTIONS, ASK_QUESTION_MAX_CHARS, ASK_LABEL_MAX_CHARS } from './lib/ask.js';
 import {PROACTIVE_STYLE,proactiveMessageGate} from './lib/proactive-message.js';
 import {threadHandoff,shouldRotate} from './lib/thread-handoff.js';
+import {SESSION_BUDGET,SESSION_HARD,SESSION_SUMMARY_MAX,SESSION_MIN_REFRESH_MESSAGES,sessionFacts,refreshDue,refreshForced,mechanicalSummary,sessionMessages} from './lib/session-refresh.js';
 import {todoInput,todoMessageId,nextActivation} from './lib/todo-list.js';
 import {REPLY_PROTOCOL,normalizeReply,bubbleText,toPlain} from './lib/reply-format.js';
-import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet,paceThreshold,paceTimeWeight} from './lib/initiative.js';
+import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,MAX_EVIDENCE_ATTEMPTS,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet,paceThreshold,paceTimeWeight} from './lib/initiative.js';
 import { MONITOR_DEFAULTS, evaluateWorkspaces, settle } from './lib/workspace-diff.js';
 import { attachmentBlock, normalizeAttachments, readUploadContent, saveUpload, UPLOAD_EXCERPT_CHARS, UPLOAD_MAX_PER_MESSAGE } from './lib/upload-store.js';
 
@@ -77,6 +78,7 @@ export const NEWMATE_RUN_TOOLS = Object.freeze([
   'computer_use', 'screen_capture', NEWMATE_SEARCH_TOOL, NEWMATE_ASK_TOOL, 'compact_context', 'newmate_task',
   'newmate_wechat_send_file', 'newmate_wechat_send_text', 'newmate_attachment_read',
   'newmate_conversation_list', 'newmate_conversation_new', 'newmate_conversation_send', 'newmate_conversation_read',
+  'newmate_session_list', 'newmate_session_read', 'newmate_session_refresh', 'newmate_session_resume',
 ]);
 
 /** The two ComputerUse tools, and the owner label every NewMate lease carries. */
@@ -151,10 +153,21 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
   if(['watchEnabled','watchIntervalMinutes','watchDepth','watchDshWeight'].some(key=>store.read().settings[key]===undefined))store.change(s=>{s.settings={watchEnabled:true,watchIntervalMinutes:MONITOR_DEFAULTS.intervalMinutes,watchDepth:MONITOR_DEFAULTS.depth,watchDshWeight:MONITOR_DEFAULTS.dshWeight,...s.settings};});
   const bootReadyAt=now()+2*MINUTE;
   if(!Array.isArray(store.read().todos))store.change(s=>{s.todos=[];});
+  /* THE RESTART REPORT IS RETIRED (0.3.79). An older version accepted tasks of kind 'update_report',
+   * created by heartBeat so the companion would narrate an update restart. That coupling is gone; a
+   * task left in a state file is cancelled here instead of running once as an unsolicited turn and
+   * publishing a restart notice into the user's conversation. */
+  if(store.read().tasks.some(t=>t.kind==='update_report'))store.change(s=>{for(const task of s.tasks)if(task.kind==='update_report'){task.status='cancelled';task.error='restart_report_decoupled';}});
   // Notification always follows the durable message receipt. Never notify it again on restart.
   if(store.read().todos.some(t=>t.status==='delivering'))store.change(s=>{for(const t of s.todos)if(t.status==='delivering'){const m=s.messages.find(m=>m.id===todoMessageId(t.id));Object.assign(t,m?{status:'delivered',deliveredAt:m.at,messageId:m.id,threadId:m.threadId}:{status:'pending'});}});
   const memoryMarker=()=>['index.json','short-memory.json'].map(name=>{try{const stat=fs.statSync(path.join(root,'Memory Lab',name));return`${stat.size}:${stat.mtimeMs}`;}catch(error){if(error.code==='ENOENT')return'absent';throw error;}}).join('|');
-  let engagedAt=0,lastProbeAt=-Infinity,lastMemoryKey=nativeMemory().key,lastMemoryMarker=memoryMarker();
+  /**
+   * The two fingerprints a memory change is detected with.
+   *
+   * They are read back from the last DELIVERED contact, not from "now": a module-local value restarts
+   * equal to the current state, so a memory change made while the host was off could never be seen.
+   */
+  let engagedAt=0,lastProbeAt=-Infinity,lastMemoryKey=store.read().initiative?.memoryKey||nativeMemory().key,lastMemoryMarker=store.read().initiative?.memoryMarker||memoryMarker();
   let readingUntil=0;
   const readers=new Map();
   const presence=(focused,client='legacy',sequence)=>{
@@ -196,6 +209,33 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
    */
   const NOTHING_ATTEMPTED = /no model has been (?:authorised|selected)|model_not_selected/i;
   const NOTHING_ATTEMPTED_RETRY_MS = 5 * MINUTE;
+  /**
+   * How long a sentence that was already written may wait for a suitable moment.
+   *
+   * Super-agent calls the idea speculative execution: do the work on the environment signal, deliver
+   * when the person is available. For a 240-character companion line the useful window is short - it
+   * talks about "just now", so half an hour is the bound beyond which the sentence itself would be a
+   * lie. Within it, a message prepared while you were typing or away is delivered without spending a
+   * second model call.
+   */
+  const PREPARED_TTL_MS = 30 * MINUTE;
+  /** Refusals that only mean "not yet": they keep a prepared message waiting instead of dropping it. */
+  const PREPARED_WAIT = ['quiet_hours','snoozed','cooldown'];
+  /**
+   * THE PROACTIVE HANDOFF's own clock.
+   *
+   * The soft session budget (see lib/session-refresh.js) used to be a REQUEST printed into whatever
+   * turn happened next, so a session that nobody talked into never got tidied: the handoff only ever
+   * happened if a user message came along to carry it. Refreshing is bookkeeping, not conversation -
+   * it neither asks nor tells the user anything - so it can be started by the runtime itself, on the
+   * same terms a scheduled check-in has: only while nothing else is queued, only when the session has
+   * been quiet for a while (a conversation in progress must not be cut in half for housekeeping), and
+   * at most once per cooldown. Three turns that fail to produce a summary fall back to the mechanical
+   * handoff, so a model that never acts cannot keep the session growing forever.
+   */
+  const SESSION_REFRESH_IDLE_MS = 30 * MINUTE;
+  const SESSION_REFRESH_COOLDOWN_MS = 2 * HOUR;
+  const SESSION_REFRESH_MAX_FAILURES = 3;
   /**
    * NewMate's own queue: is this companion busy with, or about to start, a turn of its own?
    * Deliberately does NOT consult the DSH host - a turn running in another workspace is not NewMate
@@ -384,7 +424,19 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     // The due-check no longer short-circuits on the companion switch: deliverDueTodo records WHY it
     // cannot deliver (companion_off included), and a reason nobody ever computes is not a reason.
     const todoState=store.read();if(todoState.todos.some(t=>t.status==='pending'&&t.activateAt<=now())){todoDelivering=true;try{await deliverDueTodo();}finally{todoDelivering=false;}if(stopped)return;}
+    /**
+     * A sentence that was already written goes out before anything new is decided - but only when
+     * nothing is queued: a prepared message must never delay work the user already asked for.
+     */
+    if(!store.read().tasks.some(t=>t.status==='pending'))await deliverPrepared();
+    /**
+     * The hard cap of the session budget, settled while nothing is queued: a session that nobody
+     * refreshed must not grow without bound just because no model acted on the request.
+     */
+    settleSessionBudget();
     if(now()-lastProbeAt>=MINUTE){lastProbeAt=now();probeInitiative();}
+    // The proactive handoff: nobody has to ask for a growing session to be tidied.
+    refreshSessionProactively();
     /**
      * Pick the first task that can actually run - and SKIP a paused target instead of returning.
      *
@@ -409,13 +461,17 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     if (!task) return;
     running = true; active = new AbortController();activeTask=task;manualRestart=false;userPreempted=false;guide={pending:[],drain(){return this.pending.splice(0);}};
     /**
-     * `update_report` is a task the restart pipeline ASKED for, not the companion deciding to
-     * speak. It used to be classified unsolicited (kind !== 'chat'), so its report was judged by
-     * the 240-character / no-list rule of a proactive message and thrown away: measured
-     * 2026-10-27, four post-restart reports were suppressed as `proactive_format` and the user
-     * never saw them. Requested reports are displayed; only the capability-whine gate applies.
+     * `update_report` IS GONE (0.3.79). It existed because the restart pipeline asked the companion
+     * to narrate the update; the two are now completely decoupled, so no task of that kind is created
+     * any more and a leftover one is retired at boot (see the migration near the top).
      */
-    const report=task.kind==='update_report',automatic=task.kind==='measurement'||task.kind==='self_activation',delegated=task.kind==='todo_activation',unsolicited=task.kind!=='chat'&&!report&&!delegated;activeAutomatic=automatic||delegated;
+    /**
+     * `session_refresh` is the PROACTIVE handoff: a turn nobody asked for, run only to write the
+     * summary that lets the next session continue this one. It is maintenance, not conversation - it
+     * never publishes a message, and it must not be steered by a user message (a turn whose only job is
+     * to summarise must not end up answering something typed into it).
+     */
+    const maintenance=task.kind==='session_refresh',automatic=task.kind==='measurement'||task.kind==='self_activation',delegated=task.kind==='todo_activation',unsolicited=task.kind!=='chat'&&!delegated;activeAutomatic=automatic||delegated;
     /**
      * A delegation is SOLICITED: the user asked for that turn at that time, so the 240-character /
      * no-list rule of a proactive message has no business judging the answer. Measured 2026-10-29
@@ -442,9 +498,9 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
           return list.length ? list[list.length - 1].at : 0;
         })();
         const timeLine = '当前时间：' + localStamp(now()) + '（本机时区 ' + Intl.DateTimeFormat().resolvedOptions().timeZone + '）；最后一条用户消息发送于：' + (userMessageAt ? localStamp(userMessageAt) : '（本对话还没有用户消息）') + '。两者都是本机时间并带偏移，提到\"现在\"用前者、提到\"你发消息时\"用后者，不要换算成 UTC 或别的时区。\n';
-        const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseOwner(NEWMATE_CU_OWNER,()=>withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,conversation:conversationOf(task),steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)},onEvent:event=>live.event(event)},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
-          prompt: `${timeLine}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。用户要求重复时给 repeat：{every,unit:\'min\'|\'h\'|\'d\',weekdays?:[1-7]（1=周一）,at?:\'HH:MM\'}，或等价规则串 rule（如 \"every 2 d on 1-5 at 09:00\"）；不给 repeat 就只触发一次。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：${store.read().watch?.lastDescription||'（本机尚无对比结果）'}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪些文件新增/改动、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。':''}\n${REPLY_PROTOCOL}`,
-          tools: { allow: newMateRunTools({automatic,origin:task.origin}) }, timeout_ms: automatic?45000:120000, max_steps: automatic?3:0,
+        const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseOwner(NEWMATE_CU_OWNER,()=>withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,conversation:conversationOf(task),session:{id:task.threadId,taskId:task.id},steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)},onEvent:event=>live.event(event)},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
+          prompt: `${timeLine}${sessionBlock(task.threadId)}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。用户要求重复时给 repeat：{every,unit:\'min\'|\'h\'|\'d\',weekdays?:[1-7]（1=周一）,at?:\'HH:MM\'}，或等价规则串 rule（如 \"every 2 d on 1-5 at 09:00\"）；不给 repeat 就只触发一次。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：${store.read().watch?.lastDescription||'（本机尚无对比结果）'}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪些文件新增/改动、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。':''}\n${REPLY_PROTOCOL}`,
+          tools: { allow: newMateRunTools({automatic:automatic||maintenance,origin:task.origin}) }, timeout_ms: maintenance?60000:automatic?45000:120000, max_steps: maintenance?4:automatic?3:0,
           ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:400},plain:{type:'string',maxLength:120},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
         }, signal: active.signal }))));
         active.signal.throwIfAborted();
@@ -465,7 +521,9 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
         const decision = { ...envelope.result?.structured, text: reply.rich, notify: reply.notify, topic: reply.topic };
         if(automatic&&(typeof reply.notify!=='boolean'||typeof reply.rich!=='string'||(reply.topic!==undefined&&(typeof reply.topic!=='string'||reply.topic.length>80))))throw Error('主动判断未符合 notify/text/plain/topic 协议');
         const answer = reply.rich;
-        if (typeof answer !== 'string' || (!answer && !unsolicited && !report)) throw Error('Agent API 没有返回文本');
+        // A maintenance turn may legitimately answer with nothing: its product is the handoff it
+        // scheduled through newmate_session_refresh, not a sentence for the user.
+        if (!maintenance && (typeof answer !== 'string' || (!answer && !unsolicited))) throw Error('Agent API 没有返回文本');
         const current=store.read(),topic=reply.topic||task.reason||'check-in',latest=automatic?environment():{};
         if(delegated&&task.threadId!==current.activeThreadId)throw Error('待办运行期间已切换对话，回复未发布；可显式重试');
         const lateGate=automatic?(latest.ready===false?'runtime_unavailable':latest.busy?'busy':latest.readerFocused?'reading':latest.idleMs>=90*MINUTE?'away':latest.idleMs<MINUTE?'typing':''):'';
@@ -475,14 +533,55 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
         const contentGate=unsolicited?proactiveMessageGate(answer):'';
         // An empty answer is silence for every task kind, reports included: a report with nothing to
         // say must not become an empty bubble.
-        const suppression=contentGate||(!answer?'not_actionable':'')||(automatic?(reply.notify!==true?'not_actionable':task.threadId!==current.activeThreadId?'history_closed':lateGate||messageGate(current.settings,current.initiative,now(),answer,topic,engagedAt)):'');
-        if(!suppression) {
+        /**
+         * THE SUBJECT OF A PROACTIVE MESSAGE IS WHAT THE MODEL NAMED, AND NOTHING ELSE.
+         *
+         * The dedupe key used to fall back to the TRIGGER (task.reason: 'check-in' / 'file-change'), so
+         * every proactive message that did not name a topic shared one subject. Measured 2026-10-31 on
+         * this exact path: a second check-in whose sentence was completely different was rejected as
+         * `duplicate_topic` because both carried the fallback 'check-in' - one topic-less message
+         * silenced every other topic-less message for 24 hours. The trigger is a reason, not a subject,
+         * so it no longer enters the comparison; a literal repeat is still caught by the text hash, and
+         * the pace gap still bounds how often anything is said.
+         */
+        const subject=typeof reply.topic==='string'?reply.topic.trim():'';
+        const repeatGate=automatic?messageGate(current.settings,current.initiative,now(),answer,subject,engagedAt):'';
+        const suppression=contentGate||(!answer?'not_actionable':'')||(automatic?(reply.notify!==true?'not_actionable':task.threadId!==current.activeThreadId?'history_closed':lateGate||repeatGate):'');
+        /**
+         * SPECULATIVE DELIVERY (Super-agent: 投机执行).
+         *
+         * The manual's point, in this companion's terms: the expensive part of a proactive turn is the
+         * model call, and it has already been spent by the time the delivery gate answers. Refusing a
+         * finished sentence only because the person is typing, busy or briefly away throws that work
+         * away and makes the next window start from nothing. So a message refused by the TIMING gate -
+         * and by nothing else: not content, not a declared silence, not a repeat - is kept as
+         * `initiative.prepared` and delivered by the next tick that can, without another model call.
+         * It is bounded by PREPARED_TTL_MS so a sentence about "just now" cannot arrive much later, and
+         * a prepared message is still re-checked against the content, duplicate and quiet-hour rules at
+         * the moment it actually goes out.
+         */
+        const speculable=automatic&&!contentGate&&Boolean(answer)&&reply.notify===true&&Boolean(lateGate)&&!repeatGate&&task.threadId===current.activeThreadId;
+        /**
+         * A MAINTENANCE TURN PUBLISHES NOTHING.
+         *
+         * Its whole output is the handoff summary the model scheduled through newmate_session_refresh,
+         * which applySessionChange() performs at the turn boundary. Anything it also said is internal:
+         * the user asked for none of it, and a "我已整理好上下文" bubble would be a report about the
+         * machinery, not about the user's work. The receipt records whether the summary actually
+         * arrived, and three unanswered attempts fall back to the mechanical handoff (see
+         * refreshSessionProactively) so the session cannot grow forever behind a model that never acts.
+         */
+        if(maintenance){
+          const scheduled=store.read().tasks.find(t=>t.id===task.id)?.sessionHandoff;
+          store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);if(!t)return;t.maintenance={refreshed:Boolean(scheduled),summaryChars:scheduled?.summary?.length||0,at:now()};s.initiative.sessionRefreshAt=now();s.initiative.sessionRefreshFailures=scheduled?0:(s.initiative.sessionRefreshFailures||0)+1;});
+        } else if(!suppression) {
           const destination=automatic?rotateForMessage(topic,answer):task.threadId;
           // text = the page rendering, plain = what a bubble or an external channel may show.
-          const message={id:task.id,threadId:destination,role:'assistant',text:answer,plain:reply.plain,at:now(),proactive:automatic||delegated||report,autonomous:automatic,unread:true,...task.todoId?{todoId:task.todoId}: {}};
-          store.change(s => { s.messages.push(message);const t=s.threads.find(t=>t.id===destination);if(t)t.updated=now();if(automatic){recordMessage(s.initiative,now(),answer,topic);s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.lastOutcome='message';} });
+          const message={id:task.id,threadId:destination,role:'assistant',text:answer,plain:reply.plain,at:now(),proactive:automatic||delegated,autonomous:automatic,unread:true,...task.todoId?{todoId:task.todoId}: {}};
+          store.change(s => { s.messages.push(message);const t=s.threads.find(t=>t.id===destination);if(t)t.updated=now();if(automatic){recordMessage(s.initiative,now(),answer,subject);s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.lastOutcome='message';} });
           await notify({ ...message, text: bubbleText(message), rich_text: message.text });
-        }else store.change(s=>{s.initiative.lastOutcome=suppression;s.tasks.find(t=>t.id===task.id).suppressed=suppression;});
+        }else if(speculable){store.change(s=>{s.initiative.prepared={text:answer,plain:reply.plain,subject,at:now(),expiresAt:now()+PREPARED_TTL_MS,taskId:task.id,reason:lateGate};s.initiative.lastOutcome='prepared:'+lateGate;s.tasks.find(t=>t.id===task.id).suppressed='prepared:'+lateGate;});}
+        else store.change(s=>{s.initiative.lastOutcome=suppression;s.tasks.find(t=>t.id===task.id).suppressed=suppression;});
       }
       store.change(s => { const settled=s.tasks.find(t => t.id === task.id);Object.assign(settled,{status:'completed',finished:now()});delete settled.deferred;if(task.todoId){const todo=s.todos.find(t=>t.id===task.todoId),stored=s.messages.some(m=>m.id===task.id);if(todo){const next=stored&&todo.repeat?nextActivation(todo.repeat,now()):null;delete todo.deferred;Object.assign(todo,stored?(next?{status:'pending',activateAt:next,lastDeliveredAt:now(),messageId:task.id,deliveries:(todo.deliveries||0)+1}:{status:'completed',completedAt:now(),messageId:task.id}):{status:'failed',completedAt:now(),error:'运行已结束，但回复被主动消息格式规则抑制'});}} });
     } catch (error) {
@@ -510,9 +609,342 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
       // reported settled: an unattended companion must not leave the desktop in takeover.
       await releaseComputerUse(task.id);
       const settled = store.read().tasks.find(t => t.id === task.id);
+      /**
+       * THE TURN BOUNDARY IS WHERE A SESSION CHANGES.
+       *
+       * The reply above already has a home, so switching now cannot split the exchange or orphan the
+       * answer (a switch mid-run stores the answer into a session the page has stopped showing). A
+       * change that could not be applied is recorded on the task, not thrown: the turn itself
+       * succeeded, and the receipt says exactly which half happened.
+       */
+      if(settled?.status==='completed'&&(settled.sessionHandoff||settled.sessionResume)){
+        const requested=settled.sessionHandoff?'refresh':'resume';
+        const change=applySessionChange(settled);
+        store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);if(!t)return;delete t.sessionHandoff;delete t.sessionResume;t.sessionChange={kind:requested,applied:change?.applied===true,to:change?.sessionId||null,reason:change?.reason||null,at:now()};});
+      }
+      // A settlement bug must never wedge the queue: record it, keep the turn's outcome as it is.
+      try{settleInitiativeEvidence(settled && settled.kind==='self_activation' ? settled : task);}
+      catch(error){failures.record({where:'newmate/initiative-settle',code:error?.code||'initiative_settle_failed',message:String(error?.message)});}
       live.finish({ phase: liveOutcome(settled?.status), error: settled?.error ?? null });
       running = false;activeAutomatic=false;activeTask=null;guide=null;if(!stopped&&store.read().tasks.some(t=>t.kind==='chat'&&t.status==='pending'))queueMicrotask(()=>tick().catch(e=>logger?.warn?.(e.message)));
     }
+  }
+  /**
+   * A refusal with a code the model can act on, in the shape the rest of the bundle already uses for
+   * named refusals: a message for a person, a code for a policy.
+   */
+  const coded=(code,message)=>Object.assign(Error(message),{code});
+  /**
+   * THE SESSION LINE OF A RUN PROMPT.
+   *
+   * It says three things and nothing else: which session this run answers in and how big it has
+   * become; where it came from when it was handed off; and, once the soft budget is crossed, the one
+   * action that keeps it readable. The soft budget is a REQUEST, not a refusal: a run may finish the
+   * thing it is in the middle of, and the hard cap is the runtime's own business (see
+   * settleSessionBudget).
+   *
+   * Without the "本会话由…交接而来" line a handoff would be a new session that starts by forgetting
+   * everything - the summary is the whole point of the refresh and it reaches the model here, once,
+   * as background rather than as a user message.
+   */
+  function sessionBlock(threadId){
+    const state=store.read(),facts=sessionFacts(state,threadId);
+    if(!facts)return '';
+    const lines=['会话：'+facts.sessionId+'「'+(facts.title||'未命名')+'」；已有 '+facts.messages+' 条消息 / '+facts.chars+' 字符；软预算 '+SESSION_BUDGET.messages+' 条 / '+SESSION_BUDGET.chars+' 字符，硬上限 '+SESSION_HARD.messages+' 条 / '+SESSION_HARD.chars+' 字符（到硬上限时运行时会自己机械交接）。会话管理用 newmate_session_list/read/refresh/resume：它们只管你自己的对话，不需要用户点击，自主检查轮次同样可用。'];
+    if(facts.handoff?.summary)lines.push('本会话由上一个会话 '+facts.handoff.from+' 交接而来（'+(facts.handoff.at?localStamp(facts.handoff.at):'时间未知')+'，'+(facts.handoff.by==='budget'?'运行时机械摘要':'你自己写的交接摘要')+'）：'+facts.handoff.summary);
+    const due=refreshDue(state,threadId);
+    if(due.due)lines.push('已达软预算（'+(due.code==='chars'?'字符':'消息条数')+'）：本轮结束前用 newmate_session_refresh 写一段交接摘要并开新会话——写清目标、已完成什么、未完成与下一步、关键事实与出处；旧会话归档但完整保留、仍可读。没有人会替你做这一步。');
+    return lines.join('\n')+'\n';
+  }
+  /**
+   * TURN A SESSION INTO THE NEXT SESSION.
+   *
+   * One place performs the switch, whoever asked for it: the model through newmate_session_refresh
+   * (by 'self', after its own answer was stored) or the runtime at the hard cap (by 'budget', while
+   * idle). The old session is ARCHIVED, never deleted - its messages stay readable through
+   * newmate_session_read, which is what makes a refresh a change of window rather than a loss.
+   *
+   * The summary survives in two places on purpose: on the new thread (so the page and a later
+   * handoff can show where it came from) and in the run prompt of every turn in that session (so the
+   * model is told once, as background, instead of being asked to remember).
+   */
+  function rotateSession({summary,title='',by='self',reason='',from}={}){
+    const state=store.read(),previous=state.threads.find(t=>t.id===(from||state.activeThreadId));
+    if(!previous||previous.archived)throw coded('no_active_session','NewMate has no current session to hand off');
+    const body=String(summary||'').trim();
+    if(!body)throw coded('summary_required','a handoff needs a summary');
+    if(body.length>SESSION_SUMMARY_MAX)throw coded('summary_too_long','summary must be at most '+SESSION_SUMMARY_MAX+' characters');
+    if(state.threads.length>=1000)throw coded('session_limit','the session list has reached its limit');
+    const facts=sessionFacts(state,previous.id),id=randomUUID();
+    const nextTitle=String(title||'').trim().replace(/\s+/g,' ').slice(0,32)||body.replace(/\s+/g,' ').slice(0,32)||'新会话';
+    store.change(s=>{
+      const old=s.threads.find(t=>t.id===previous.id);if(!old)return;
+      old.archived=true;old.archivedReason='refreshed';old.refreshedAt=now();
+      s.threads.push({id,title:nextTitle,created:now(),updated:now(),archived:false,carried:{from:old.id,fromTitle:old.title||'',at:now(),by:by==='budget'?'budget':'self',reason:String(reason||'').slice(0,200),summary:body}});
+      s.lastThreadRotation={from:old.id,to:id,at:now(),reason:by==='budget'?(String(reason)==='maintenance_failed'?'maintenance_failed':'budget_hard'):'self_refresh'};
+      s.activeThreadId=id;
+    });
+    return{ok:true,applied:true,kind:'refresh',sessionId:id,from:previous.id,previous:{sessionId:previous.id,title:previous.title||'',messages:facts.messages,chars:facts.chars},carried:{summaryChars:body.length,by:by==='budget'?'budget':'self'}};
+  }
+  /**
+   * The hard cap, honoured without asking anyone.
+   *
+   * The soft budget asks the model; this is the answer when no model acted. It runs only while
+   * nothing is queued and no turn is running, because moving a session under a run would strand that
+   * run's answer in a session the page no longer shows. The digest is mechanical and labelled
+   * `by:'budget'` - a runtime that invented a judgement would be lying about what it did.
+   */
+  function settleSessionBudget(){
+    const state=store.read();
+    if(running||state.tasks.some(t=>['pending','running'].includes(t.status)))return null;
+    const forced=refreshForced(state,state.activeThreadId);
+    if(!forced.forced||!forced.facts||forced.facts.archived)return null;
+    const summary=mechanicalSummary(sessionMessages(state,forced.facts.sessionId)).slice(0,SESSION_SUMMARY_MAX);
+    try{return rotateSession({summary,title:'（自动交接）',by:'budget',reason:forced.code,from:forced.facts.sessionId});}
+    catch(error){failures.record({where:'newmate/session-budget',code:error.code||'session_budget_failed',message:String(error.message)});return null;}
+  }
+  /**
+   * THE PROACTIVE HANDOFF.
+   *
+   * A session over the soft budget is tidied by a turn NewMate starts itself: it carries the same
+   * session tools, writes the handoff through newmate_session_refresh, and publishes nothing. What
+   * makes this "proactive" is precisely that no user message is involved - the trigger is the size of
+   * the conversation and its quietness, not a request.
+   *
+   * The order of the decisions is deliberate: switches, queue, budget, quietness, cooldown, then the
+   * model. The mechanical fallback sits BEFORE the cooldown, because three maintenance turns that
+   * produced no summary are the signal that asking again is pointless.
+   */
+  function refreshSessionProactively(){
+    const state=store.read();
+    if(!state.settings.companion||!state.settings.initiative)return null;
+    if(state.tasks.some(t=>['pending','running'].includes(t.status))||state.tasks.length>=2000)return null;
+    const due=refreshDue(state,state.activeThreadId);
+    if(!due.due)return null;
+    const active=state.threads.find(t=>t.id===state.activeThreadId);
+    if(!active||active.archived)return null;
+    if(due.facts.messages<SESSION_MIN_REFRESH_MESSAGES)return null;
+    const lastAt=due.facts.newestMessageAt||active.updated||0;
+    if(now()-lastAt<SESSION_REFRESH_IDLE_MS)return null;
+    const failures=Number(state.initiative.sessionRefreshFailures||0);
+    if(failures>=SESSION_REFRESH_MAX_FAILURES){
+      const summary=mechanicalSummary(sessionMessages(state,active.id)).slice(0,SESSION_SUMMARY_MAX);
+      try{
+        const change=rotateSession({summary,title:'（自动交接）',by:'budget',reason:'maintenance_failed',from:active.id});
+        store.change(s=>{s.initiative.sessionRefreshFailures=0;s.initiative.sessionRefreshAt=now();});
+        return{ok:true,mechanical:true,change};
+      }catch(error){failures.record({where:'newmate/session-maintenance',code:error?.code||'session_maintenance_failed',message:String(error?.message)});return null;}
+    }
+    if(now()-Number(state.initiative.sessionRefreshAt||0)<SESSION_REFRESH_COOLDOWN_MS)return null;
+    /**
+     * HOUSEKEEPING DOES NOT CONSULT THE ATTENTION GATES - measured 2026-11-01 on the live host.
+     *
+     * The first shipped version of this function also required environment() to be ready and un-busy,
+     * and on the acceptance host that meant it NEVER ran: busy is true whenever ANY DSH conversation is
+     * running (the one testing it included), and ready needs the desktop pet live with the user's
+     * desktop active. Hiring the attention gates for a job that neither asks nor tells anything is the
+     * same mistake 0.3.65 removed from reminder delivery: a host-level busy flag let an unrelated
+     * conversation decide. A session refresh needs only what it spends - a model call and the store -
+     * and both already belong to the companion.
+     */
+    const facts=due.facts;
+    const prompt='会话维护（内部动作，本轮不会发给用户，也不需要问候）：这个会话已积累 '+facts.messages+' 条消息 / '+facts.chars+' 字符，达到会话软预算 '+SESSION_BUDGET.messages+' 条 / '+SESSION_BUDGET.chars+' 字符。请用 newmate_session_refresh 写一段交接摘要并开新会话：summary 写清目标、已经完成什么、未完成与下一步、关键事实与出处（不超过 '+SESSION_SUMMARY_MAX+' 字符），不要复述全文；本轮不需要联系用户、不要创建待办、不要发微信、不要执行桌面操作。摘要写完简短回复即可。';
+    const task=enqueue(prompt);
+    store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='session_refresh';t.reason=due.code;});
+    return{ok:true,id:task.id,code:due.code,facts:{messages:facts.messages,chars:facts.chars}};
+  }
+  /**
+   * Apply the change a finished turn scheduled - refresh or resume - now that its reply has a home.
+   *
+   * This is the second half of the tools' contract: the model picks the summary and the target, and
+   * the switch happens at the turn boundary, so an exchange is never split across two sessions and an
+   * answer is never stored into a session the page has stopped showing.
+   */
+  function applySessionChange(task){
+    const handoff=task?.sessionHandoff,resume=task?.sessionResume;
+    if(!handoff&&!resume)return null;
+    const state=store.read(),active=state.threads.find(t=>t.id===state.activeThreadId);
+    if(!active||active.id!==task.threadId)return{applied:false,reason:'session_changed'};
+    let change;
+    try{
+      if(handoff)change=rotateSession({summary:handoff.summary,title:handoff.title,by:handoff.by,reason:handoff.reason,from:active.id});
+      else{
+        const target=state.threads.find(t=>t.id===resume.sessionId);
+        if(!target)return{applied:false,reason:'unknown_session'};
+        if(target.id===active.id)return{applied:false,reason:'already_active'};
+        store.change(s=>{
+          const current=s.threads.find(t=>t.id===s.activeThreadId);
+          if(current&&!current.archived){current.archived=true;current.archivedReason='resumed_other';current.archivedAt=now();}
+          const next=s.threads.find(t=>t.id===resume.sessionId);
+          next.archived=false;delete next.archivedReason;delete next.archivedAt;next.updated=now();
+          s.lastThreadRotation={from:current?.id,to:next.id,at:now(),reason:'manual_resume'};
+          s.activeThreadId=next.id;
+        });
+        change={ok:true,applied:true,kind:'resume',sessionId:resume.sessionId,from:active.id};
+      }
+    }catch(error){return{applied:false,reason:error.code||'session_change_failed',error:String(error.message)};}
+    return change;
+  }
+  /** One session as a listing row. Handoff SUMMARY is counted here, not carried: a list is not a transcript. */
+  function sessionRow(state,facts){
+    return{sessionId:facts.sessionId,title:facts.title||'',active:facts.active,archived:facts.archived,created:facts.created||null,updated:facts.updated||null,messages:facts.messages,chars:facts.chars,handoffSummaryChars:facts.handoff?.summaryChars||0,...facts.handoff?{handoff:{from:facts.handoff.from,by:facts.handoff.by,at:facts.handoff.at}}:{}};
+  }
+  function sessionList({limit=10}={}){
+    const state=store.read(),rows=(Array.isArray(state.threads)?state.threads:[]).map(thread=>sessionRow(state,sessionFacts(state,thread.id)));
+    rows.sort((left,right)=>(right.updated||0)-(left.updated||0));
+    const page=rows.slice(0,limit);
+    return{ok:true,total:rows.length,returned:page.length,truncated:rows.length>page.length,active:rows.find(row=>row.active)?.sessionId||null,sessions:page};
+  }
+  function sessionRead({sessionId,limit=12,maxChars=8000,maxMessageChars=800}={}){
+    const state=store.read(),facts=sessionFacts(state,sessionId);
+    if(!facts)throw coded('unknown_session','no such NewMate session: '+sessionId);
+    const all=sessionMessages(state,sessionId),kept=[];
+    let chars=0,dropped=0,droppedChars=0,clipped=false;
+    for(let index=all.length-1;index>=0;index-=1){
+      const message=all[index];
+      let body=typeof message.text==='string'?message.text:'';
+      if(!body)continue;
+      if(kept.length>=limit){dropped=index+1;droppedChars+=body.length;continue;}
+      if(body.length>maxMessageChars){droppedChars+=body.length-maxMessageChars;body=body.slice(0,maxMessageChars)+'…';clipped=true;}
+      if(chars+body.length>maxChars&&kept.length){dropped=index+1;droppedChars+=body.length;continue;}
+      kept.push({role:message.role==='user'?'user':'assistant',text:body,at:Number.isFinite(message.at)?message.at:null,proactive:message.proactive===true});
+      chars+=body.length;
+    }
+    kept.reverse();
+    return{ok:true,sessionId:facts.sessionId,title:facts.title||'',active:facts.active,archived:facts.archived,total:all.length,chars,kept:kept.length,messages:kept,truncated:{messages:dropped>0,chars:chars>=maxChars||clipped,droppedMessages:dropped,droppedChars},handoff:facts.handoff?{from:facts.handoff.from,fromTitle:facts.handoff.fromTitle,by:facts.handoff.by,at:facts.handoff.at,reason:facts.handoff.reason,summary:facts.handoff.summary}:null};
+  }
+  /**
+   * newmate_session_refresh: DECLARE the handoff, do not perform it.
+   *
+   * Scheduling instead of switching is the whole point: this call happens inside a turn whose answer
+   * has not been stored yet, and a session change there would put the answer into an archived
+   * session. The request is recorded on the running task and applied by the finally block once the
+   * reply is written. What the model chooses is CONTENT (summary, title, reason); which session is
+   * handed off comes from the run's own ALS context, never from an argument.
+   */
+  function sessionRefresh({summary,title='',reason=''}={}){
+    const state=store.read(),session=newMateContext()?.session;
+    const task=session?.taskId?state.tasks.find(t=>t.id===session.taskId):undefined;
+    if(!task||task.status!=='running')throw coded('no_running_turn','a session can only be handed off from inside a running NewMate turn');
+    const active=state.threads.find(t=>t.id===state.activeThreadId);
+    if(!active||active.archived)throw coded('no_active_session','NewMate has no current session to hand off');
+    if(active.id!==task.threadId)throw coded('session_changed','the run is no longer answering in the current session; the handoff was not scheduled');
+    const facts=sessionFacts(state,active.id);
+    if(facts.messages<SESSION_MIN_REFRESH_MESSAGES)throw coded('session_too_short','this session has '+facts.messages+' messages; at least '+SESSION_MIN_REFRESH_MESSAGES+' are needed for a handoff to carry anything');
+    const body=String(summary||'').trim();
+    if(!body)throw coded('summary_required','a handoff needs a summary: write what the next session must know');
+    if(body.length>SESSION_SUMMARY_MAX)throw coded('summary_too_long','summary must be at most '+SESSION_SUMMARY_MAX+' characters (got '+body.length+')');
+    const nextTitle=String(title||'').trim().slice(0,32);
+    store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);if(t)t.sessionHandoff={summary:body,title:nextTitle,reason:String(reason||'').slice(0,200),by:'self',at:now()};});
+    return{ok:true,scheduled:true,sessionId:active.id,summaryChars:body.length,title:nextTitle||null,turns:{messages:facts.messages,chars:facts.chars},note:'交接已排入本轮：回复写入后生效，当前会话归档并完整保留，新会话开局带着这段摘要。'};
+  }
+  /** newmate_session_resume: the same boundary rule, for bringing an archived session back. */
+  function sessionResume({sessionId}={}){
+    const state=store.read(),session=newMateContext()?.session;
+    const task=session?.taskId?state.tasks.find(t=>t.id===session.taskId):undefined;
+    if(!task||task.status!=='running')throw coded('no_running_turn','a session can only be switched from inside a running NewMate turn');
+    const target=state.threads.find(t=>t.id===sessionId);
+    if(!target)throw coded('unknown_session','no such NewMate session: '+sessionId);
+    if(target.id===state.activeThreadId)throw coded('already_active','that session is already the current one');
+    store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);if(t)t.sessionResume={sessionId:target.id,at:now()};});
+    return{ok:true,scheduled:true,sessionId:target.id,title:target.title||'',note:'恢复已排入本轮：回复写入后生效，当前会话归档并完整保留。'};
+  }
+  /** Which session this companion is in, how big it is, and which threshold it has crossed. */
+  function sessionStatus(){
+    const state=store.read(),facts=sessionFacts(state,state.activeThreadId);
+    if(!facts)return{ok:false,code:'no_active_session',error:'NewMate has no current session'};
+    const due=refreshDue(state,facts.sessionId),forced=refreshForced(state,facts.sessionId);
+    return{ok:true,sessionId:facts.sessionId,title:facts.title||'',messages:facts.messages,chars:facts.chars,budget:SESSION_BUDGET,hard:SESSION_HARD,due:due.due?due.code:null,forced:forced.forced?forced.code:null,proactive:{failures:Number(state.initiative?.sessionRefreshFailures||0),lastAt:Number(state.initiative?.sessionRefreshAt||0),idleMs:SESSION_REFRESH_IDLE_MS,cooldownMs:SESSION_REFRESH_COOLDOWN_MS},handoff:facts.handoff?{from:facts.handoff.from,by:facts.handoff.by,at:facts.handoff.at,summaryChars:facts.handoff.summaryChars}:null};
+  }
+  /**
+   * EVIDENCE IS CONSUMED BY A CONTACT, NOT BY AN ATTEMPT.
+   *
+   * probeInitiative used to clear `initiative.signals` and advance the memory fingerprints the moment
+   * it scheduled a check-in. A check-in that then said nothing (`notify=false`), was refused by the
+   * duplicate or format gate, or never reached the model at all, had therefore CONSUMED the only proof
+   * that something had happened: the next probe fell back to reason='check-in', and the real change was
+   * never mentioned. The shape of the defect is one line long - a signal, one silent run, no signal.
+   *
+   * The rule now: a DELIVERED contact spends the evidence it was about. Signals raised after the run
+   * started are kept, because that message cannot have mentioned them. An attempt that delivered
+   * nothing keeps the evidence for a bounded number of attempts (MAX_EVIDENCE_ATTEMPTS), after which it
+   * expires and the expiry is RECORDED - a change that truly was not worth mentioning must stop
+   * driving check-ins, but it must not vanish without a trace.
+   */
+  function settleInitiativeEvidence(task){
+    if(task?.kind!=='self_activation')return;
+    const state=store.read(),evidence=task.evidence||{};
+    const delivered=state.messages.some(message=>message.id===task.id);
+    const fingerprint=()=>{if(evidence.memoryKey){lastMemoryKey=evidence.memoryKey;lastMemoryMarker=evidence.marker;}};
+    if(delivered){
+      fingerprint();
+      store.change(s=>{
+        s.initiative.signals=(s.initiative.signals||[]).filter(signal=>(signal.at||0)>(task.created||0));
+        s.initiative.pending=undefined;
+        s.initiative.evidence={state:'delivered',reason:evidence.reason||null,at:now(),signals:evidence.signals||0};
+        if(evidence.memoryKey){s.initiative.memoryKey=evidence.memoryKey;s.initiative.memoryMarker=evidence.marker;}
+      });
+      return;
+    }
+    const attempts=Number(state.initiative.pending?.attempts)||1;
+    if(attempts>=MAX_EVIDENCE_ATTEMPTS){
+      fingerprint();
+      store.change(s=>{
+        s.initiative.signals=[];
+        s.initiative.pending=undefined;
+        s.initiative.evidence={state:'expired',reason:evidence.reason||null,at:now(),attempts,signals:evidence.signals||0};
+        if(evidence.memoryKey){s.initiative.memoryKey=evidence.memoryKey;s.initiative.memoryMarker=evidence.marker;}
+      });
+      return;
+    }
+    store.change(s=>{s.initiative.evidence={state:'pending',reason:evidence.reason||null,at:now(),attempts,signals:evidence.signals||0};});
+  }
+  /**
+   * Deliver the sentence a previous turn already wrote, when the moment now fits.
+   *
+   * The counterpart of `speculable` in the publish path: a finished proactive message that the timing
+   * gate refused waits here instead of being thrown away, and every tick asks whether it can go out
+   * yet. Nothing is regenerated, so the cost of the second chance is one tick.
+   *
+   * The refusal vocabulary is inherited on purpose, and the two families are handled differently:
+   * quiet hours / snooze / pace cooldown mean "not yet", so the sentence keeps waiting inside its TTL;
+   * duplicate, disabled initiative, content problems and an expired window mean "not this one", so it
+   * is dropped and the reason is recorded. A message is never delivered while the person is typing,
+   * reading, busy or away - the same conditions that refused it the first time still refuse it.
+   */
+  async function deliverPrepared(){
+    const state=store.read(),prepared=state.initiative.prepared;
+    if(!prepared)return null;
+    if(now()>=(prepared.expiresAt||0)){
+      store.change(s=>{s.initiative.prepared=null;s.initiative.lastOutcome='prepared_expired';});
+      return{delivered:false,reason:'expired'};
+    }
+    const env=environment();
+    const blocked=env.ready===false?'runtime_unavailable':env.busy?'busy':env.readerFocused?'reading':env.idleMs>=90*MINUTE?'away':env.idleMs<MINUTE?'typing':'';
+    if(blocked)return{delivered:false,reason:blocked};
+    const gate=messageGate(state.settings,state.initiative,now(),prepared.text,prepared.subject,engagedAt);
+    if(gate&&PREPARED_WAIT.includes(gate))return{delivered:false,reason:gate};
+    if(gate){store.change(s=>{s.initiative.prepared=null;s.initiative.lastOutcome='prepared_dropped:'+gate;});return{delivered:false,reason:gate};}
+    const contentGate=proactiveMessageGate(prepared.text);
+    if(contentGate){store.change(s=>{s.initiative.prepared=null;s.initiative.lastOutcome='prepared_dropped:'+contentGate;});return{delivered:false,reason:contentGate};}
+    const destination=rotateForMessage(prepared.subject||'',prepared.text);
+    const memoryKey=nativeMemory().key,marker=memoryMarker();
+    const message={id:prepared.taskId||randomUUID(),threadId:destination,role:'assistant',text:prepared.text,plain:prepared.plain,at:now(),proactive:true,autonomous:true,unread:true,preparedAt:prepared.at};
+    store.change(s=>{
+      s.messages.push(message);
+      const t=s.threads.find(t=>t.id===destination);if(t)t.updated=now();
+      recordMessage(s.initiative,now(),prepared.text,prepared.subject);
+      s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);
+      s.initiative.lastOutcome='message';
+      s.initiative.prepared=null;
+      // The delivered sentence is about the evidence it was prepared for: it spends it here.
+      s.initiative.signals=[];s.initiative.pending=undefined;
+      s.initiative.evidence={state:'delivered',via:'prepared',reason:prepared.reason||null,at:now()};
+      s.initiative.memoryKey=memoryKey;s.initiative.memoryMarker=marker;
+    });
+    lastMemoryKey=memoryKey;lastMemoryMarker=marker;
+    await notify({...message,text:bubbleText(message),rich_text:message.text});
+    return{delivered:true,id:message.id,threadId:destination};
   }
   function rotateForMessage(topic,text){
     const state=store.read(),env=environment();const reason=threadHandoff(state,now(),{topic,focused:readingUntil>now()||env.readerFocused,draft:state.attention?.[state.activeThreadId]?.draftUntil>now(),busy:state.tasks.some(t=>t.kind==='chat'&&['pending','running'].includes(t.status)),engagedAt});
@@ -528,9 +960,16 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     const localDue=reason==='check-in'&&(!s.initiative.lastMessageAt?now()-s.initiative.enabledAt>=DAY:now()-s.initiative.lastMessageAt>=3*DAY);
     const greetings=['我在这儿。今天有没有想慢慢聊一聊的事？','想歇一会儿时，可以来和我聊聊；也可以一起把一件事理清。','如果最近有件事卡住了，可以说给我听，我们一点点来。'];
     const localText=localDue?greetings[(s.initiative.localChecks||0)%greetings.length]:'';
-    const prompt=`主动陪伴稀疏检查，触发=${reason}。用户未主动发起也可在合适时简短自然地关心，但没有必要内容时 notify=false。不是强制问候；不要重复追问“在吗”、催促回复、重复上一条话题或假装知道用户正在做什么。最多两句话、240 字符；仅使用有效 MemoryLab 背景，过期记忆不可当当前事实。返回 notify、text，可附具体话题 topic。禁止唤起外部对话或执行工作；只可为用户明确委托创建确定时间的待办，不得为寒暄或无依据推测创建待办。未回应次数=${s.initiative.unanswered||0}。文件信号仅为浅层元数据，不是文件内容/完成证据：${JSON.stringify(signals)}。`;
-    const task=enqueue(prompt);lastMemoryKey=memoryKey;lastMemoryMarker=marker;
-    store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='self_activation';t.reason=reason;if(localText){t.localText=localText;s.initiative.localChecks=(s.initiative.localChecks||0)+1;}touchDay(s.initiative,now());if(!localText)s.initiative.attempts++;s.initiative.lastAttemptAt=now();s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.signals=[];s.initiative.lastReason=localText?'gentle-presence':reason;});return{ok:true,allowed:true,id:task.id,reason};
+    const prompt=`主动陪伴稀疏检查，触发=${reason}。用户未主动发起也可在合适时简短自然地关心，但没有必要内容时 notify=false。不是强制问候；不要重复追问“在吗”、催促回复、重复上一条话题或假装知道用户正在做什么。最多两句话、240 字符；仅使用有效 MemoryLab 背景，过期记忆不可当当前事实。返回 notify、text；这条消息讲的是具体某件事时给 topic（同一件事用同一个短的稳定主题，如「周报进度」），只是问候或没有具体事时不要给 topic——同一 topic 24 小时内不会重复，凑一个空话 topic 只会让你下一件真事发不出去。禁止唤起外部对话或执行工作；只可为用户明确委托创建确定时间的待办，不得为寒暄或无依据推测创建待办。未回应次数=${s.initiative.unanswered||0}。文件信号仅为浅层元数据，不是文件内容/完成证据：${JSON.stringify(signals)}。`;
+    const task=enqueue(prompt);
+    /**
+     * EVIDENCE IS NOT SPENT BY SCHEDULING - see settleInitiativeEvidence() for where it is spent.
+     *
+     * The task carries exactly what this check-in is about (the reason, the memory fingerprints, how
+     * many signals it was shown) so the settlement can decide, after the run, whether a contact was
+     * actually delivered. Attempts are counted here and only reset by a delivery.
+     */
+    store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='self_activation';t.reason=reason;t.evidence={reason,memoryKey,marker,signals:signals.length,at:now()};if(localText){t.localText=localText;s.initiative.localChecks=(s.initiative.localChecks||0)+1;}touchDay(s.initiative,now());if(!localText)s.initiative.attempts++;s.initiative.lastAttemptAt=now();s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.pending={reason,at:now(),attempts:(s.initiative.pending?.attempts||0)+1};s.initiative.lastReason=localText?'gentle-presence':reason;});return{ok:true,allowed:true,id:task.id,reason};
   }
   // Interrupted runs are retained and await explicit retry: no automatic duplicate model spend.
   if (store.read().tasks.some(t => t.status === 'running')) store.change(s => { for (const t of s.tasks) if (t.status === 'running') { t.status = 'interrupted'; t.error = '宿主在任务完成前退出，可显式重试'; } });
@@ -700,10 +1139,11 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
 
   return {
     sweepWorkspaces, watchStatus, noteDshActivity,
+    sessionStatus, sessionList, sessionRead, sessionRefresh, sessionResume,
     todoAdd(input,execution,source='agent'){const value=todoInput(input,now()),id=randomUUID();store.change(s=>{if(s.todos.length>=2000||s.todos.filter(t=>['pending','delivering'].includes(t.status)).length>=100)throw Error('待办列表已达到容量上限');s.todos.push({id,...value,created:now(),status:'pending',source,origin:computerUseCaller(execution)||undefined});});return{ok:true,todo:store.read().todos.find(t=>t.id===id)};},
     todoList(){return{ok:true,todos:store.read().todos};},
     todoCancel(id){store.change(s=>{const t=s.todos.find(t=>t.id===id);if(!t||!['pending','failed'].includes(t.status))throw Error('该待办不存在、已投递或正在投递');t.status='cancelled';t.cancelledAt=now();delete t.deferred;});return{ok:true,id};},
-    state: store.read, deliveryBlocker, deliveryReady, newmateIdle, loopStatus: () => live.snapshot(), ask, answerQuestion, pendingQuestion, enqueue, tick, initiativeStatus(){const s=store.read(),env=environment();return{...initiativeGate(s.settings,s.initiative,now(),{...env,busy:env.busy||running||s.tasks.some(t=>['pending','running'].includes(t.status))},engagedAt,bootReadyAt),nextAttemptAt:s.initiative.nextAttemptAt,lastReason:s.initiative.lastReason,lastOutcome:s.initiative.lastOutcome};},stop() { stopped = true; settleAsk({ ok: false, code: 'question_aborted', error: 'the companion stopped before the user answered', questionId: null }); active?.abort(); },
+    state: store.read, deliveryBlocker, deliveryReady, newmateIdle, loopStatus: () => live.snapshot(), ask, answerQuestion, pendingQuestion, enqueue, tick, initiativeStatus(){const s=store.read(),env=environment();return{...initiativeGate(s.settings,s.initiative,now(),{...env,busy:env.busy||running||s.tasks.some(t=>['pending','running'].includes(t.status))},engagedAt,bootReadyAt),nextAttemptAt:s.initiative.nextAttemptAt,lastReason:s.initiative.lastReason,lastOutcome:s.initiative.lastOutcome,evidence:s.initiative.evidence||null,pendingEvidence:s.initiative.pending||null,signals:(s.initiative.signals||[]).length,prepared:s.initiative.prepared?{at:s.initiative.prepared.at,expiresAt:s.initiative.prepared.expiresAt,subject:s.initiative.prepared.subject||null,chars:(s.initiative.prepared.text||'').length,reason:s.initiative.prepared.reason||null}:null};},stop() { stopped = true; settleAsk({ ok: false, code: 'question_aborted', error: 'the companion stopped before the user answered', questionId: null }); active?.abort(); },
     async configure(settings) {
       if(!settings||Object.keys(settings).some(k=>!['companion','notifications','watchEnabled','watchIntervalMinutes','watchDepth','watchDshWeight',...Object.keys(INITIATIVE_DEFAULTS)].includes(k)))throw Error('陪伴设置无效');
       for(const [key,value]of Object.entries(settings)){if(['companion','notifications','initiative'].includes(key)&&typeof value!=='boolean')throw Error('开关无效');if(key==='pace'&&(typeof value!=='string'||!Object.hasOwn(PACES,value)))throw Error('陪伴频率无效');if(['quietStart','quietEnd'].includes(key)&&(!Number.isInteger(value)||value<0||value>23))throw Error('静默时间无效');if(key==='watchEnabled'&&typeof value!=='boolean')throw Error('监控开关无效');if(key==='watchIntervalMinutes'&&(!Number.isInteger(value)||value<5||value>1440))throw Error('监控间隔须为 5–1440 分钟');if(key==='watchThreshold')throw Error('监控阈值已并入主动性选择，请改 pace');if(key==='watchDepth'&&(!Number.isInteger(value)||value<0||value>6))throw Error('监控深度须为 0–6');if(key==='watchDshWeight'&&(!Number.isFinite(value)||value<0||value>1))throw Error('DSH 变动权重须在 0–1 之间');if(key==='snoozeUntil'&&(!Number.isFinite(value)||value<0||value>now()+7*DAY))throw Error('暂停期限无效');}
@@ -757,7 +1197,18 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
       const prompt=withAttachments(words,files);
       const selected=thread(threadId),caller=computerUseCaller(execution),origin=caller?.startsWith('dsh-session:')?caller.slice('dsh-session:'.length):undefined;
       const inputId=randomUUID();let task,mode='start';
-      if(running&&activeTask?.threadId===selected.id&&activeTask.destination==='newmate'){
+      /**
+       * A USER MESSAGE OUTRANKS MAINTENANCE.
+       *
+       * A session-refresh turn exists only to write a summary, so typing at it must cancel it and
+       * become an ordinary chat turn. Steering into it was the trap: the run would end, hand the user's
+       * words back as the pending maintenance prompt, and answer them inside a housekeeping turn. The
+       * aborted turn is recorded as interrupted (nothing was said), and the user's message starts its
+       * own task, which the same tick runs.
+       */
+      const cancelMaintenance=running&&activeTask?.destination==='newmate'&&activeTask.kind==='session_refresh';
+      if(cancelMaintenance){userPreempted=true;active.abort();}
+      if(!cancelMaintenance&&running&&activeTask?.threadId===selected.id&&activeTask.destination==='newmate'){
         if(guide.pending.length>=32||guide.pending.reduce((n,m)=>n+m.content[0].text.length,0)+prompt.length>32000)throw Error('当前引导过长，请等待当前回复处理');
         task={ok:true,id:activeTask.id};mode='steer';
         if(activeAutomatic){manualRestart=true;store.change(s=>{const t=s.tasks.find(t=>t.id===activeTask.id);t.kind='chat';t.prompt=prompt;if(origin)t.origin=origin;if(files.length)t.attachments=files;});active.abort();}

@@ -9,7 +9,7 @@ export const SNAPSHOT_GLOBAL = '__NEWMARK_HEARTBEAT__';
 export function apply(ctx, config) {
   const core = ctx.get?.('newmarkComponents');
   const version = JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version;
-  const beat = createHeartBeat({ root: resolveRoot(config), core: () => core, agents: () => ctx.get?.('agents'), goals: () => ctx.get?.('goals'), version, logger:ctx.logger });
+  const beat = createHeartBeat({ root: resolveRoot(config), agents: () => ctx.get?.('agents'), goals: () => ctx.get?.('goals'), version, logger:ctx.logger });
   if (core) core.heartBeat = beat;
   ctx.effect(() => () => { beat.stop(); if (core?.heartBeat === beat) delete core.heartBeat; }, 'heartbeat-bridge');
   ctx.effect(() => { const timer = setInterval(() => beat.tick().catch(e => ctx.logger?.warn?.(e.message)), 2000); timer.unref?.(); return () => clearInterval(timer); }, 'heartbeat-delivery');

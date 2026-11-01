@@ -9,6 +9,7 @@ import { createNewMateMcp, MCP_ROUTE } from './lib/mcp.js';
 import { createNewMateSearch } from './lib/web-search.js';
 import { createAskTool } from './lib/ask.js';
 import { createConversationBridge } from './lib/conversations.js';
+import { createSessionBridge } from './lib/sessions.js';
 import { createWechatChannel } from './lib/wechat-channel.js';
 import { MONITOR_DEFAULTS, dedupeRoots } from './lib/workspace-diff.js';
 import { UPLOAD_MAX_BYTES } from './lib/upload-store.js';
@@ -68,6 +69,18 @@ export function apply(ctx, config) {
   const conversations=createConversationBridge({services:{agents:()=>ctx.get?.('agents'),presets:()=>ctx.get?.('agentPresets'),workspaces:()=>ctx.get?.('workspaceRegistry'),persistence:()=>ctx.get?.('sessionPersistence'),sessionQuery:()=>ctx.get?.('sessionQuery'),goals:()=>ctx.get?.('goals'),model:()=>{const selection=readCoreSelection({core});return selection?.ok?{provider:selection.provider,model:selection.model,...selection.reasoningEffort?{reasoningEffort:selection.reasoningEffort}:{}}:undefined;}},log:(where,error)=>ctx.logger?.warn?.(where+': '+error?.message)});
   const privateTools={...(globalThis[Symbol.for("newmark.newmate.privateTools")] || {})};
   for(const definition of conversations.definitions)privateTools[definition.name]=definition;
+  /**
+   * NewMate's OWN sessions, managed by the companion itself.
+   *
+   * Different from ~conversations~ above: those act on real DSH conversations (and are somebody
+   * else's session); these act on the threads NewMate keeps for its own dialogue with the user. They
+   * are private tools for the same reason, and they are deliberately NOT request-bound - an
+   * autonomous check-in is exactly when a handoff has to be possible, because nobody is there to
+   * press a button. The session a call refreshes comes from the run's context, never from an
+   * argument; see lib/sessions.js.
+   */
+  const sessions=createSessionBridge({services:{sessions:()=>mate},log:(where,error)=>ctx.logger?.warn?.(where+': '+error?.message)});
+  for(const definition of sessions.definitions)privateTools[definition.name]=definition;
   /**
    * The report path: NewMate telling the user something it found out by itself.
    *
