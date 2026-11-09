@@ -7,7 +7,6 @@ import { embedJson } from '../../lib/embed.js';
 import { schema } from '../../lib/schema.js';
 import { createNewMateMcp, MCP_ROUTE } from './lib/mcp.js';
 import { createNewMateSearch } from './lib/web-search.js';
-import { createAskTool } from './lib/ask.js';
 import { createConversationBridge } from './lib/conversations.js';
 import { createSessionBridge } from './lib/sessions.js';
 import { createWechatChannel } from './lib/wechat-channel.js';
@@ -214,7 +213,6 @@ export function apply(ctx, config) {
       output: { schema: { type: 'object' }, render: (_, v) => [{ type: 'text', text: JSON.stringify(v) }] }, execute: action,
     }), `newmate-tool-${toolName}`);
   }
-  ctx.effect(() => ctx.tools.register(createAskTool(mate)), 'newmate-ask');
   /**
    * Sending a file to the user's phone, registered in the SHARED tool registry.
    *

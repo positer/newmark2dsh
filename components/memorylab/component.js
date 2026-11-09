@@ -29,6 +29,7 @@ import { agentApiPresence, AGENT_API_PRESENCE_TOOL } from '../agent-api/lib/pres
 // This component owns two of the failures the user asked to have persisted: the deterministic
 // rebuild, and every judgement that is not a verdict.
 import { causeChain, createErrorLog, describeError } from '../../lib/errors.js';
+import { executeOne } from '../../lib/tool-batch.js';
 
 /**
  * What this store IS, at the head of every model-facing description.
@@ -811,7 +812,7 @@ export function createMemoryLab({ root, language = 'auto', reindexOnRender = tru
     });
     let outcome = null;
     try {
-      const dispatched = tools.execute({
+      const dispatched = executeOne(tools, {
         callId: `newmark-memorylab:judge:${judgementAsks}:${Date.now().toString(36)}`,
         name: JUDGEMENT_TOOL,
         // The ask, the directory the run works in, and the bound. No `tools`, no `max_steps`, no

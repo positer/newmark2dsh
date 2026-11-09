@@ -11,6 +11,8 @@
  * that one instance; the tool definition is a thin adapter so a gate can drive it directly.
  */
 
+import { newMateContext } from '../../../lib/newmate-context.js';
+
 /** The model-facing tool name. */
 export const NEWMATE_ASK_TOOL = 'newmate_ask';
 /** Newmark's option block accepts a short list; the model does not get to render a menu. */
@@ -58,6 +60,13 @@ export function createAskTool(mate) {
       additionalProperties: false,
     },
     output: { schema: { type: 'object' }, render: (_, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }] },
-    execute: (args, execution) => mate.ask(args, execution),
+    execute: (args, execution) => {
+      /* NewMate-only by construction: the question is rendered by the NewMate page and
+       * answered through that page's route, which only a NewMate run can reach. A DSH
+       * agent's call would block with no UI able to answer it, so it is refused here
+       * rather than left to hang. */
+      if (!newMateContext()) throw new Error('newmate_ask is only available inside a NewMate run');
+      return mate.ask(args, execution);
+    },
   };
 }

@@ -6,11 +6,12 @@ import { currentConversation, deliverConversation, conversationPaused, conversat
 import { classifyToolResult } from '../agent-api/lib/contract.js';
 import { createErrorLog } from '../../lib/errors.js';
 import { withNewMateContext, newMateContext } from '../../lib/newmate-context.js';
+import { executeOne } from '../../lib/tool-batch.js';
 import { createMemoryContext } from './lib/memory-context.js';
 import { computerUseCaller, withComputerUseCaller, withComputerUseOwner } from '../../lib/cu-caller.js';
 import { createLoopStatus } from './lib/agent-loop.js';
 import { NEWMATE_SEARCH_TOOL } from './lib/web-search.js';
-import { NEWMATE_ASK_TOOL, ASK_MIN_OPTIONS, ASK_MAX_OPTIONS, ASK_QUESTION_MAX_CHARS, ASK_LABEL_MAX_CHARS } from './lib/ask.js';
+import { NEWMATE_ASK_TOOL, createAskTool, ASK_MIN_OPTIONS, ASK_MAX_OPTIONS, ASK_QUESTION_MAX_CHARS, ASK_LABEL_MAX_CHARS } from './lib/ask.js';
 import {PROACTIVE_STYLE,proactiveMessageGate} from './lib/proactive-message.js';
 import {threadHandoff,shouldRotate} from './lib/thread-handoff.js';
 import {SESSION_BUDGET,SESSION_HARD,SESSION_SUMMARY_MAX,SESSION_MIN_REFRESH_MESSAGES,sessionFacts,refreshDue,refreshForced,mechanicalSummary,sessionMessages} from './lib/session-refresh.js';
@@ -379,7 +380,7 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     try {
       for (const mouse_mode of ['real', 'virtual']) {
         try {
-          await withComputerUseOwner(NEWMATE_CU_OWNER, () => tools.execute({
+          await withComputerUseOwner(NEWMATE_CU_OWNER, () => executeOne(tools, {
             callId: `newmate-release:${taskId}:${mouse_mode}`,
             name: 'computer_use',
             arguments: { action: 'takeover_stop', mouse_mode },
@@ -498,11 +499,18 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
           return list.length ? list[list.length - 1].at : 0;
         })();
         const timeLine = '当前时间：' + localStamp(now()) + '（本机时区 ' + Intl.DateTimeFormat().resolvedOptions().timeZone + '）；最后一条用户消息发送于：' + (userMessageAt ? localStamp(userMessageAt) : '（本对话还没有用户消息）') + '。两者都是本机时间并带偏移，提到\"现在\"用前者、提到\"你发消息时\"用后者，不要换算成 UTC 或别的时区。\n';
-        const outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseOwner(NEWMATE_CU_OWNER,()=>withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,conversation:conversationOf(task),session:{id:task.threadId,taskId:task.id},steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)},onEvent:event=>live.event(event)},()=>tools.execute({ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
+        /* newmate_ask is NewMate's own surface: registered for the duration of an
+         * interactive run and disposed at the end, so a DSH agent never sees it in its
+         * catalog (its normal asking goes through the native ask_user_question), and a
+         * call that somehow reaches it still refuses outside this ALS context. */
+        const disposeAsk = task.localText || automatic || maintenance ? undefined : tools.register(createAskTool({ ask }));
+        let outcome;
+        try { outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseOwner(NEWMATE_CU_OWNER,()=>withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,conversation:conversationOf(task),session:{id:task.threadId,taskId:task.id},steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)},onEvent:event=>live.event(event)},()=>executeOne(tools,{ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
           prompt: `${timeLine}${sessionBlock(task.threadId)}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。用户要求重复时给 repeat：{every,unit:\'min\'|\'h\'|\'d\',weekdays?:[1-7]（1=周一）,at?:\'HH:MM\'}，或等价规则串 rule（如 \"every 2 d on 1-5 at 09:00\"）；不给 repeat 就只触发一次。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：${store.read().watch?.lastDescription||'（本机尚无对比结果）'}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪些文件新增/改动、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。':''}\n${REPLY_PROTOCOL}`,
           tools: { allow: newMateRunTools({automatic:automatic||maintenance,origin:task.origin}) }, timeout_ms: maintenance?60000:automatic?45000:120000, max_steps: maintenance?4:automatic?3:0,
           ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:400},plain:{type:'string',maxLength:120},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
         }, signal: active.signal }))));
+        } finally { disposeAsk?.(); }
         active.signal.throwIfAborted();
         // A guide arriving after the loop ended must never publish an obsolete answer.
         if(guide.pending.length){store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.status='pending';t.prompt=guide.pending.map(m=>m.content[0].text).join('\n');});return;}

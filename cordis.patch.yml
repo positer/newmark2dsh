@@ -172,21 +172,23 @@
             config:
               - id: tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+                # DSH 0.2.2 folded the former `.../list-agents` subpath export into this
+                # package (send_message / interrupt_agent / list_agents are registered by
+                # this row alone). Declaring a separate `tool-subagent-list-agents` row
+                # now fails to resolve and aborts the whole preset mount with
+                # "never started", so no such row exists here.
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
                   toolName: subagent
-                  modelSelectionSettings: true
-                  backgroundMode: continuable
+                  modelSelection: true
+                  modelDiscovery: true
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: fork
                   toolName: subagent_fork
-                  backgroundMode: continuable
               - id: tool-subagent-codex
                 name: '@deepseek-ai/dsh-tool-subagent'
                 disabled: true
@@ -378,21 +380,23 @@
             config:
               - id: tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+                # DSH 0.2.2 folded the former `.../list-agents` subpath export into this
+                # package (send_message / interrupt_agent / list_agents are registered by
+                # this row alone). Declaring a separate `tool-subagent-list-agents` row
+                # now fails to resolve and aborts the whole preset mount with
+                # "never started", so no such row exists here.
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
                   toolName: subagent
-                  modelSelectionSettings: true
-                  backgroundMode: continuable
+                  modelSelection: true
+                  modelDiscovery: true
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: fork
                   toolName: subagent_fork
-                  backgroundMode: continuable
               - id: tool-subagent-codex
                 name: '@deepseek-ai/dsh-tool-subagent'
                 disabled: true

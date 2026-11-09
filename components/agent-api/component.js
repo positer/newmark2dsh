@@ -229,6 +229,7 @@ import {
 import { runAgentLoop } from './lib/loop.js';
 import { admitImages, visualToolContent } from './lib/visual.js';
 import { newMateContext } from '../../lib/newmate-context.js';
+import { executeOne } from '../../lib/tool-batch.js';
 import { JUDGE_SYSTEM_PROMPT, createLlmStreamFn, excerpt, toolCallArgumentsChecked, toolCallKey } from './lib/llm-seam.js';
 import { readCoreSelection, verifyModelAvailable } from './lib/core-model.js';
 
@@ -848,7 +849,7 @@ export function createAgentApi({
             // one surface and executing another is the bypass this pairing exists to avoid — a
             // tool the list showed but the resolved layer does not carry would answer
             // `UNKNOWN_TOOL` at call time.
-            const outcome = await view.tools.execute({
+            const outcome = await executeOne(view.tools, {
               callId: `agent-api-run:${callId}`,
               name,
               arguments: args ?? {},
@@ -1403,7 +1404,7 @@ export function createAgentApi({
       // `dispatchScope` is where that decision lives and why. A route-driven call has no Agent and
       // keeps the process-wide view. `call`, `reach` and `where` are computed above the try, because
       // the catch reports `where` too.
-      const outcome = await view.tools.execute({
+      const outcome = await executeOne(view.tools, {
         callId: `agent-api:${counters.dispatches}:${Date.now().toString(36)}`,
         name,
         arguments: toolArgs,
