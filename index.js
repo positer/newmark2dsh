@@ -973,6 +973,10 @@ export function apply(ctx, config) {
           enabled: true,
           installedVersion: installed.version,
           runningVersion: coreVersion(),
+          // Whether it landed is answered by the disk, not by the manager's `application` word:
+          // a pass running inside the plugin it replaces gets `failed` back from the manager's
+          // apply step even when pnpm installed the new version correctly (measured 2026-11-10).
+          installedAfter: async () => (await installedCoreVersion(maybe('pluginManager'))).version,
           install: (latest) => {
             if (typeof manager?.installBundle !== 'function') {
               throw Error('pluginManager.installBundle 不可用，未执行静默更新');
