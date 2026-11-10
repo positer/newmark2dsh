@@ -2982,13 +2982,64 @@ function readPageGlobals() {
          * named tarball and restarts through the restart helper. A downgrade is refused rather
          * than performed: an older official release is not an update.
          */
+        /**
+         * One line about the last startup check, in the receipt's own terms.
+         *
+         * This line is the whole answer to "did the silent update work?". A feature that installs
+         * without telling anyone has to leave evidence somewhere, or "it updated quietly" and "it
+         * never ran" are the same observation. The evidence is the receipt under
+         * `<root>/core/auto-update.json`, and it is surfaced HERE — inside 版本管理, only when the
+         * user opens this page — rather than as a notice, which is what 不通知 rules out.
+         */
+        function autoUpdateLine(state) {
+          if (!state || typeof state !== 'object' || !state.outcome) return '';
+          const at = typeof state.checkedAt === 'string'
+            ? state.checkedAt.replace('T', ' ').replace(/\..*$/, '').slice(0, 16)
+            : '';
+          const words = {
+            installed: () =>
+              '已安装 ' + (state.from || '?') + (state.to ? ' → ' + state.to : '') +
+              (state.pendingRestart === false ? '' : '，重启 DSH 后生效'),
+            awaiting_restart: () => '磁盘上已是 ' + (state.latest || '最新版') + '，重启 DSH 后生效',
+            installed_current: () => '已是最新 ' + (state.latest || ''),
+            installed_ahead: () => '本地 ' + (state.installed || '') + ' 比 npm 的 ' + (state.latest || '') + ' 新，没有降级',
+            check_failed: () => '检查没有完成（' + (state.detail || 'npm 无响应') + '）',
+            install_failed: () => '安装没有完成（' + (state.detail || '未知原因') + '）',
+            install_refused: () => '宿主拒绝了这次安装（' + (state.application || '未说明') + '）',
+            version_unreadable: () => '版本号无法比较，没有更新',
+          };
+          const say = words[String(state.outcome)];
+          if (!say) return '';
+          return '上次启动检查' + (at ? '（' + at + '）' : '') + '：' + say() + '。';
+        }
+
         function ConfigUpdateCard({ model }) {
+          // true / false / null. null means the route has not answered for this switch: it is
+          // disabled and says so, instead of showing "off" for a value nobody read.
+          const autoUpdate = model.autoUpdate;
+          const known = autoUpdate === true || autoUpdate === false;
+          const locked = !known || model.autoUpdateEditable === false || model.autoUpdateBusy === true;
           return h(ConfigCard, {
             title: 'Newmark Core',
             description: '统一更新五个组件，重启后任务由 heartBeat 接续。',
           },
             h('div', { className: 'nmc-actions' },
               h(ConfigButton, { variant: 'outline', disabled: model.busy, onClick: model.check }, model.busy ? '处理中…' : '检查更新')),
+            h('hr', { className: 'nmc-rule' }),
+            h(ConfigSwitch, {
+              id: 'nmc-auto-update',
+              label: '启动时自动更新',
+              checked: autoUpdate === true,
+              disabled: locked,
+              onChange: value => model.saveAutoUpdate?.(value),
+            }),
+            h(ConfigNote, null, '开启后每次启动都会静默检查 npm 最新版：有新版本就装好，不重启、不弹窗、不发消息；你下次重启 DSH 时生效。'),
+            !known ? h(ConfigNote, null, '这一项还没有从宿主读到，暂不能修改。') : null,
+            known && model.autoUpdateEditable === false
+              ? h(ConfigNote, null, '当前 profile 的配置编辑器不可用，这个开关无法写入；检查更新按钮不受影响。')
+              : null,
+            autoUpdateLine(model.autoUpdateReceipt) ? h(ConfigNote, null, autoUpdateLine(model.autoUpdateReceipt)) : null,
+            model.autoUpdateError ? h(ConfigNote, { tone: 'error' }, model.autoUpdateError) : null,
             h(ConfigNote, null, model.message),
             model.prompt && UpdateModal
               ? h(UpdateModal, {
@@ -3102,6 +3153,20 @@ function readPageGlobals() {
           const [updateMessage, setUpdateMessage] = React.useState('所有组件随 Newmark Core 统一更新。');
           const [updateBusy, setUpdateBusy] = React.useState(false);
           const [updatePrompt, setUpdatePrompt] = React.useState(null);
+          /**
+           * The startup auto-update switch, in three states rather than two.
+           *
+           * `null` means the route has not answered for it — an older Host half, or a page whose
+           * first read has not landed. Rendering that as "off" would be this page asserting a
+           * setting it has not read, which is exactly the mistake the component rows were fixed
+           * for (a page snapshot read as a fact). So the switch is disabled until the answer is
+           * known, and never guesses.
+           */
+          const [autoUpdate, setAutoUpdate] = React.useState(null);
+          const [autoUpdateEditable, setAutoUpdateEditable] = React.useState(false);
+          const [autoUpdateReceipt, setAutoUpdateReceipt] = React.useState(null);
+          const [autoUpdateBusy, setAutoUpdateBusy] = React.useState(false);
+          const [autoUpdateError, setAutoUpdateError] = React.useState('');
           const updateLock = React.useRef(false);
           const updateDecision = React.useRef(null);
           const decideUpdate = confirmed => {
@@ -3125,6 +3190,14 @@ function readPageGlobals() {
                 const next = {};
                 for (const entry of result.components) next[entry.name] = { ok: true, mounted: entry.mounted === true, detail: entry.detail };
                 setApplied(current => ({ ...current, ...next }));
+                // One GET carries both, so the switch and the state it affects are read at the same
+                // instant. A body without the block leaves the switch unknown rather than off.
+                const update = typeof result.update === 'object' && result.update ? result.update : null;
+                if (update) {
+                  setAutoUpdate(update.autoUpdate === true);
+                  setAutoUpdateEditable(update.editable === true);
+                  setAutoUpdateReceipt(update.state && typeof update.state === 'object' ? update.state : null);
+                }
                 return true;
               })
               .catch(() => false);
@@ -3246,6 +3319,38 @@ function readPageGlobals() {
             finally { control.busy = false; }
           };
 
+          /**
+           * Write the startup auto-update switch.
+           *
+           * No optimistic flip: the switch keeps showing the Host's answer until the read-back
+           * says otherwise, because the whole point of this setting is that it changes behaviour
+           * with nobody watching — a page that showed it as on when the write was refused would be
+           * the only place the user could have noticed, and it would be lying.
+           */
+          const saveAutoUpdate = wanted => {
+            if (autoUpdateBusy) return;
+            setAutoUpdateBusy(true);
+            setAutoUpdateError('');
+            fetch('/newmark-core/components', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ component: 'update', autoUpdate: wanted === true }),
+            })
+              .then(response => response.json().catch(() => ({})).then(body => ({ ...body, httpStatus: response.status })))
+              .then(result => {
+                if (result.ok !== true) {
+                  setAutoUpdateError([
+                    result.httpStatus ? 'HTTP ' + result.httpStatus : null,
+                    result.error ? String(result.error) : null,
+                    result.detail ? String(result.detail) : null,
+                  ].filter(Boolean).join(' · ') || '保存失败');
+                }
+                return readState();
+              })
+              .catch(error => { setAutoUpdateError(String((error && error.message) || error)); })
+              .then(() => setAutoUpdateBusy(false));
+          };
+
           /** Install the named release, then restart through the restart helper. */
           const updateCore = async () => {
             if (updateLock.current) return;
@@ -3344,7 +3449,10 @@ function readPageGlobals() {
             components: { applied, pending, loaded, on, note, toggle },
             model: { state: modelState, busy: modelBusy, error: modelError, save: saveModel, loaded },
             desktop: { scale: petScale, error: petError, save: savePetScale },
-            update: { message: updateMessage, busy: updateBusy, check: updateCore, prompt: updatePrompt, decide: decideUpdate },
+            update: {
+              message: updateMessage, busy: updateBusy, check: updateCore, prompt: updatePrompt, decide: decideUpdate,
+              autoUpdate, autoUpdateEditable, autoUpdateReceipt, autoUpdateBusy, autoUpdateError, saveAutoUpdate,
+            },
           };
         }
         /**

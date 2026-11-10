@@ -48,7 +48,9 @@ import { readNewMateSettings, writeNewMateSettings } from './lib/newmate-setting
 import { schema } from './lib/schema.js';
 import { defaultRoot, resolveRoot } from './lib/root.js';
 import { embedJson } from './lib/embed.js';
-import { latestCore } from './lib/core-update.js';
+import { randomUUID } from 'node:crypto';
+import { CORE_PACKAGE, coreVersion, latestCore } from './lib/core-update.js';
+import { AUTO_UPDATE_DELAY_MS, readAutoUpdateState, runAutoUpdate } from './lib/auto-update.js';
 import { causeChain, createErrorLog, describeError } from './lib/errors.js';
 import {
   MODEL_ID_FIELD,
@@ -90,6 +92,16 @@ export const CORE_MODEL_ACCESSOR = 'model';
 export const MODEL_COMPONENT_KEY = 'model';
 
 /**
+ * The wire key the 版本管理 card sends to write the auto-update switch.
+ *
+ * A component key of its own rather than a flag on an existing one, because it is the only write
+ * on this route that changes a BEHAVIOUR of the row itself rather than which components are
+ * mounted — and a caller that sent `{component: 'update'}` by mistake should be answered, not
+ * silently read as a switch.
+ */
+export const UPDATE_COMPONENT_KEY = 'update';
+
+/**
  * The shared root and the authorised model, for the Client half and for diagnostics.
  *
  * `model` is the one field on this row that is not a switch: it is **准用 — authorised**. The
@@ -128,6 +140,20 @@ export const Config = schema
         .description('The provider route the authorised model belongs to, e.g. deepseek-official.')
         .default(''),
       newMateWatchRoot: schema.string().description('Opt-in directory for NewMate shallow file-change measurement; empty disables background observation.').default(''),
+      /*
+       * The startup auto-update switch. Off by default: installing software without being asked is
+       * a decision the user makes once, here, and never a default this bundle assumes for them.
+       * On, it means exactly what `lib/auto-update.js` documents — one silent check per process,
+       * a staged install, and no restart.
+       */
+      autoUpdate: schema
+        .boolean()
+        .description(
+          'On every start, silently check npm for a newer newmark2dsh and install it without ' +
+            'restarting: no dialog, no message, and the update takes effect the next time the user ' +
+            'restarts DSH. Off by default.',
+        )
+        .default(false),
     })
   : undefined;
 
@@ -514,6 +540,22 @@ export function apply(ctx, config) {
             }
           };
 
+          /**
+           * The startup auto-update's own state, as the 版本管理 card renders it.
+           *
+           * Three facts and no fourth: whether the switch is ON (the row's live config, so the page
+           * cannot show a default as if it were the persisted value), whether it CAN be written
+           * (an editor and a Loader entry, the same precondition the model write states), and the
+           * receipt of the last startup check. The receipt is what makes a silent feature
+           * verifiable at all: without it "it updated quietly" and "it never ran" look identical.
+           */
+          const updateState = () => ({
+            autoUpdate: liveConfig().autoUpdate === true,
+            editable:
+              typeof maybe('configEditor')?.edit === 'function' && ctx.fiber?.entry !== undefined,
+            state: readAutoUpdateState(root),
+          });
+
           if (req.method === 'GET') {
             if (new URL(req.url || '/', 'http://localhost').searchParams.get('view') === 'newMate') { send(200, {ok:true,newMate:readNewMateSettings(root)}); return; }
             // The preset is not a composed component, so its state is read from the
@@ -538,6 +580,7 @@ export function apply(ctx, config) {
                   })),
                 ],
                 [MODEL_COMPONENT_KEY]: await modelState(),
+                update: updateState(),
               }))) ?? { ok: false, error: 'handler_failed' },
             );
             return;
@@ -738,6 +781,81 @@ export function apply(ctx, config) {
               return;
             }
 
+            // ------------------------------------------------------- the auto-update ---
+            //
+            // One boolean, written through the same `configEditor.edit` the model write uses and
+            // read back the same way. Three refusals come before any write and each is named: a
+            // request that is not a boolean is a caller error (400), and no editor or no Loader
+            // entry means there is nowhere to persist it (501) — never a second write path to the
+            // profile patch, which is how one value ends up with two authors.
+            if (name === UPDATE_COMPONENT_KEY) {
+              if (typeof parsed.autoUpdate !== 'boolean') {
+                send(400, {
+                  ok: false,
+                  component: UPDATE_COMPONENT_KEY,
+                  error: 'auto_update_required',
+                  detail: 'the auto-update switch is a boolean, and nothing else is accepted',
+                });
+                return;
+              }
+              const wanted = parsed.autoUpdate;
+              const entry = ctx.fiber?.entry;
+              const configEditor = maybe('configEditor');
+              if (entry === undefined || typeof configEditor?.edit !== 'function') {
+                send(501, {
+                  ok: false,
+                  component: UPDATE_COMPONENT_KEY,
+                  error: 'config_editor_unavailable',
+                  detail:
+                    'this row has no Loader entry, or the configEditor service is not reachable from ' +
+                    'this scope, so the switch cannot be persisted; nothing was written',
+                });
+                return;
+              }
+              const outcome = await safe(async () => {
+                try {
+                  await configEditor.edit(entry, (current) => ({ ...current, autoUpdate: wanted }));
+                } catch (error) {
+                  failures.record({
+                    where: 'core/auto-update-write',
+                    code: 'write_failed',
+                    message: `configEditor.edit threw while writing autoUpdate=${wanted}: ${describeError(error)}`,
+                    detail: causeChain(error),
+                    fields: { component: UPDATE_COMPONENT_KEY, autoUpdate: wanted },
+                  });
+                  throw error;
+                }
+                // Read back, never echo: the editor resolves the config through the row's fiber and
+                // REPLACES the object, so the only honest answer is what the row holds now.
+                const live = entry.options.config ?? {};
+                const persisted = live.autoUpdate === true;
+                const ok = persisted === wanted;
+                if (!ok) {
+                  failures.record({
+                    where: 'core/auto-update-write',
+                    code: 'write_not_verified',
+                    message: `the auto-update write did not take: the row's config reads autoUpdate=${String(live.autoUpdate)}`,
+                    detail: `requested ${wanted}, read back ${String(live.autoUpdate)}`,
+                    fields: { component: UPDATE_COMPONENT_KEY, autoUpdate: wanted },
+                  });
+                }
+                return {
+                  status: ok ? 200 : 400,
+                  body: {
+                    ok,
+                    component: UPDATE_COMPONENT_KEY,
+                    autoUpdate: persisted,
+                    detail: ok
+                      ? `autoUpdate=${persisted} is persisted in this row's config`
+                      : `the write did not take: the row's config still holds autoUpdate=${String(live.autoUpdate)}`,
+                  },
+                };
+              });
+              if (outcome === undefined) return;
+              send(outcome.status, { ...outcome.body, update: updateState() });
+              return;
+            }
+
             if (!COMPONENTS[name]) {
               send(400, { ok: false, error: 'unknown_component', component: name });
               return;
@@ -800,6 +918,98 @@ export function apply(ctx, config) {
       );
     }
   }
+
+  /**
+   * The startup auto-update, wired to the switch the 版本管理 card writes.
+   *
+   * What this effect deliberately does NOT do is as important as what it does:
+   *
+   *   - **It never restarts.** `lib/core-restart.js` is not imported here. The install is staged
+   *     and the running process keeps the version it booted with, which is what 等待用户重启 means.
+   *   - **It never tells anyone.** No page event, no message, no proactive turn. The receipt in
+   *     `<root>/core/auto-update.json` is the only artefact, and the config page reads it only
+   *     when the user opens that page.
+   *   - **It never runs twice in one process.** The loader re-applies this row every time its
+   *     config is written — including the write the switch itself performs — so "once per start"
+   *     has to be a fact about the process. `runAutoUpdate` enforces it from the receipt's `pid`.
+   *   - **It never blocks the boot.** The check is scheduled and not awaited, so a registry that
+   *     takes 20 s to answer delays nothing the user is waiting for.
+   *
+   * The delay is not politeness: this row is composed of five components mounted by dynamic
+   * import, and replacing the package directory while those imports are still landing is the
+   * window that produced an empty bundle directory in 0.3.71. Three seconds is enough for the
+   * mount to finish on this machine and invisible to a user.
+   */
+  const installedCoreVersion = async (manager) => {
+    if (typeof manager?.listBundles !== 'function') {
+      return { version: '', reason: 'plugin_manager_unavailable' };
+    }
+    try {
+      const list = await manager.listBundles();
+      const entry = (Array.isArray(list) ? list : []).find((bundle) => bundle?.name === CORE_PACKAGE);
+      return entry?.version
+        ? { version: entry.version, availability: entry.availability }
+        : { version: '', reason: 'bundle_not_listed' };
+    } catch (error) {
+      return { version: '', reason: String(error?.message ?? error) };
+    }
+  };
+
+  ctx.effect(() => {
+    // With the switch off nothing at all is scheduled: no timer, no network, no callback. A
+    // feature that starts a timer on every mount and then decides to do nothing is silent only
+    // in the sense that nobody was watching the process.
+    if (liveConfig().autoUpdate !== true) return () => {};
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void (async () => {
+        // Read the switch at the moment of the check, not at apply time: the row's config is the
+        // live object the editor replaces, so a switch turned off before the timer fires wins.
+        if (liveConfig().autoUpdate !== true) return;
+        const manager = maybe('pluginManager');
+        const installed = await installedCoreVersion(manager);
+        const receipt = await runAutoUpdate({
+          root,
+          enabled: true,
+          installedVersion: installed.version,
+          runningVersion: coreVersion(),
+          install: (latest) => {
+            if (typeof manager?.installBundle !== 'function') {
+              throw Error('pluginManager.installBundle 不可用，未执行静默更新');
+            }
+            // The exact published tarball, so pnpm cannot resolve a different build by its own
+            // age rules — the same authority the manual path uses.
+            return manager.installBundle(latest.tarball, {
+              enabled: true,
+              registry: latest.registry,
+              requestId: randomUUID(),
+            });
+          },
+          record: (failure) =>
+            failures.record({
+              where: 'core/auto-update',
+              code: failure.code,
+              message: failure.message,
+              fields: failure.fields,
+            }),
+        });
+        if (cancelled) return;
+        // One line, only when something actually landed: a no-op start leaves its receipt and
+        // nothing else, which is what silence has to mean if it is to mean anything.
+        if (receipt.acted && receipt.ok) {
+          ctx.logger?.info?.(
+            `newmark-core: startup auto-update installed ${receipt.state?.to} (was ${receipt.state?.from}); waiting for a restart`,
+          );
+        }
+      })().catch((error) => {
+        ctx.logger?.warn?.('newmark-core: startup auto-update failed: ' + (error?.message ?? error));
+      });
+    }, AUTO_UPDATE_DELAY_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, 'newmark-core-auto-update');
 
   ctx.effect(
     () =>
