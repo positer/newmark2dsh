@@ -16,11 +16,50 @@
 # the same persona, the same project protocol, the same PTC presentation — and
 # differ only in whether it can reach the harness it runs inside. They are written
 # out separately because a preset is a declaration the registry mounts as written;
-# there is no inheritance to express "the same, minus these three rows".
+# there is no inheritance to express "the same, minus these rows".
+#
+# ALIGNED WITH THE INSTALLED HARNESS, NOT WITH THE HARNESS IT WAS COPIED FROM.
+# Both declarations began as copies of the shipped `cordis` preset at DSH 0.2.0-rc.2 and were
+# never re-derived, so every row the shipped presets later gained was missing here while every
+# row they dropped stayed. `evidence/20261017-preset-break/parity.md` measured that gap against
+# 0.2.1-rc.1 and it was left unfixed; the 0.2.2-rc.3 update widened it with a fifth row. What
+# the rows below now carry, and why each is present:
+#
+#   time-context       the step clock. Every shipped preset mounts it; `dsh-time-context`
+#                      injects a source-attributed time reading into the request history.
+#   tool-schedule      `schedule_create` / `_list` / `_view` / `_edit`. The host composes the
+#                      `dsh-schedule` service, and its own composition comment says the four
+#                      reminder tools "belong to the standard, cordis, and ptc presets, which
+#                      declare them in their own scope" — a preset that omits the row leaves
+#                      the service reachable by nothing.
+#   tool-office        `office_render` / `office_convert` / `office_recalculate`, admitted from
+#                      the step after an Office skill loads. `office-kit` and `skill-office` are
+#                      host-composed in every profile, so this needs no config to work.
+#   tool-executor-ptc  the PTC transport itself. `tool-agent-tool-presentation` is DEPRECATED in
+#                      0.2.2-rc.3 — its own module doc says to mount this executor directly — and
+#                      the shipped `ptc` preset mounts this row instead of the shim.
+#   tool-plugin-market `plugin_market`, a read-only listing of the configured plugin indexes.
+#                      The row waits for nothing: the tool is registered inside `ctx.inject`,
+#                      so on a profile without the market bundle the tool is simply absent.
+#
+# Dropped, because the 0.2.1 update dropped them from every shipped preset and nothing here
+# registers what they name: `tool-subagent-codex` and `tool-subagent-claude-code`. Neither row
+# could ever have mounted — 0.2.2-rc.3 has no `codex` or `claude-code` subagent provider
+# composed (the `dsh-subagent-codex` package is installed as a profile dependency but is not in
+# `dsh.profile.bundles`, and no claude-code package exists at all) — and both sat disabled, so
+# removing them changes no behaviour. Re-adding one means composing its provider first.
+#
+# Kept as deliberate differences from the shipped presets, each stated where it lives:
+#   * `tool-subagent-control` keeps the schema default `interrupt: true`, so `interrupt_agent`
+#     exists; the shipped presets pass `interrupt: false`.
+#   * `workflow-ptc` / `tool-workflow` stay disabled, matching the shipped `ptc` preset, because
+#     this preset presents PTC.
+#   * `tool-ralph` stays declared and disabled: its package is still installed and its row is a
+#     capability a patch can enable, not a reference to something gone.
 #
 # `preset-dev` is the *creator mode*: it carries the same kernel-modification
 # capability the shipped `cordis` preset ("创造模式" / Creator mode) grants. That
-# capability is exactly three rows, and all three come from
+# capability is four rows, and all four come from
 # `@deepseek-ai/dsh-web-app/presets/cordis.patch.yml`:
 #
 #   tool-cordis          runtime inspection of the live composition
@@ -30,11 +69,14 @@
 #                        plugin and agent-preset development guidance
 #   tool-plugin-manager  persistent plugin management, under the same
 #                        `!ctx.get('profileContext')` gate the shipped preset uses
+#   tool-plugin-market   the market listing that manager installs from, under the same
+#                        gate — a market whose install verb is disabled is useless, so the
+#                        pair goes together (and the shipped `standard` preset disables both)
 #
 # `preset-rdev` ("restricted developer") has none of them, and `disabled` on its
-# `tool-plugin-manager` stays a literal `true` rather than a gate. The difference
-# between the two declarations is asserted mechanically, row by row, by
-# `verify-newmark-core.mjs` — see the note above `preset-rdev`.
+# `tool-plugin-manager` and `tool-plugin-market` stays a literal `true` rather than a
+# gate. The difference between the two declarations is asserted mechanically, row by
+# row, by `verify-newmark-core.mjs` — see the note above `preset-rdev`.
 #
 # A "mode" is a tool list, not a privilege: what a model may actually change is
 # still decided by the session's sandbox and approval settings. What these rows
@@ -58,7 +100,7 @@
       config:
         id: dev
         name: Dev
-        description: 'PTC 模式 + 项目管理 + 创造模式内核修改权限：读取并维护 README.md、OVERVIEW.md、taste.md 与 archive/ 的最新状态，并可运行时检查 DSH 组合、开发与持久化管理插件和 Agent 预设。'
+        description: 'PTC 模式 + 项目管理 + 创造模式内核修改权限：读取并维护 README.md、OVERVIEW.md、taste.md 与 archive/ 的最新状态；具备时间上下文、定时任务与 Office 文档能力，可运行时检查 DSH 组合、开发与持久化管理插件、读取插件市场并管理 Agent 预设。'
         order: 2.5
         plugins:
           # --- dev identity: this is where the extra constraints live ---------
@@ -97,6 +139,10 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+          # The clock: a durable, source-attributed time reading per eligible step, as every
+          # shipped preset has. Without it the agent infers "now" from timestamps it never sees.
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'
             disabled: !!js process.platform === 'win32'
@@ -111,6 +157,10 @@
               sampleOverCapGlobResults: false
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
+          # schedule_create / schedule_list / schedule_view / schedule_edit over the host's own
+          # `schedule` service.
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
           # --- 创造模式内核修改权限: the composition-skills guidance -------------
           # The shipped creator mode contributes exactly this directory; without it
           # a Dev session has the `skill` tool but not the composition skills that
@@ -189,22 +239,6 @@
                 config:
                   provider: fork
                   toolName: subagent_fork
-              - id: tool-subagent-codex
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: codex
-                  toolName: subagent_codex
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
-              - id: tool-subagent-claude-code
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: claude-code
-                  toolName: subagent_claude_code
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
                 disabled: true
@@ -238,12 +272,19 @@
           - id: tool-cordis
             name: '@deepseek-ai/dsh-tool-cordis'
           # --- PTC mode: the model sees `run_code` plus a generated SDK ------
-          - id: tool-presentation
-            name: '@deepseek-ai/dsh-agent-tool-presentation'
-            config:
-              mode: ptc
+          # Mounted directly since 0.3.83. `tool-agent-tool-presentation` is a DEPRECATED
+          # compatibility shim in 0.2.2-rc.3 — it only does `ctx.plugin(mode === 'native' ?
+          # NativeToolExecutor : PtcToolExecutor)` — and the shipped `ptc` preset mounts this row
+          # itself. Same executor, one less deprecated layer to remove later.
+          - id: tool-executor-ptc
+            name: '@deepseek-ai/dsh-tool-executor-ptc'
           - id: present
             name: '@deepseek-ai/dsh-tool-present'
+          # office_render / office_convert / office_recalculate. The three tools are admitted from
+          # the step after one of the default activation skills loads, so the row is inert until
+          # the session reads a document — which is why it is declared rather than discovered.
+          - id: tool-office
+            name: '@deepseek-ai/dsh-tool-office'
           # --- 创造模式内核修改权限: persistent plugin management ----------------
           # Install, enable, disable and remove bundles and plugins, and read the
           # reason a row is not addressable. The gate is the shipped creator
@@ -254,27 +295,37 @@
           - id: tool-plugin-manager
             name: '@deepseek-ai/dsh-plugin-manager/tools'
             disabled: !!js "!ctx.get('profileContext')"
+          # `plugin_market` answers what the configured indexes offer, and a result carries the
+          # exact install target for `plugin_manager`. Same gate as the manager above: a market
+          # this build cannot install from is a list of things it cannot do. The row never waits
+          # for the service — `dsh-plugin-market` registers the tool inside `ctx.inject`, so on a
+          # profile without the market bundle the tool is absent rather than pending.
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: !!js "!ctx.get('profileContext')"
 
     # ── rDev: restricted developer ─────────────────────────────────────────
-    # The same agent as `preset-dev` with the three kernel-modification rows
+    # The same agent as `preset-dev` with the kernel-modification capability
     # removed, so it can work on a project but cannot reach the harness it runs
     # inside: no `tool-cordis`, no `customSkillDirs`, and `tool-plugin-manager`
-    # back to an unconditional `disabled: true`.
+    # plus `tool-plugin-market` back to an unconditional `disabled: true`. The
+    # market row goes with the manager because a market listing whose install
+    # verb is disabled is a list of things this preset cannot do.
     #
     # The identity half is REPEATED rather than referenced. A preset is a
     # declaration and the registry mounts it as written — there is no inheritance
-    # between rows — so the only honest way to say "Dev without these three rows"
-    # is to write that list out. What keeps the copy from drifting is a gate, not
+    # between rows — so the only honest way to say "Dev without these rows" is to
+    # write that list out. What keeps the copy from drifting is a gate, not
     # discipline: `verify-newmark-core.mjs` diffs the two presets row by row and
-    # requires the difference to be exactly the three capability changes — the
-    # missing `tool-cordis` row, the missing `customSkillDirs`, and a
-    # `tool-plugin-manager` whose `disabled` stays a literal `true`.
+    # requires the difference to be exactly these changes — the missing
+    # `tool-cordis` row, the missing `customSkillDirs`, and two rows whose
+    # `disabled` is a literal `true` instead of the shipped `profileContext` gate.
     - id: preset-rdev
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: rdev
         name: rDev
-        description: 'restricted developer：与 Dev 完全相同的 PTC 模式 + 项目管理（README/OVERVIEW/taste/archive 立档协议），但没有创造模式内核修改权限——不检查运行时 DSH 组合、不持久化管理插件、不加载组合开发指引。'
+        description: 'restricted developer：与 Dev 完全相同的 PTC 模式 + 项目管理（README/OVERVIEW/taste/archive 立档协议）、时间上下文、定时任务与 Office 文档能力，但没有创造模式内核修改权限——不检查运行时 DSH 组合、不持久化管理插件、不读取插件市场、不加载组合开发指引。'
         order: 2.6
         plugins:
           - id: persona
@@ -312,6 +363,10 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+          # The clock: a durable, source-attributed time reading per eligible step, as every
+          # shipped preset has. Without it the agent infers "now" from timestamps it never sees.
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'
             disabled: !!js process.platform === 'win32'
@@ -326,6 +381,10 @@
               sampleOverCapGlobResults: false
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
+          # schedule_create / schedule_list / schedule_view / schedule_edit over the host's own
+          # `schedule` service.
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
           - id: skill-filesystem
             name: '@deepseek-ai/dsh-skill-filesystem'
           - id: tool-skill
@@ -397,22 +456,6 @@
                 config:
                   provider: fork
                   toolName: subagent_fork
-              - id: tool-subagent-codex
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: codex
-                  toolName: subagent_codex
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
-              - id: tool-subagent-claude-code
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: claude-code
-                  toolName: subagent_claude_code
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
                 disabled: true
@@ -439,17 +482,29 @@
               fetch: true
               searchTimeoutMs: 60000
           # --- PTC mode: the model sees `run_code` plus a generated SDK ------
-          - id: tool-presentation
-            name: '@deepseek-ai/dsh-agent-tool-presentation'
-            config:
-              mode: ptc
+          # Mounted directly since 0.3.83. `tool-agent-tool-presentation` is a DEPRECATED
+          # compatibility shim in 0.2.2-rc.3 — it only does `ctx.plugin(mode === 'native' ?
+          # NativeToolExecutor : PtcToolExecutor)` — and the shipped `ptc` preset mounts this row
+          # itself. Same executor, one less deprecated layer to remove later.
+          - id: tool-executor-ptc
+            name: '@deepseek-ai/dsh-tool-executor-ptc'
           - id: present
             name: '@deepseek-ai/dsh-tool-present'
-          # Off on purpose, unconditionally: this row is the whole difference
-          # between rDev and Dev, and rDev must not manage the plugins that make
-          # up the harness it is running inside.
+          # office_render / office_convert / office_recalculate. The three tools are admitted from
+          # the step after one of the default activation skills loads, so the row is inert until
+          # the session reads a document — which is why it is declared rather than discovered.
+          - id: tool-office
+            name: '@deepseek-ai/dsh-tool-office'
+          # Off on purpose, unconditionally: this pair is the whole difference between rDev and
+          # Dev, and rDev must not manage the plugins that make up the harness it is running
+          # inside. Both rows follow the shipped `standard` preset, which disables them with a
+          # literal `true` for the same reason — listing a market you cannot install from is a
+          # capability without an effect.
           - id: tool-plugin-manager
             name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
             disabled: true
 
 # The presets above are only *declared* by this bundle; this is what selects one, so a
