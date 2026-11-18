@@ -113,6 +113,13 @@ const GOAL_RESTORE_ATTEMPTS = 30;
  * disarmed at 01:28:13), so a one-shot restore at boot can miss the very window it exists for. */
 const GOAL_RESTORE_WINDOW_MS = 180000;
 const ADOPT_LIMIT = 8;
+/* THE REQUESTER IS ALWAYS WOKEN (0.3.84). A restart takes this process down; if the conversation that
+ * asked for it receives no continuation, the work it was doing dies with the process and the user is
+ * left looking at a dead turn. So the restart REGISTERS a continuation for the requester whether or
+ * not the caller named one, and this is the text it uses when none was named. It is exported so the
+ * tool layer describes the same sentence it applies - a description that paraphrases the default is a
+ * second copy of it, free to drift. */
+export const RESTART_DEFAULT_PROMPT = 'DSH已重启，继续完成当前任务';
 
 export function createHeartBeat({ root, agents, goals = () => null, controller = createRestartController(root), probe = probeDesktop, pid = process.pid, version, logger, now = Date.now }) {
   const failures = createErrorLog({root,logger});
@@ -179,8 +186,22 @@ export function createHeartBeat({ root, agents, goals = () => null, controller =
   };
   const liveAgents = () => {
     const service = agents();
-    if (!service || typeof service.roots !== 'function') return null;
-    return service.roots().map(agent => ({ agent, view: identity(agent) })).filter(entry => entry.view);
+    if (!service) return null;
+    /* DSH 0.2.2-rc.3 REMOVED `AgentRegistry.roots()`; the registry now exposes
+     * `list(): Agent[]` — "All live agents, in registration order" — and `get(id)`. Requiring
+     * `roots` therefore made every reader of this function answer "agents unavailable" on the
+     * installed host: not an error, a silently dead capability. Measured 2026-11-17 22:28 on
+     * 0.2.2-rc.3 (`dsh-agent/src/index.ts` contains no `roots` at all). Both are accepted, in the
+     * order the installed host supports, so a deployment that still has `roots` keeps working. */
+    const read = typeof service.list === 'function'
+      ? () => service.list()
+      : typeof service.roots === 'function'
+        ? () => service.roots()
+        : null;
+    if (read === null) return null;
+    const entries = read();
+    if (!Array.isArray(entries)) return null;
+    return entries.map(agent => ({ agent, view: identity(agent) })).filter(entry => entry.view);
   };
 
   /* ------------------------------------------------------- goal continuity --- */
@@ -283,7 +304,13 @@ if (!service || typeof service.resume !== 'function' || typeof service.get !== '
   if (goalRestoreAttempts >= GOAL_RESTORE_ATTEMPTS) {
     store.change((s) => {
       s.schema = 3;
-      s.goalRestore = { ...(s.goalRestore || {}), settled: true, closed_reason: 'services_unavailable', attempts: goalRestoreAttempts, at: s.goalRestore?.at ?? now(), deadline: s.goalRestore?.deadline ?? now(), mode: snapshot ? 'snapshot' : 'boot_sweep', events: s.goalRestore?.events || [], resumed: s.goalRestore?.resumed || [], skipped: s.goalRestore?.skipped || [], resumed_count: s.goalRestore?.resumed_count || 0, skipped_count: (s.goalRestore?.skipped || []).length };
+      /* The receipt MUST be readable by this function's own reader (`:270-276`): it accepts a record
+       * only when `bootPid === pid`, `events` and `candidates` are arrays. This settle write used to
+       * carry none of the three, so the next tick discarded it, incremented the counter and wrote
+       * again - an error line every 2 s forever (measured 2026-11-17 22:28: 224 lines in 448 s,
+       * attempts past 225, `errors.jsonl` 26.7 MB). `candidates: []` is the truth here: no agent was
+       * read, so there was nothing to restore. */
+      s.goalRestore = { ...(s.goalRestore || {}), schema: 3, bootPid: pid, settled: true, closed_reason: 'services_unavailable', attempts: goalRestoreAttempts, at: s.goalRestore?.at ?? now(), deadline: s.goalRestore?.deadline ?? now(), mode: snapshot ? 'snapshot' : 'boot_sweep', events: s.goalRestore?.events || [], candidates: s.goalRestore?.candidates || [], resumed: s.goalRestore?.resumed || [], skipped: s.goalRestore?.skipped || [], resumed_count: s.goalRestore?.resumed_count || 0, skipped_count: (s.goalRestore?.skipped || []).length };
     });
     failures.record({ where: 'heartbeat/goal-restore', code: 'services_unavailable', message: 'goal restore could not read the goal service or the agent registry', fields: { attempts: goalRestoreAttempts } });
   }
@@ -303,7 +330,9 @@ if (!loadedNow.length && !existing) {
   if (goalRestoreAttempts < GOAL_RESTORE_ATTEMPTS) return { state: 'waiting', attempts: goalRestoreAttempts, agents_loaded: (live || []).length };
   store.change((s) => {
     s.schema = 3;
-    s.goalRestore = { at: now(), deadline: now(), mode: snapshot ? 'snapshot' : 'boot_sweep', settled: true, closed_reason: 'agents_never_loaded', attempts: goalRestoreAttempts, agents_loaded: (live || []).length, events: [], resumed: [], skipped: [] };
+    /* Same readability rule as the settle above: without `bootPid` this receipt is discarded by the
+     * next tick and the "agents never loaded" give-up becomes an endless loop. */
+    s.goalRestore = { schema: 3, bootPid: pid, at: now(), deadline: now(), mode: snapshot ? 'snapshot' : 'boot_sweep', settled: true, closed_reason: 'agents_never_loaded', attempts: goalRestoreAttempts, agents_loaded: (live || []).length, events: [], candidates: (candidates || []).map(entry => ({ ...entry })), resumed: [], skipped: [] };
   });
   return { state: 'gave_up' };
 }
@@ -435,6 +464,27 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
     const modelSelection=conversationModel(agent);
     const id = randomUUID(); store.change(s => { if(s.tasks.length >= 2000) throw Error('heartBeat 任务队列已达容量上限'); s.tasks.push({ id, prompt, destination, status: 'waiting', created: Date.now(), creatorPid: pid, ...options.kind ? { kind: options.kind } : {},...modelSelection?{modelSelection}:{} }); }); return { ok: true, id, destination };
   };
+  /**
+   * Make sure the conversation that asked for the restart has exactly one continuation.
+   *
+   * Called at restart time, not left to the caller: "wake me afterwards" is not an option a caller
+   * can forget to take, because forgetting it does not fail - it silently stops the work the restart
+   * was asked for. A continuation the caller DID register is reused rather than duplicated (the same
+   * promise with two ids would wake the conversation twice), and the text is the caller's or
+   * RESTART_DEFAULT_PROMPT.
+   */
+  function ensureRequesterContinuation(sessionId, prompt, agent) {
+    if (typeof sessionId !== 'string' || sessionId === '') return { ok: false, registered: false, reason: 'no_requester' };
+    const text = typeof prompt === 'string' && prompt.trim() !== '' ? prompt : RESTART_DEFAULT_PROMPT;
+    const existing = store.read().tasks.find(t => t.destination === sessionId && (t.status === 'waiting' || t.status === 'armed'));
+    if (existing) {
+      /* Reuse, but do not let a caller-named prompt be silently ignored: a registered continuation
+       * whose text differs is the caller's own earlier decision and keeps it. */
+      return { ok: true, registered: true, reused: true, id: existing.id, prompt: existing.prompt };
+    }
+    const created = enqueue(text, sessionId, agent);
+    return { ok: true, registered: true, reused: false, id: created.id, prompt: text };
+  }
   const schedule = (prompt, destination, execution, options = {}) => {
     if (execution) destination = currentConversation(execution);
     const registered = enqueue(prompt, destination, execution?.agent, options);
@@ -562,6 +612,9 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
       id: randomUUID(), requesterSessionId, requesterPid: pid, createdAt: at, updatedAt: at,
       deadline: at + ackTimeoutMs, ackMode, onTimeout, force: options.force === true, reason,
       requesterModel: requester ? conversationModel(requester.agent) : null,
+      /* The requester's own continuation text, so the receipt it did not give at commit time can be
+       * completed with the words it chose on heartbeat_restart (0.3.84). */
+      requesterPrompt: typeof options.prompt === 'string' && options.prompt.trim() !== '' ? options.prompt : null,
       phase: 'preparing', ticket: null, folder: null, committedAt: null, delivery: null,
       participants: participants.map(entry => ({ ...entry.view, ack: 'pending', ackSource: null, ackAt: null, note: null })),
     };
@@ -601,7 +654,18 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
       // unless the requester chose 'proceed', it aborts and the host keeps running.
       if (at > intent.deadline && !proceed) return abort('deadline_exceeded');
       const requester = participantOf(store.read().intent, requesterSessionId);
-      if (!requester || requester.ack !== 'registered') return abort('requester_not_registered');
+      if (!requester) return abort('requester_not_registered');
+      if (requester.ack !== 'registered') {
+        /* THE REQUESTER IS WOKEN EVEN IF IT NEVER SAID SO (0.3.84). This used to abort the commit
+         * with requester_not_registered, which turned "the requester forgot to register" into "the
+         * restart does not happen" - and, with force, into a restart that left that conversation
+         * dead. Register what it did not, with the prompt it named on heartbeat_restart, then record
+         * the receipt as this component's own (`ackSource: 'auto'`) rather than dressing it as one
+         * the requester gave. */
+        const ensured = ensureRequesterContinuation(requesterSessionId, intent.requesterPrompt, null);
+        if (!ensured.ok) return abort('requester_not_registered');
+        ack(requesterSessionId, 'registered', 'auto', intent.id);
+      }
       const missing = pendingOf(store.read().intent);
       if (missing.length && !(proceed && at > intent.deadline)) return abort('missing_acks');
     }
@@ -742,7 +806,7 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
   return {
     state: status, schedule, stop() { stopped = true; },
     prepare: targetVersion => controller.prepare(targetVersion),
-    async restart(ticket, update = false) {
+    async restart(ticket, update = false, options = {}) {
       const goalSnapshot = captureGoalSnapshot(update ? 'update' : 'immediate');
       const helper = await controller.restart(ticket);
       /* NO COMPANION REPORT ON AN UPDATE RESTART (0.3.79). An update restart used to schedule a
@@ -764,10 +828,17 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
           catch (error) { failures.record({ where: 'heartbeat/update', code: error.code || 'continuation_failed', message: String(error.message), fields: { sessionId: entry.view.sessionId } }); }
         }
       }
+      /* THE REQUESTER, ALWAYS (0.3.84). Registered after the helper is launched and before the
+       * returned commit() can arm anything, so the continuation this restart exists for cannot be
+       * lost to an ordering slip. A plain forced restart used to register NOTHING: the process went
+       * down and the conversation that asked for it simply stopped - measured 2026-11-17, where the
+       * requester's only continuation existed because the caller had registered one by hand. */
+      const requester = ensureRequesterContinuation(options.requesterSessionId ?? null, options.prompt, options.requesterAgent ?? null);
       let finished = false;
       return {
         folder: helper.folder,
         continued,
+        requester,
         commit() {
           if (finished) return;
           store.change(s => { for (const t of s.tasks) if (t.status === 'waiting') Object.assign(t, { status: 'armed', restartPid:pid, folder: helper.folder }); });
@@ -776,11 +847,12 @@ return { state: record.settled ? 'settled' : 'watching', receipt: record, resume
         cancel() { if (!finished) { finished = true; helper.cancel(); } },
       };
     },
-    async globalRestart() {
+    async globalRestart(options = {}) {
       // An open barrier is a promise to other conversations; an immediate restart would break it.
       const running = activeIntent();
       if (running) throw Error('已有一个进行中的两阶段重启准备（intentId=' + running.id + '），请先提交或等它结束');
-      const prepared = await controller.prepare(installedVersion()); return this.restart(prepared.ticket);
+      const prepared = await controller.prepare(installedVersion());
+      return this.restart(prepared.ticket, false, options);
     },
     /**
      * Restore THIS conversation's goal, in any host turn, and do nothing else.

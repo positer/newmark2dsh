@@ -63,25 +63,65 @@ try {
   Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
   Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
 
-  # Wait until the Electron profile is actually released. The identity wait above only covers
-  # the tree frozen before the kill; a helper that outlives it keeps the user-data lock, and the
-  # replacement then exits within a second. Measured 2026-10-27 12:31:16: status.json said
-  # "DSH exited during startup ()" and the user had to launch the app by hand.
+  # A REPLACEMENT THAT IS ALREADY UP IS THE RESTART SUCCEEDING, NOT THE OLD TREE LINGERING.
+  #
+  # This used to ask "is there ANY process whose ExecutablePath is the host's" and throw after 20 s
+  # otherwise. That question cannot tell "the frozen tree is still dying" from "something already
+  # brought the app back", because both are the same executable path - and measured 2026-11-17 22:26
+  # it answered the second case with the first case's verdict: the app was running again at 22:26:43,
+  # the helper wrote "Old DSH processes still hold the profile; no replacement launched" at 22:27:12,
+  # launched nothing at all (its desktop.stdout.log stayed 0 bytes), and the user had to start DSH by
+  # hand. A stop this component requested must end with a host, never with that sentence.
+  #
+  # The frozen tree is the only thing that can be "old"; anything alive on that path after it is gone
+  # is a replacement. So: the old tree must be gone (identity), and a same-path process that is NOT in
+  # it is the replacement - reported as running instead of being mistaken for a blocker.
   $deadline=[DateTime]::UtcNow.AddSeconds(20)
+  $replacement=@()
   do {
-    $samePath=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $job.owner.path })
-    if (!$samePath.Count) { break }
-    if ([DateTime]::UtcNow -gt $deadline) { throw 'Old DSH processes still hold the profile; no replacement launched' }
+    $left=@($targets | Where-Object {SameProcess $_})
+    if ($left.Count) {
+      if ([DateTime]::UtcNow -gt $deadline) { throw 'Old DSH processes did not exit; no duplicate instance started' }
+      Start-Sleep -Milliseconds 100
+      continue
+    }
+    $replacement=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $job.owner.path -and $_.CommandLine -notmatch '--type=' })
+    if ($replacement.Count) { break }
+    if ([DateTime]::UtcNow -gt $deadline) { break }
     Start-Sleep -Milliseconds 200
   } while ($true)
+  if ($replacement.Count) {
+    # Wait for the replacement to be usable before saying so, but never turn its existence into a
+    # failure: the host is already coming up, and a continuation delivered to a host still booting is
+    # retried by the new process, while a "failed" receipt stops it from ever being delivered.
+    $deadline=[DateTime]::UtcNow.AddSeconds(60)
+    do {
+      $window=@(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
+      if ($window.Count -gt 0) { break }
+      if ([DateTime]::UtcNow -gt $deadline) { break }
+      Start-Sleep -Milliseconds 300
+    } while ($true)
+    $windows=@(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }).Count
+    Status 'running' "A replacement host was already running after the stop; no duplicate launched (visible windows: $windows)"
+    exit 0
+  }
 
   # One launch is not evidence. A launcher that re-execs exits and leaves the real host behind,
   # so readiness is judged by the host itself - its stdout line or its window - not by the pid we
-  # happened to start. A launch that dies with nothing left behind is retried, bounded.
+  # happened to start.
+  #
+  # RESTART IS NOT AN OPTION (0.3.84). This loop used to stop after three attempts and throw
+  # "DSH did not become ready after 3 attempt(s)", leaving the user to start the app by hand - but
+  # the process is already down by then, so "failed" is not a safe end state: it is the exact state
+  # the restart was supposed to leave behind. The window is now a MANDATORY five minutes: as long as
+  # the executable exists, the helper keeps relaunching. A helper that cannot start the app at all
+  # (missing executable, refused launch on every attempt) still reports failed, because claiming a
+  # host exists when it does not would be worse than saying so.
   $attempts=0; $ready=$false; $lastDetail=''
-  while ($attempts -lt 3 -and !$ready) {
+  $mandatory=[DateTime]::UtcNow.AddSeconds(300)
+  while (!$ready -and [DateTime]::UtcNow -lt $mandatory) {
     $attempts++
-    Status 'starting' "Launching the installed desktop executable (attempt $attempts of 3)"
+    Status 'starting' "Launching the installed desktop executable (attempt $attempts)"
     # NOT -WindowStyle Hidden for the app itself. Measured 2026-10-27 12:35:31: the host came back
     # with the HTTP server up and ZERO visible windows, because this Electron build creates its
     # first window with the startup show state it was given. The helper stays hidden; the app must
@@ -99,10 +139,11 @@ try {
       if ($started.HasExited -and !$alive.Count) { $lastDetail="launched process exited ($($started.ExitCode)) with no host left behind"; break }
       Start-Sleep -Milliseconds 300
     } while ([DateTime]::UtcNow -lt $deadline)
-    if (!$ready -and $attempts -lt 3) { Start-Sleep -Seconds 2 }
+    if (!$ready -and !(Test-Path -LiteralPath $job.owner.path)) { throw "DSH executable missing: $($job.owner.path)" }
+    if (!$ready) { Start-Sleep -Seconds 3 }
   }
   if ($ready) { Status 'running' "DSH host ready after $attempts attempt(s)"; exit 0 }
-  throw "DSH did not become ready after $attempts attempt(s): $lastDetail"
+  throw "DSH did not become ready after $attempts attempt(s) in the five-minute window: $lastDetail"
 } catch {
   Status 'failed' $_.Exception.Message
   exit 1

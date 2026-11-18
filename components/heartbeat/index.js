@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { createHeartBeat } from './component.js';
+import { createHeartBeat, RESTART_DEFAULT_PROMPT } from './component.js';
 import { resolveRoot } from '../../lib/root.js';
 import { embedJson } from '../../lib/embed.js';
 import { currentConversation } from '../../lib/conversation-delivery.js';
@@ -23,8 +23,11 @@ export function apply(ctx, config) {
     return () => { clearTimeout(timer); helper.cancel(); };
   }, label);
   ctx.effect(() => ctx.tools.register({ name: 'heartbeat_after_restart', description: '目标不需要手动设置：本组件在重启前记录所有活动对话的目标状态，重启后自动恢复当时 active 的目标；只有自动恢复没成功而 get_goal 仍显示 active+disarmed 时，才用 goal_restore 补一次。不要用原生 create_goal 或 update_goal 去做这件事——自动续跑轮里它们必被拒（requires a direct human turn on a top-level agent），而且它们能改写目标、goal_restore 不能。 Register a durable post-restart task for this conversation only. Target identity is taken from the host, never from arguments. Pass intentId to make the same call this conversation\'s continuation receipt for an open two-phase restart.',
-    parameters: { type: 'object', properties: { prompt: { type: 'string', maxLength: 16000 }, intentId: { type: 'string', maxLength: 100 } }, required: ['prompt'], additionalProperties: false }, output,
-    execute: (a, e) => beat.schedule(a.prompt, currentConversation(e), e, { intentId: a.intentId }),
+    parameters: { type: 'object', properties: {
+      prompt: { type: 'string', maxLength: 16000, description: 'What this conversation should be told to do after the restart. Omit it to use the standard sentence ' + JSON.stringify(RESTART_DEFAULT_PROMPT) + ' — a restart always wakes this conversation, and this only decides the words it wakes up to.' },
+      intentId: { type: 'string', maxLength: 100 },
+    }, additionalProperties: false }, output,
+    execute: (a, e) => beat.schedule(typeof a.prompt === 'string' && a.prompt.trim() !== '' ? a.prompt : RESTART_DEFAULT_PROMPT, currentConversation(e), e, { intentId: a.intentId }),
   }), 'heartbeat-task-tool');
   ctx.effect(() => ctx.tools.register({ name: 'heartbeat_activity', description: '目标不需要手动设置：本组件在重启前记录所有活动对话的目标状态，重启后自动恢复当时 active 的目标（heartbeat_activity 的 goal_restore 回执）；只有自动恢复没成功、而 get_goal 仍显示 paused 或 active+disarmed 时，才调用 goal_restore 补一次。不要用原生 create_goal 或 update_goal 做恢复——自动续跑轮里它们必被拒（requires a direct human turn on a top-level agent），而且它们能改写目标、goal_restore 不能。 Read-only: which OTHER conversations are running right now. Call it before deciding how to restart — heartbeat_restart refuses to restart until it has reported this, so use it to decide between force:true (nobody else is running, or you accept interrupting them) and broadcast:true (wait for every running conversation to register its continuation).',
     parameters: { type: 'object', properties: {}, additionalProperties: false }, output,
@@ -42,7 +45,7 @@ export function apply(ctx, config) {
     parameters: { type: 'object', properties: {}, additionalProperties: false }, output,
     execute: (a, e) => beat.restoreGoal(e),
   }), 'heartbeat-goal-restore-tool');
-  ctx.effect(() => ctx.tools.register({ name: 'heartbeat_restart', description: '目标不需要手动设置：本组件在重启前记录所有活动对话的目标状态，重启后自动恢复当时 active 的目标（heartbeat_activity 的 goal_restore 回执）；只有自动恢复没成功、而 get_goal 仍显示 paused 或 active+disarmed 时，才调用 goal_restore 补一次。不要用原生 create_goal 或 update_goal 做恢复——自动续跑轮里它们必被拒（requires a direct human turn on a top-level agent），而且它们能改写目标、goal_restore 不能。 Request a global DSH restart. IMPORTANT: the first call does NOT restart — it returns { code:"confirmation_required", activity } listing the OTHER conversations running right now, and you then decide: call again with force:true to restart now (interrupting them), or with broadcast:true to open the two-phase barrier and wait for every running conversation to register its continuation. With broadcast=false and force=false nothing restarts and previously registered tasks are delivered once the new desktop host is ready. With broadcast=true this only OPENS a two-phase restart: every running conversation is told to register a continuation, the call returns phase "preparing" with the participants, and nothing restarts until heartbeat_restart_commit is called and the receipts are in.',
+  ctx.effect(() => ctx.tools.register({ name: 'heartbeat_restart', description: '目标不需要手动设置：本组件在重启前记录所有活动对话的目标状态，重启后自动恢复当时 active 的目标（heartbeat_activity 的 goal_restore 回执）；只有自动恢复没成功、而 get_goal 仍显示 paused 或 active+disarmed 时，才调用 goal_restore 补一次。不要用原生 create_goal 或 update_goal 做恢复——自动续跑轮里它们必被拒（requires a direct human turn on a top-level agent），而且它们能改写目标、goal_restore 不能。 Request a global DSH restart. IMPORTANT: the first call does NOT restart — it returns { code:"confirmation_required", activity } listing the OTHER conversations running right now, and you then decide: call again with force:true to restart now (interrupting them), or with broadcast:true to open the two-phase barrier and wait for every running conversation to register its continuation. THE CALLING CONVERSATION IS ALWAYS WOKEN AFTERWARDS: a continuation is registered for it whether or not you pass `prompt` (omitted => "DSH已重启，继续完成当前任务"), and a continuation you already registered with heartbeat_after_restart is reused rather than duplicated. With broadcast=false and force=false nothing restarts and previously registered tasks are delivered once the new desktop host is ready. With broadcast=true this only OPENS a two-phase restart: every running conversation is told to register a continuation, the call returns phase "preparing" with the participants, and nothing restarts until heartbeat_restart_commit is called and the receipts are in.',
     parameters: { type: 'object', properties: {
       broadcast: { type: 'boolean', description: 'true opens the two-phase barrier instead of restarting now.' },
       ackMode: { type: 'string', enum: ['auto', 'agent'], description: "auto (default) registers a continuation for every running conversation without spending a model call; agent delivers a notification into each conversation and waits for that conversation's own heartbeat_after_restart or heartbeat_restart_ack." },
@@ -50,6 +53,7 @@ export function apply(ctx, config) {
       onTimeout: { type: 'string', enum: ['abort', 'proceed'], description: "abort (default) refuses the restart and names the conversations that never answered; proceed restarts anyway and records them." },
       force: { type: 'boolean', description: 'Skip the barrier checks for this intent. The intent records that it was forced.' },
       reason: { type: 'string', maxLength: 200, description: 'Why this restart is being requested, recorded with the intent.' },
+      prompt: { type: 'string', maxLength: 16000, description: 'What the conversation that asks for the restart should be told to do once the new host is up. It is registered whether or not you pass it: with this text when you do, ' + JSON.stringify(RESTART_DEFAULT_PROMPT) + ' when you do not.' },
     }, additionalProperties: false }, output,
     async execute(a, execution) {
       currentConversation(execution);
@@ -79,9 +83,16 @@ export function apply(ctx, config) {
               : '无法确认是否有其他对话在运行（agents 服务不可用）。要重启必须显式 force:true，并自行承担打断的风险。',
           };
         }
-        const helper = await beat.globalRestart();
+        /* THE REQUESTER IS ALWAYS CONTINUED (0.3.84). Identity comes from the authenticated
+         * execution and the text from the caller or RESTART_DEFAULT_PROMPT; neither is optional, so a
+         * conversation cannot ask for a restart that stops its own work and never comes back. */
+        const helper = await beat.globalRestart({
+          requesterSessionId: currentConversation(execution),
+          requesterAgent: execution?.agent ?? null,
+          prompt: a.prompt,
+        });
         commitAfterResponse(helper, 'heartbeat-confirmed-restart');
-        return { ok: true, restarting: true, forced: true, activity: probe };
+        return { ok: true, restarting: true, forced: true, activity: probe, requester: helper.requester };
       }
       return beat.beginBarrier(a, execution);
     },
