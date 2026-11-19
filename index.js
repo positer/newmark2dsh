@@ -969,14 +969,25 @@ export function apply(ctx, config) {
   const releaseAgeState = durableState(path.join(root, 'core', 'release-age.json'), { version: 1 });
   const ensureReleaseAge = async () => {
     const located = locateProfileDir(fileURLToPath(new URL('./', import.meta.url)));
-    if (!located.ok) return { ok: false, reason: located.reason };
-    const answer = await ensureSelfExemption({ profileDir: located.dir });
-    const receipt = { ...answer, profileDir: located.dir, pid: process.pid };
-    // A repair that worked must not fail because its receipt could not be written, and a run that
-    // changed nothing must not rewrite the receipt that says when the profile was last repaired.
-    if (answer.changed || !answer.ok) {
-      try { releaseAgeState.change((current) => { current.last = receipt; }); } catch { /* receipt only */ }
-    }
+    const answer = located.ok
+      ? await ensureSelfExemption({ profileDir: located.dir })
+      : { ok: false, reason: located.reason };
+    const receipt = {
+      ...answer,
+      profileDir: located.ok ? located.dir : null,
+      pid: process.pid,
+      checkedAt: new Date().toISOString(),
+    };
+    /**
+     * The receipt is written on EVERY pass, including one that changed nothing.
+     *
+     * MEASURED 2026-11-19, after the 0.3.85 restart: the file did not exist, because the pass found
+     * the entry already correct and wrote nothing. That made "the mount-time check ran and found
+     * the profile correct" and "the check never ran" the same observation — the exact blind spot a
+     * receipt exists to remove. A write that fails is still only a receipt problem: a repair that
+     * worked must not fail because its evidence could not be stored.
+     */
+    try { releaseAgeState.change((current) => { current.last = receipt; }); } catch { /* receipt only */ }
     if (answer.changed) {
       ctx.logger?.info?.(
         `newmark-core: profile ${RELEASE_AGE_KEY} now names ${SELF_PACKAGE} alone (removed ${(answer.removed ?? []).length} version-pinned entries); other packages' entries untouched`,
