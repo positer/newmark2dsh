@@ -49,7 +49,11 @@ import { schema } from './lib/schema.js';
 import { defaultRoot, resolveRoot } from './lib/root.js';
 import { embedJson } from './lib/embed.js';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { CORE_PACKAGE, coreVersion, latestCore } from './lib/core-update.js';
+import { RELEASE_AGE_KEY, SELF_PACKAGE, ensureSelfExemption, locateProfileDir } from './lib/release-age.js';
+import { durableState } from './lib/durable-state.js';
 import { AUTO_UPDATE_DELAY_MS, readAutoUpdateState, runAutoUpdate } from './lib/auto-update.js';
 import { causeChain, createErrorLog, describeError } from './lib/errors.js';
 import {
@@ -554,6 +558,12 @@ export function apply(ctx, config) {
             editable:
               typeof maybe('configEditor')?.edit === 'function' && ctx.fiber?.entry !== undefined,
             state: readAutoUpdateState(root),
+            // The last time the profile's pnpm release-age entry had to be narrowed to this
+            // package. Rendered only when a repair actually happened, because that is the only
+            // case in which the user has something to check.
+            releaseAge: (() => {
+              try { return releaseAgeState.read().last ?? null; } catch { return null; }
+            })(),
           });
 
           if (req.method === 'GET') {
@@ -940,6 +950,48 @@ export function apply(ctx, config) {
    * window that produced an empty bundle directory in 0.3.71. Three seconds is enough for the
    * mount to finish on this machine and invisible to a user.
    */
+  /**
+   * The profile's pnpm release-age entry, ensured from this package's own location.
+   *
+   * pnpm 11 checks EVERY lockfile entry against `minimumReleaseAge` — including on the frozen
+   * installs the host runs — so a release of this bundle that is younger than the waiting period
+   * makes every other install in the same profile fail, DSH's own update included. MEASURED
+   * 2026-11-19 on this machine: a copy of the live profile failed with
+   * `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` naming `newmark2dsh@0.3.84` and `dsh-pighub@1.0.11`;
+   * with this bundle's entry reduced to the bare package name, the same run named only the other
+   * package. That is the whole point of `lib/release-age.js`: the exemption this bundle writes is
+   * its own name, never another package's, and never the policy's waiting period.
+   *
+   * Run at mount (so a profile broken by an earlier release is repaired without the user running
+   * pnpm by hand) and again immediately before this bundle installs itself (because that install
+   * is what introduces the young entry).
+   */
+  const releaseAgeState = durableState(path.join(root, 'core', 'release-age.json'), { version: 1 });
+  const ensureReleaseAge = async () => {
+    const located = locateProfileDir(fileURLToPath(new URL('./', import.meta.url)));
+    if (!located.ok) return { ok: false, reason: located.reason };
+    const answer = await ensureSelfExemption({ profileDir: located.dir });
+    const receipt = { ...answer, profileDir: located.dir, pid: process.pid };
+    // A repair that worked must not fail because its receipt could not be written, and a run that
+    // changed nothing must not rewrite the receipt that says when the profile was last repaired.
+    if (answer.changed || !answer.ok) {
+      try { releaseAgeState.change((current) => { current.last = receipt; }); } catch { /* receipt only */ }
+    }
+    if (answer.changed) {
+      ctx.logger?.info?.(
+        `newmark-core: profile ${RELEASE_AGE_KEY} now names ${SELF_PACKAGE} alone (removed ${(answer.removed ?? []).length} version-pinned entries); other packages' entries untouched`,
+      );
+    } else if (!answer.ok) {
+      ctx.logger?.warn?.(`newmark-core: could not ensure the profile's ${RELEASE_AGE_KEY} entry: ${answer.reason}`);
+    }
+    return receipt;
+  };
+
+  ctx.effect(() => {
+    void ensureReleaseAge().catch(() => {});
+    return () => {};
+  }, 'newmark-core-release-age');
+
   const installedCoreVersion = async (manager) => {
     if (typeof manager?.listBundles !== 'function') {
       return { version: '', reason: 'plugin_manager_unavailable' };
@@ -977,12 +1029,15 @@ export function apply(ctx, config) {
           // a pass running inside the plugin it replaces gets `failed` back from the manager's
           // apply step even when pnpm installed the new version correctly (measured 2026-11-10).
           installedAfter: async () => (await installedCoreVersion(maybe('pluginManager'))).version,
-          install: (latest) => {
+          install: async (latest) => {
             if (typeof manager?.installBundle !== 'function') {
               throw Error('pluginManager.installBundle 不可用，未执行静默更新');
             }
-            // The exact published tarball, so pnpm cannot resolve a different build by its own
-            // age rules — the same authority the manual path uses.
+            // The exact published tarball names the release, but it does NOT exempt it from
+            // pnpm's release-age policy: MEASURED 2026-11-19, a frozen install of exactly that
+            // tarball failed with ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION. The exemption this
+            // bundle is allowed to write is its own package name, and it is written here first.
+            await ensureReleaseAge();
             return manager.installBundle(latest.tarball, {
               enabled: true,
               registry: latest.registry,

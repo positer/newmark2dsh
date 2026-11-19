@@ -3013,6 +3013,32 @@ function readPageGlobals() {
           return '上次启动检查' + (at ? '（' + at + '）' : '') + '：' + say() + '。';
         }
 
+        /**
+         * One line about the profile's pnpm release-age entry, and only when it needed repair.
+         *
+         * pnpm checks every lockfile entry against `minimumReleaseAge`, so while this bundle's own
+         * entry was a stale `name@version` list, every other install in the profile failed with
+         * ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION. The repair narrows the entry to this bundle's
+         * bare package name — never another package's — and this line is where the user can see
+         * that it happened. Silence means nothing needed doing, which is the normal case.
+         */
+        function releaseAgeLine(receipt) {
+          if (!receipt || typeof receipt !== 'object') return '';
+          const at = typeof receipt.at === 'string'
+            ? receipt.at.replace('T', ' ').replace(/\..*$/, '').slice(0, 16)
+            : '';
+          if (receipt.ok === true && receipt.changed === true) {
+            const removed = Array.isArray(receipt.removed) ? receipt.removed.length : 0;
+            return 'pnpm 发布年龄豁免' + (at ? '（' + at + '）' : '') + '：已把 profile 的条目收窄为只豁免本插件' +
+              (removed > 0 ? '，替换掉 ' + removed + ' 条按版本写死的旧条目' : '') +
+              '；其他插件与 DSH 的更新不再被本插件的发布时间挡住。';
+          }
+          if (receipt.ok === false) {
+            return 'pnpm 发布年龄豁免未能确认：' + (receipt.reason || '未知原因') + '。本插件更新可能被发布年龄策略暂缓。';
+          }
+          return '';
+        }
+
         function ConfigUpdateCard({ model }) {
           // true / false / null. null means the route has not answered for this switch: it is
           // disabled and says so, instead of showing "off" for a value nobody read.
@@ -3039,6 +3065,7 @@ function readPageGlobals() {
               ? h(ConfigNote, null, '当前 profile 的配置编辑器不可用，这个开关无法写入；检查更新按钮不受影响。')
               : null,
             autoUpdateLine(model.autoUpdateReceipt) ? h(ConfigNote, null, autoUpdateLine(model.autoUpdateReceipt)) : null,
+            releaseAgeLine(model.releaseAgeReceipt) ? h(ConfigNote, null, releaseAgeLine(model.releaseAgeReceipt)) : null,
             model.autoUpdateError ? h(ConfigNote, { tone: 'error' }, model.autoUpdateError) : null,
             h(ConfigNote, null, model.message),
             model.prompt && UpdateModal
@@ -3165,6 +3192,7 @@ function readPageGlobals() {
           const [autoUpdate, setAutoUpdate] = React.useState(null);
           const [autoUpdateEditable, setAutoUpdateEditable] = React.useState(false);
           const [autoUpdateReceipt, setAutoUpdateReceipt] = React.useState(null);
+          const [releaseAgeReceipt, setReleaseAgeReceipt] = React.useState(null);
           const [autoUpdateBusy, setAutoUpdateBusy] = React.useState(false);
           const [autoUpdateError, setAutoUpdateError] = React.useState('');
           const updateLock = React.useRef(false);
@@ -3197,6 +3225,7 @@ function readPageGlobals() {
                   setAutoUpdate(update.autoUpdate === true);
                   setAutoUpdateEditable(update.editable === true);
                   setAutoUpdateReceipt(update.state && typeof update.state === 'object' ? update.state : null);
+                  setReleaseAgeReceipt(update.releaseAge && typeof update.releaseAge === 'object' ? update.releaseAge : null);
                 }
                 return true;
               })
@@ -3406,8 +3435,12 @@ function readPageGlobals() {
               const restart = await restartRequest({ action: 'prepare', version: latest.latest });
               setUpdateMessage('正在更新 Newmark Core 至 ' + latest.latest + '…');
               requested = true;
-              // The authoritative tarball names exactly the selected release. It avoids
-              // pnpm's bare-name age fallback without changing the user's pnpm policies.
+              // The authoritative tarball names exactly the selected release, but it does NOT
+              // exempt it from pnpm's release-age policy: MEASURED 2026-11-19, installing this
+              // exact tarball with a frozen lockfile failed with
+              // ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION. The host half narrows the profile's
+              // exclusion to this package's bare name at mount and before every install, which
+              // is the only exemption this bundle is allowed to write.
               const answer = await manager.installBundle(latest.tarball, {
                 enabled: true, registry: latest.registry, requestId: crypto.randomUUID(),
               });
@@ -3452,6 +3485,7 @@ function readPageGlobals() {
             update: {
               message: updateMessage, busy: updateBusy, check: updateCore, prompt: updatePrompt, decide: decideUpdate,
               autoUpdate, autoUpdateEditable, autoUpdateReceipt, autoUpdateBusy, autoUpdateError, saveAutoUpdate,
+              releaseAgeReceipt,
             },
           };
         }
