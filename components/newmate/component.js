@@ -19,6 +19,8 @@ import {todoInput,todoMessageId,nextActivation} from './lib/todo-list.js';
 import {REPLY_PROTOCOL,normalizeReply,bubbleText,toPlain} from './lib/reply-format.js';
 import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,MAX_EVIDENCE_ATTEMPTS,initiativeGate,messageGate,nextGap,touchDay,recordMessage,isQuiet,paceThreshold,paceTimeWeight} from './lib/initiative.js';
 import { MONITOR_DEFAULTS, evaluateWorkspaces, settle } from './lib/workspace-diff.js';
+import { DIGEST_DEFAULTS, surveyChanges, summariseChanges, digestBlock } from './lib/change-digest.js';
+import { createCoreMemory, CORE_MEMORY_TOOL_NAME } from './lib/core-memory.js';
 import { attachmentBlock, normalizeAttachments, readUploadContent, saveUpload, UPLOAD_EXCERPT_CHARS, UPLOAD_MAX_PER_MESSAGE } from './lib/upload-store.js';
 
 /**
@@ -39,7 +41,7 @@ const readReply = (envelope, automatic) => {
   if (structured && typeof structured.text === 'string') {
     const rich = structured.text.trim();
     const plain = typeof structured.plain === 'string' && structured.plain.trim() ? structured.plain.trim() : toPlain(rich);
-    return { rich, plain, notify: typeof structured.notify === 'boolean' ? structured.notify : undefined, topic: typeof structured.topic === 'string' ? structured.topic : undefined, protocol: true };
+    return { rich, plain, notify: typeof structured.notify === 'boolean' ? structured.notify : undefined, topic: typeof structured.topic === 'string' ? structured.topic : undefined, brief: typeof structured.brief === 'string' ? structured.brief.trim() : undefined, protocol: true };
   }
   return normalizeReply(envelope?.result?.output, { automatic });
 };
@@ -80,6 +82,7 @@ export const NEWMATE_RUN_TOOLS = Object.freeze([
   'newmate_wechat_send_file', 'newmate_wechat_send_text', 'newmate_attachment_read',
   'newmate_conversation_list', 'newmate_conversation_new', 'newmate_conversation_send', 'newmate_conversation_read',
   'newmate_session_list', 'newmate_session_read', 'newmate_session_refresh', 'newmate_session_resume',
+  CORE_MEMORY_TOOL_NAME,
 ]);
 
 /** The two ComputerUse tools, and the owner label every NewMate lease carries. */
@@ -126,7 +129,13 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
   // The initialization payload is built once at construction and rebuilt whenever memory moves.
   // It carries the persona, the complete tag tree, every short row and the memory tool-group schema;
   // bodies stay on demand. The schema source is the LIVE registry this process registered, not a copy.
-  const nativeMemory = createMemoryContext(root,now,{toolSchemas:()=>({schemas:typeof tools?.schemas==='function'?tools.schemas():[],names:NEWMATE_RUN_TOOLS})});
+  /**
+   * The core memory store, created with the component so the budget and the section shape are this
+   * companion's own facts rather than settings a caller could widen. Handed to the prefix builder as
+   * a READER, so `lib/memory-context.js` never learns how the store is written.
+   */
+  const core = createCoreMemory(root, now);
+  const nativeMemory = createMemoryContext(root,now,{toolSchemas:()=>({schemas:typeof tools?.schemas==='function'?tools.schemas():[],names:NEWMATE_RUN_TOOLS}),coreMemory:()=>core.render()});
   nativeMemory();
   const store = durableState(path.join(root, 'newMate', 'state.json'), { schema: 2, threads: [{id:'default',title:'与 NewMate 的对话',created:now(),updated:now(),archived:false}], activeThreadId:'default', settings:{companion:false,notifications:false}, messages: [], tasks: [], measurements: {}, lastResponse: 0 });
   if (store.read().schema !== 2) store.change(s => {
@@ -506,9 +515,9 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
         const disposeAsk = task.localText || automatic || maintenance ? undefined : tools.register(createAskTool({ ask }));
         let outcome;
         try { outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseOwner(NEWMATE_CU_OWNER,()=>withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,conversation:conversationOf(task),session:{id:task.threadId,taskId:task.id},steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)},onEvent:event=>live.event(event)},()=>executeOne(tools,{ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
-          prompt: `${timeLine}${sessionBlock(task.threadId)}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。用户要求重复时给 repeat：{every,unit:\'min\'|\'h\'|\'d\',weekdays?:[1-7]（1=周一）,at?:\'HH:MM\'}，或等价规则串 rule（如 \"every 2 d on 1-5 at 09:00\"）；不给 repeat 就只触发一次。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：${store.read().watch?.lastDescription||'（本机尚无对比结果）'}\n当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪些文件新增/改动、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。':''}\n${REPLY_PROTOCOL}`,
+          prompt: `${timeLine}${sessionBlock(task.threadId)}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。用户要求重复时给 repeat：{every,unit:\'min\'|\'h\'|\'d\',weekdays?:[1-7]（1=周一）,at?:\'HH:MM\'}，或等价规则串 rule（如 \"every 2 d on 1-5 at 09:00\"）；不给 repeat 就只触发一次。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、核心记忆、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n${briefBlock(task)}当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪件事、在哪个项目或目录、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。brief 写第②步的整理（一条判断，≤200 字），text 写第③步的提醒正文；两者都不要复述扫描过程。':''}\n${REPLY_PROTOCOL}`,
           tools: { allow: newMateRunTools({automatic:automatic||maintenance,origin:task.origin}) }, timeout_ms: maintenance?60000:automatic?45000:120000, max_steps: maintenance?4:automatic?3:0,
-          ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:400},plain:{type:'string',maxLength:120},topic:{type:'string',maxLength:80}},required:['notify','text'],additionalProperties:false } } : {}),
+          ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:400},plain:{type:'string',maxLength:120},topic:{type:'string',maxLength:80},brief:{type:'string',maxLength:200}},required:['notify','text'],additionalProperties:false } } : {}),
         }, signal: active.signal }))));
         } finally { disposeAsk?.(); }
         active.signal.throwIfAborted();
@@ -585,11 +594,23 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
         } else if(!suppression) {
           const destination=automatic?rotateForMessage(topic,answer):task.threadId;
           // text = the page rendering, plain = what a bubble or an external channel may show.
-          const message={id:task.id,threadId:destination,role:'assistant',text:answer,plain:reply.plain,at:now(),proactive:automatic||delegated,autonomous:automatic,unread:true,...task.todoId?{todoId:task.todoId}: {}};
+          // `brief` is the model's own summary of what it read (step ② of the check-in sequence); it is
+          // stored beside the message so the judgement that produced a sentence can be read back, and
+          // it never reaches the bubble - the bubble carries the sentence.
+          const message={id:task.id,threadId:destination,role:'assistant',text:answer,plain:reply.plain,at:now(),proactive:automatic||delegated,autonomous:automatic,unread:true,...reply.brief?{brief:reply.brief}:{},...task.todoId?{todoId:task.todoId}: {}};
           store.change(s => { s.messages.push(message);const t=s.threads.find(t=>t.id===destination);if(t)t.updated=now();if(automatic){recordMessage(s.initiative,now(),answer,subject);s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.lastOutcome='message';} });
           await notify({ ...message, text: bubbleText(message), rich_text: message.text });
-        }else if(speculable){store.change(s=>{s.initiative.prepared={text:answer,plain:reply.plain,subject,at:now(),expiresAt:now()+PREPARED_TTL_MS,taskId:task.id,reason:lateGate};s.initiative.lastOutcome='prepared:'+lateGate;s.tasks.find(t=>t.id===task.id).suppressed='prepared:'+lateGate;});}
-        else store.change(s=>{s.initiative.lastOutcome=suppression;s.tasks.find(t=>t.id===task.id).suppressed=suppression;});
+        }else if(speculable){store.change(s=>{s.initiative.prepared={text:answer,plain:reply.plain,subject,at:now(),expiresAt:now()+PREPARED_TTL_MS,taskId:task.id,reason:lateGate,...reply.brief?{brief:reply.brief}:{}};s.initiative.lastOutcome='prepared:'+lateGate;s.tasks.find(t=>t.id===task.id).suppressed='prepared:'+lateGate;});}
+        /**
+         * A ROUND THAT STAYED SILENT STILL HAS A JUDGEMENT, and it is worth keeping.
+         *
+         * Measured 2026-11-23 (the first live check-in on this machine): the model ran 16 s with the
+         * file-change evidence, answered notify=false, and the only trace left was
+         * `lastOutcome: not_actionable` - the step-② summary it had written (brief) was dropped because
+         * nothing was published. "What did it think it saw" is exactly the question an operator asks a
+         * quiet companion, so the brief is stored on the task receipt whatever the outcome.
+         */
+        else store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);s.initiative.lastOutcome=suppression;if(t){t.suppressed=suppression;if(reply.brief)t.brief=reply.brief;}});
       }
       store.change(s => { const settled=s.tasks.find(t => t.id === task.id);Object.assign(settled,{status:'completed',finished:now()});delete settled.deferred;if(task.todoId){const todo=s.todos.find(t=>t.id===task.todoId),stored=s.messages.some(m=>m.id===task.id);if(todo){const next=stored&&todo.repeat?nextActivation(todo.repeat,now()):null;delete todo.deferred;Object.assign(todo,stored?(next?{status:'pending',activateAt:next,lastDeliveredAt:now(),messageId:task.id,deliveries:(todo.deliveries||0)+1}:{status:'completed',completedAt:now(),messageId:task.id}):{status:'failed',completedAt:now(),error:'运行已结束，但回复被主动消息格式规则抑制'});}} });
     } catch (error) {
@@ -977,7 +998,7 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
      * many signals it was shown) so the settlement can decide, after the run, whether a contact was
      * actually delivered. Attempts are counted here and only reset by a delivery.
      */
-    store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='self_activation';t.reason=reason;t.evidence={reason,memoryKey,marker,signals:signals.length,at:now()};if(localText){t.localText=localText;s.initiative.localChecks=(s.initiative.localChecks||0)+1;}touchDay(s.initiative,now());if(!localText)s.initiative.attempts++;s.initiative.lastAttemptAt=now();s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.pending={reason,at:now(),attempts:(s.initiative.pending?.attempts||0)+1};s.initiative.lastReason=localText?'gentle-presence':reason;});return{ok:true,allowed:true,id:task.id,reason};
+    store.change(s=>{const t=s.tasks.find(t=>t.id===task.id);t.kind='self_activation';t.reason=reason;t.evidence={reason,memoryKey,marker,signals:signals.length,at:now(),digestAt:Number(s.watch?.digestAt)||0};if(localText){t.localText=localText;s.initiative.localChecks=(s.initiative.localChecks||0)+1;}touchDay(s.initiative,now());if(!localText)s.initiative.attempts++;s.initiative.lastAttemptAt=now();s.initiative.nextAttemptAt=now()+nextGap(s.settings,s.initiative);s.initiative.pending={reason,at:now(),attempts:(s.initiative.pending?.attempts||0)+1};s.initiative.lastReason=localText?'gentle-presence':reason;});return{ok:true,allowed:true,id:task.id,reason};
   }
   // Interrupted runs are retained and await explicit retry: no automatic duplicate model spend.
   if (store.read().tasks.some(t => t.status === 'running')) store.change(s => { for (const t of s.tasks) if (t.status === 'running') { t.status = 'interrupted'; t.error = '宿主在任务完成前退出，可显式重试'; } });
@@ -1043,7 +1064,7 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
       // The threshold is not its own setting any more: it follows the initiative level, so "how
       // active am I" is one choice instead of two that can contradict each other.
       threshold: paceThreshold(settings?.pace),
-      depth: Number.isInteger(settings?.watchDepth) ? Math.min(Math.max(settings.watchDepth, 0), 6) : MONITOR_DEFAULTS.depth,
+      depth: Number.isInteger(settings?.watchDepth) ? Math.min(Math.max(settings.watchDepth, 0), 8) : MONITOR_DEFAULTS.depth,
       // How much a change made during a DSH turn still counts. 0 = ignore it entirely, 1 = no
       // distinction; the default 0.1 is the user's "大幅降低".
       dshWeight: typeof settings?.watchDshWeight === 'number' && Number.isFinite(settings.watchDshWeight) ? Math.min(Math.max(settings.watchDshWeight, 0), 1) : MONITOR_DEFAULTS.dshWeight,
@@ -1083,6 +1104,30 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     const settled = settle(acc, score, { threshold: watch.threshold });
     const fire = settled.fire && score > 0;
     const notable = evaluated.perWorkspace.filter((entry) => entry.changedNames > 0 || entry.countDelta > 0 || entry.timeDelta > 0);
+    /**
+     * THE OVERVIEW THE CHECK-IN IS WRITTEN FROM (user requirement: 先通读概览可信工作区的文件变动).
+     *
+     * The score is computed from counts, but a sentence cannot be. This survey keeps the change set
+     * itself - names, kinds, modification times, sizes, a directory roll-up - so the check-in prompt
+     * can be composed from what actually moved rather than from one aggregate number. It is stored
+     * with the monitor state so a check-in that happens hours later still reads the same survey, and
+     * its AGE travels with it (a stale survey must not be spoken about as "just now").
+     *
+     * A pass with nothing to survey keeps the PREVIOUS digest: erasing it would mean the next
+     * time-driven check-in had no overview at all even though the last real changes were minutes ago.
+     */
+    const digest = surveyChanges(evaluated.perWorkspace, { at });
+    const surveyed = digest.workspaces.some((entry) => entry.files.length > 0);
+    /**
+     * A REBASE REPLACES THE PREVIOUS OVERVIEW; IT DOES NOT KEEP IT.
+     *
+     * The rule "a pass with nothing to survey keeps the previous digest" is right for a quiet pass and
+     * wrong for a rebase: the previous overview was measured through a different window, so keeping it
+     * would present exactly the numbers the rebase just declared meaningless (measured 2026-11-23: after
+     * the 0.3.88 install the digest still said "Code：新增 2998、删除 950" for half an hour, because the
+     * first baseline pass had nothing to survey and the old survey was retained).
+     */
+    const rebaselined = evaluated.perWorkspace.some((entry) => entry.rebased === true);
     store.change((s) => {
       s.watch = {
         snapshots: evaluated.snapshots,
@@ -1096,10 +1141,14 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
         lastIdleMs: idleMs,
         lastDescription: evaluated.description || '',
         lastEvent: fire ? { at, reached: settled.at, description: evaluated.description, workspaces: notable.map((entry) => ({ root: entry.root, added: entry.added, removed: entry.removed, changed: entry.changed, countDelta: entry.countDelta, timeDelta: entry.timeDelta })) } : (s.watch?.lastEvent || null),
+        digest: (surveyed || rebaselined) ? digest : (s.watch?.digest || null),
+        digestAt: (surveyed || rebaselined) ? at : (s.watch?.digestAt || 0),
       };
       if (fire) {
         const signals = (s.initiative.signals || []).filter((signal) => signal?.kind !== 'workspace-diff');
-        signals.push({ kind: 'workspace-diff', at, score: Number(settled.at.toFixed(3)), fileScore: Number(evaluated.score.toFixed(3)), timeScore: Number(timeScore.toFixed(3)), idleMs, description: evaluated.description });
+        // The signal says the survey exists and when it was taken, so the check-in can point at it
+        // instead of re-describing it in the state file.
+        signals.push({ kind: 'workspace-diff', at, score: Number(settled.at.toFixed(3)), fileScore: Number(evaluated.score.toFixed(3)), timeScore: Number(timeScore.toFixed(3)), idleMs, description: evaluated.description, digestAt: surveyed ? at : (s.watch?.digestAt || 0), digested: surveyed });
         s.initiative.signals = signals.slice(-8);
       }
     });
@@ -1108,7 +1157,11 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
       ok: true, fired: fire, score: Number(score.toFixed(4)), fileScore: Number(evaluated.score.toFixed(4)), timeScore: Number(timeScore.toFixed(4)), idleMs,
       accumulated: Number(settled.accumulated.toFixed(4)),
       threshold: watch.threshold, at, description: evaluated.description,
-      workspaces: evaluated.perWorkspace.map((entry) => ({ root: entry.root, first: entry.first, added: entry.added, removed: entry.removed, changed: entry.changed, user: entry.user, dsh: entry.dsh, dshWeight: entry.dshWeight, countDelta: entry.countDelta, timeDelta: entry.timeDelta })),
+      workspaces: evaluated.perWorkspace.map((entry) => ({ root: entry.root, first: entry.first, skipped: entry.skipped, added: entry.added, removed: entry.removed, changed: entry.changed, user: entry.user, dsh: entry.dsh, dshWeight: entry.dshWeight, countDelta: entry.countDelta, timeDelta: entry.timeDelta, coverage: entry.coverage })),
+      // The brief is reported as MEASUREMENTS (when, how many, how many characters) rather than as
+      // prose: the caller already has the description, and a second copy of the wording would be a
+      // second thing to keep true.
+      brief: { at: digest.at, surveyed, workspaces: digest.workspaces.length, files: digest.totals.files, chars: summariseChanges(digest, { now: at }).length, truncated: digest.truncated, partial: digest.workspaces.some((entry) => entry.coverage && (entry.coverage.omittedDirectories || entry.coverage.omittedFiles)) },
     };
   }
 
@@ -1134,6 +1187,63 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     return { ok: true, windows: active.length };
   }
 
+
+  /**
+   * THE INFORMATION BUNDLE ONE CHECK-IN IS COMPOSED FROM.
+   *
+   * The user's requirement is a sequence, and this block is what makes the sequence real: the runtime
+   * has already surveyed the trusted workspaces (see sweepWorkspaces) and summarised them
+   * deterministically, so the model does not have to spend a tool call reading what changed - and,
+   * with `max_steps: 3` on an automatic run, it could not afford one. What it gets here is:
+   *
+   *   the survey   what moved, where, of what kind, how long ago - measured, never file content;
+   *   the facts    how long it has been quiet, how many messages went unanswered, the initiative
+   *                level and its threshold, memory counts, open reminders, the session size.
+   *
+   * The order is stated in the block itself (通读概览 → 整理判断 → 写提醒) because that is the
+   * instruction it implements; the model's own summary of step two travels back in `brief`, which is
+   * stored with the message so "what did it think it saw" can be checked afterwards.
+   *
+   * Runs that a person asked for (chat, a scheduled todo) keep the old one-line workspace fact: their
+   * prompt is about the user's request, and a full change brief would compete with it.
+   */
+  function briefBlock(task){
+    const state=store.read(),watch=state.watch||{},settings=state.settings||{},initiative=state.initiative||{},at=now();
+    if(task?.kind!=='self_activation')return '工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：'+(watch.lastDescription||'（本机尚无对比结果）')+'\n';
+    const memory=nativeMemory();
+    const expired=memory.shortMemory.filter(row=>row.expired).length;
+    const todos=state.todos.filter(todo=>todo.status==='pending');
+    const dueNow=todos.filter(todo=>Number(todo.activateAt)>0&&Number(todo.activateAt)<=at);
+    const dueSoon=todos.filter(todo=>Number(todo.activateAt)>0&&Number(todo.activateAt)<=at+DAY);
+    const lastContact=Math.max(Number(initiative.lastUserAt)||0,Number(initiative.lastMessageAt)||0,Number(initiative.lastReadAt)||0,Number(initiative.enabledAt)||0);
+    const quiet=quietSince(Math.max(0,at-lastContact));
+    const digest=digestBlock(watch.digest,{now:at});
+    const facts=sessionFacts(state,task.threadId);
+    const lines=['可较快获取的信息（运行时在发问前整理；这些是背景，不是已经对用户说过的话）：',
+      '- 现在：'+localStamp(at)+'；距最近一次用户互动或主动联系：'+quiet+'；未回应次数 '+(Number(initiative.unanswered)||0)+'；主动性级别 '+(settings.pace||'balanced')+'（阈值 '+(PACES[settings.pace]||PACES.balanced).threshold+'）。'];
+    if(digest){
+      lines.push('- '+digest.text);
+      if(digest.stale)lines.push('  注意：这份概览扫描于 '+localStamp(digest.at)+'，距现在约 '+Math.max(1,Math.round(digest.ageMs/60000))+' 分钟，只能当作「最近」的背景，不能写成「刚刚」「现在」。');
+      // A partial walk must not be read as "nothing else happened": that is the sentence the user was
+      // handed about their own repository on 2026-11-23.
+      if(digest.partial)lines.push('  注意：至少一个工作区这次只做了部分遍历（目录或文件达到上限），没有列出的区域不代表没有变化；不要因此断言「别的都没动」。');
+    }else lines.push('- 工作区最近变动：'+(watch.lastDescription||'（本机尚无对比结果）'));
+    lines.push('- 记忆：长期记忆 '+memory.tree.counts.tags+' 个标签 / '+memory.tree.counts.components+' 个节点；短期记忆 '+memory.shortMemory.length+' 条（其中已过期 '+expired+' 条，过期内容不可当作当前事实）。');
+    lines.push('- 待办：未投递 '+todos.length+' 条，其中 '+dueNow.length+' 条已到点、'+dueSoon.length+' 条 24 小时内到期。');
+    if(facts)lines.push('- 本会话消息 '+facts.messages+' 条 / '+facts.chars+' 字符。');
+    lines.push('处理顺序（这就是这次主动联系的机制）：①先通读上面的工作区变动概览，弄清哪些项目、哪些目录、哪一类文件真的动了；②把这次变动整理成一句自己的判断——哪一件值得此刻说、为什么，写进 brief；③再根据这句判断和上面所有可较快获取的信息写 text，只写用户能直接用的具体事实（哪件事、在哪个项目或目录）和至多一个不催促的可选邀请，不复述扫描过程、不罗列文件清单。没有值得此刻说的具体内容就 notify=false。');
+    return lines.join('\n')+'\n';
+  }
+
+  /** How long since the last contact, in words a person would use. */
+  const quietSince=(ms)=>{
+    const minutes=Math.floor(Math.max(0,ms)/60000);
+    if(minutes<1)return '刚刚';
+    if(minutes<60)return minutes+' 分钟';
+    const hours=Math.floor(minutes/60);
+    return hours+' 小时 '+(minutes%60)+' 分钟';
+  };
+
   /** The monitor as data, for the state route and the settings page. */
   function watchStatus() {
     const state = store.read(), watch = watchSettings(state.settings), monitored = state.watch || {};
@@ -1142,6 +1252,13 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
       companion: state.settings.companion === true, acc: Number(monitored.acc) || 0, runs: Number(monitored.runs) || 0,
       lastRunAt: monitored.lastRunAt || 0, lastScore: monitored.lastScore || 0, lastDescription: monitored.lastDescription || '',
       lastEvent: monitored.lastEvent || null, workspaces: Object.keys(monitored.snapshots || {}),
+      // The brief as data: when it was surveyed, how big it is and whether the age makes it background.
+      // `stale` is computed here so the panel and the prompt answer the same question the same way.
+      brief: monitored.digest ? { at: monitored.digestAt || monitored.digest.at || 0, ageMs: Math.max(0, now() - (monitored.digestAt || monitored.digest.at || 0)), stale: Math.max(0, now() - (monitored.digestAt || monitored.digest.at || 0)) > DIGEST_DEFAULTS.maxAgeMs, workspaces: monitored.digest.workspaces?.length || 0, files: monitored.digest.totals?.files || 0, chars: summariseChanges(monitored.digest, { now: now() }).length, partial: (monitored.digest.workspaces || []).some((entry) => entry.coverage && (entry.coverage.omittedDirectories || entry.coverage.omittedFiles)) } : null,
+      // Per-workspace coverage: which registered workspaces were walked, how far, and what the caps
+      // left out. Without this the panel can only say "watching 3 workspaces", which is the claim that
+      // was true and misleading on 2026-11-23.
+      coverage: (monitored.digest?.workspaces || []).map((entry) => ({ name: entry.name, root: entry.root, coverage: entry.coverage || null })),
     };
   }
 
@@ -1154,7 +1271,7 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     state: store.read, deliveryBlocker, deliveryReady, newmateIdle, loopStatus: () => live.snapshot(), ask, answerQuestion, pendingQuestion, enqueue, tick, initiativeStatus(){const s=store.read(),env=environment();return{...initiativeGate(s.settings,s.initiative,now(),{...env,busy:env.busy||running||s.tasks.some(t=>['pending','running'].includes(t.status))},engagedAt,bootReadyAt),nextAttemptAt:s.initiative.nextAttemptAt,lastReason:s.initiative.lastReason,lastOutcome:s.initiative.lastOutcome,evidence:s.initiative.evidence||null,pendingEvidence:s.initiative.pending||null,signals:(s.initiative.signals||[]).length,prepared:s.initiative.prepared?{at:s.initiative.prepared.at,expiresAt:s.initiative.prepared.expiresAt,subject:s.initiative.prepared.subject||null,chars:(s.initiative.prepared.text||'').length,reason:s.initiative.prepared.reason||null}:null};},stop() { stopped = true; settleAsk({ ok: false, code: 'question_aborted', error: 'the companion stopped before the user answered', questionId: null }); active?.abort(); },
     async configure(settings) {
       if(!settings||Object.keys(settings).some(k=>!['companion','notifications','watchEnabled','watchIntervalMinutes','watchDepth','watchDshWeight',...Object.keys(INITIATIVE_DEFAULTS)].includes(k)))throw Error('陪伴设置无效');
-      for(const [key,value]of Object.entries(settings)){if(['companion','notifications','initiative'].includes(key)&&typeof value!=='boolean')throw Error('开关无效');if(key==='pace'&&(typeof value!=='string'||!Object.hasOwn(PACES,value)))throw Error('陪伴频率无效');if(['quietStart','quietEnd'].includes(key)&&(!Number.isInteger(value)||value<0||value>23))throw Error('静默时间无效');if(key==='watchEnabled'&&typeof value!=='boolean')throw Error('监控开关无效');if(key==='watchIntervalMinutes'&&(!Number.isInteger(value)||value<5||value>1440))throw Error('监控间隔须为 5–1440 分钟');if(key==='watchThreshold')throw Error('监控阈值已并入主动性选择，请改 pace');if(key==='watchDepth'&&(!Number.isInteger(value)||value<0||value>6))throw Error('监控深度须为 0–6');if(key==='watchDshWeight'&&(!Number.isFinite(value)||value<0||value>1))throw Error('DSH 变动权重须在 0–1 之间');if(key==='snoozeUntil'&&(!Number.isFinite(value)||value<0||value>now()+7*DAY))throw Error('暂停期限无效');}
+      for(const [key,value]of Object.entries(settings)){if(['companion','notifications','initiative'].includes(key)&&typeof value!=='boolean')throw Error('开关无效');if(key==='pace'&&(typeof value!=='string'||!Object.hasOwn(PACES,value)))throw Error('陪伴频率无效');if(['quietStart','quietEnd'].includes(key)&&(!Number.isInteger(value)||value<0||value>23))throw Error('静默时间无效');if(key==='watchEnabled'&&typeof value!=='boolean')throw Error('监控开关无效');if(key==='watchIntervalMinutes'&&(!Number.isInteger(value)||value<5||value>1440))throw Error('监控间隔须为 5–1440 分钟');if(key==='watchThreshold')throw Error('监控阈值已并入主动性选择，请改 pace');if(key==='watchDepth'&&(!Number.isInteger(value)||value<0||value>8))throw Error('监控深度须为 0–8');if(key==='watchDshWeight'&&(!Number.isFinite(value)||value<0||value>1))throw Error('DSH 变动权重须在 0–1 之间');if(key==='snoozeUntil'&&(!Number.isFinite(value)||value<0||value>now()+7*DAY))throw Error('暂停期限无效');}
       const before=store.read().settings;store.change(s=>{Object.assign(s.settings,settings,{notifications:false});if(settings.companion===false||settings.initiative===false)for(const task of s.tasks)if(['measurement','self_activation'].includes(task.kind)&&task.status==='pending')task.status='paused';});
       if((settings.companion===true&&!before.companion)||(settings.initiative===true&&!before.initiative))store.change(s=>{s.initiative.enabledAt=now();s.initiative.nextAttemptAt=Math.max(s.initiative.nextAttemptAt||0,now()+20*MINUTE);});
       if((settings.companion===false||settings.initiative===false)&&activeAutomatic)active?.abort();
@@ -1183,7 +1300,16 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
       const message={id,threadId:destination,role:'assistant',text:text.trim(),summary:options.summary,at:now(),proactive:true,unread:true};
       store.change(s=>{s.messages.push(message);s.threads.find(t=>t.id===destination).updated=now();});const delivery=await notify(message);return{ok:true,id,...delivery};
     },
-    memoryContext() { const value=nativeMemory(); return {key:value.key,tree:structuredClone(value.tree),tags:structuredClone(value.tags),shortMemory:structuredClone(value.shortMemory),shortMemoryTotal:value.shortMemoryTotal,shortMemoryOmitted:value.shortMemoryOmitted,tools:structuredClone(value.tools),toolsMissing:structuredClone(value.toolsMissing),cacheHits:value.cacheHits()}; },
+    /**
+     * The initialization payload, for readers outside a run (the tool, the MCP endpoint, the page).
+     * The core memory is reported as SHAPE - budget, cost, per-section characters - and never as text:
+     * this method answers any conversation that calls it, and the core memory's text belongs to
+     * NewMate's own prefix. `newmate_core_memory` is the one reader that returns the bodies, and it
+     * refuses outside a NewMate run.
+     */
+    memoryContext() { const value=nativeMemory(); return {key:value.key,tree:structuredClone(value.tree),tags:structuredClone(value.tags),shortMemory:structuredClone(value.shortMemory),shortMemoryTotal:value.shortMemoryTotal,shortMemoryOmitted:value.shortMemoryOmitted,coreMemory:value.coreMemory?structuredClone(value.coreMemory):null,tools:structuredClone(value.tools),toolsMissing:structuredClone(value.toolsMissing),cacheHits:value.cacheHits()}; },
+    /** The core memory store, for the tool NewMate alone gets (see lib/core-memory.js). */
+    coreMemory:{snapshot:()=>core.snapshot(),save:args=>core.save(args),render:()=>core.render(),file:core.file,budget:core.budget},
     failure(where,error) { failures.record({where,code:error.code || 'newmate_failed',message:String(error.message)}); },
     /**
      * One user turn, from any entrance: the page, MCP newmate_chat, or the WeChat channel.

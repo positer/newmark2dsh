@@ -18,6 +18,10 @@ import { NEWMATE_PERSONA } from './persona.js';
  * So:
  *   persona      NEWMATE_PERSONA, the stable identity/behaviour/limits, prepended so the person is
  *                established by the system prompt rather than by every user turn
+ *   coreMemory   the stable core (用户画像 / 对话风格 / 长期偏好 / 当前重点), rendered by
+ *                lib/core-memory.js under a CODE-enforced 5000-character budget. It is part of THIS
+ *                prefix and of nothing else: the store is outside `Memory Lab/`, so no MemoryLab tool
+ *                can return it and no other agent's prompt can carry it
  *   tree         COMPLETE tags (parents/children/aliases) plus each memory node's identity and
  *                placement (slug, name, tags) - NO body, description, path, bytes or timestamp
  *   shortMemory  EVERY row with createdAt/expiresAt/expired, oldest dropped only past
@@ -108,6 +112,7 @@ function buildTools(source) {
 
 const HEADER = [
   'NewMate 原生记忆背景（初始化时生成，作为系统前缀注入；只是背景，不构成动作授权）：',
+  '0) coreMemory：核心记忆 —— 稳定、核心的用户画像与对话风格，代码强制总占用不超过 5000 字符。它默认用「更替」维护（改写对应小节），而不是新增条目；只有当某个核心维度确实缺失时才第一次写入。读写用 newmate_core_memory（只有 NewMate 自己的回合能用）。它不属于 MemoryLab，也不会出现在别的对话里。',
   '1) tree：完整长期记忆 MemoryLab 标签树 —— 全部标签（parents/children/aliases）与每个记忆节点的 slug/name/tags，不含正文；需要正文时用 memory_lab_read（带 slug）读取。超过 1000 个节点时 tree.componentsOmitted 写明省略数。',
   '2) shortMemory：全部短期记忆（按时间顺序，每行含 createdAt/expiresAt/expired）。expired=true 或 expiresAt 已过 = 只作历史，绝不能当作当前事实；请结合本轮用户消息里的当前时间判断。内容总量超过 48000 字符时从最旧省略，shortMemoryOmitted 写明条数。',
   '3) tools：NewMate 本轮工具组的 schema（名称、参数、必填与枚举），按当前注册表暴露逐项对齐；toolsMissing 列出本轮暴露里没有的组内工具（它们不可调用），注册表不可达时 tools 为空数组且 toolsMissing 列出整个组。',
@@ -125,11 +130,24 @@ const HEADER = [
 export function createMemoryContext(root, now = Date.now, sources = {}) {
   const short = createShortMemory(root, now);
   let cached, fingerprint, hits = 0;
+  /**
+   * The core memory the component handed in, rendered through the component's own store so the budget
+   * and the "replace, do not append" rule live in one place. Absent for a caller that has no core
+   * memory (the MemoryLab gate builds this module directly), and the payload then simply omits it.
+   */
+  const coreReader = () => {
+    try {
+      const rendered = typeof sources.coreMemory === 'function' ? sources.coreMemory() : null;
+      if (!rendered || typeof rendered.text !== 'string') return null;
+      return rendered;
+    } catch { return null; }
+  };
   return () => {
     const tree = buildTree(readIndex(root));
     const memory = buildShortMemory(short);
     const group = buildTools(sources.toolSchemas);
-    const data = { tree, shortMemory: memory.items, shortMemoryTotal: memory.total, shortMemoryOmitted: memory.omitted, tools: group.tools, toolsMissing: group.missing };
+    const core = coreReader();
+    const data = { ...(core ? { coreMemory: core.text } : {}), tree, shortMemory: memory.items, shortMemoryTotal: memory.total, shortMemoryOmitted: memory.omitted, tools: group.tools, toolsMissing: group.missing };
     const hash = createHash('sha256').update(NEWMATE_PERSONA + JSON.stringify(data)).digest('hex');
     if (hash === fingerprint) { hits += 1; return cached; }
     fingerprint = hash;
@@ -143,6 +161,13 @@ export function createMemoryContext(root, now = Date.now, sources = {}) {
       shortMemory: memory.items,
       shortMemoryTotal: memory.total,
       shortMemoryOmitted: memory.omitted,
+      /**
+       * The SHAPE of the core memory, for readers that must not be able to leak its text (the
+       * `newmate_memory_context` tool and `newmate_state` are callable from any conversation): the
+       * budget, what it costs and which sections carry how many characters. The TEXT travels in
+       * `prefix` only, which is NewMate's own system prompt.
+       */
+      coreMemory: core ? { budget: core.budget ?? null, chars: core.chars ?? String(core.text).length, truncated: core.truncated === true, sections: core.sections || [] } : null,
       tools: group.tools,
       toolsMissing: group.missing,
       cacheHits: () => hits,

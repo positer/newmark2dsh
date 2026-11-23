@@ -9,8 +9,9 @@ import { createNewMateMcp, MCP_ROUTE } from './lib/mcp.js';
 import { createNewMateSearch } from './lib/web-search.js';
 import { createConversationBridge } from './lib/conversations.js';
 import { createSessionBridge } from './lib/sessions.js';
+import { coreMemoryDefinition } from './lib/core-memory.js';
 import { createWechatChannel } from './lib/wechat-channel.js';
-import { MONITOR_DEFAULTS, dedupeRoots } from './lib/workspace-diff.js';
+import { MONITOR_DEFAULTS, uniqueRoots } from './lib/workspace-diff.js';
 import { UPLOAD_MAX_BYTES } from './lib/upload-store.js';
 import { readCoreSelection } from '../agent-api/lib/core-model.js';
 import { startDesktopPet, stopDesktopPet, companionPetEvents, notifyDesktopPet, updateDesktopPetFocus, claimDesktopPetNotice, updateDesktopPetTheme } from '../computeruse/lib/desktop-pet.js';
@@ -81,6 +82,18 @@ export function apply(ctx, config) {
   const sessions=createSessionBridge({services:{sessions:()=>mate},log:(where,error)=>ctx.logger?.warn?.(where+': '+error?.message)});
   for(const definition of sessions.definitions)privateTools[definition.name]=definition;
   /**
+   * CORE MEMORY, as a private tool of the companion.
+   *
+   * It is private for the same reason the conversation and session tools are: the core memory is
+   * NewMate's own view of the person, and the user's rule is that it lives in NewMate and nowhere else.
+   * The store is also outside `Memory Lab/`, so no MemoryLab tool can return it and no DSH
+   * conversation receives it in a prompt. The definition itself refuses outside a NewMate run
+   * (`core_memory_outside_newmate`), which is what makes "private" hold even when a caller reaches the
+   * private map through agent_api_send.
+   */
+  const coreMemory=coreMemoryDefinition({services:{core:()=>mate?.coreMemory}});
+  privateTools[coreMemory.name]=coreMemory;
+  /**
    * The report path: NewMate telling the user something it found out by itself.
    *
    * It is a PRIVATE tool (NewMate's run only) rather than a shared registration, because it speaks
@@ -130,8 +143,11 @@ export function apply(ctx, config) {
       const list = await registry?.list?.();
       for (const entry of Array.isArray(list) ? list : []) if (typeof entry?.path === 'string') roots.push(entry.path);
     } catch (e) { ctx.logger?.warn?.('newmate/watch-roots: ' + e.message); }
-    // Registered workspaces can nest; the topmost one covers the rest (dedupeRoots says why).
-    return dedupeRoots(roots);
+    // Registered workspaces can nest, and each one is monitored AS ITSELF: the parent skips the
+    // subtrees that are workspaces of their own (planWorkspaces), so a nested project is not starved by
+    // its parent's budget. Measured 2026-11-23: the collapse this replaces left the main repository
+    // (64 sessions) with zero visible files and a brief that said "新增 0".
+    return uniqueRoots(roots);
   };
   // The four knobs may also arrive from the plugin config; they are applied ONCE as the initial
   // value and from then on the NewMate settings page (persisted in state.json) is the authority.
