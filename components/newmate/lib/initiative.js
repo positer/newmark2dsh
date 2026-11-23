@@ -11,7 +11,19 @@ export const MINUTE=60000,HOUR=60*MINUTE,DAY=24*HOUR;
  * expires and the expiry is recorded instead of the change being silently dropped.
  */
 export const MAX_EVIDENCE_ATTEMPTS=3;
-export const INITIATIVE_DEFAULTS={initiative:true,pace:'balanced',quietStart:23,quietEnd:8,snoozeUntil:0};
+/**
+ * Quiet hours are MINUTES FROM LOCAL MIDNIGHT on a half-hour grid (0..1410), not whole hours.
+ *
+ * The user asked for half-hour granularity (静默时间段设置调整为半小时一段) and for a switch that turns
+ * the window off entirely (提供静默区间开关). Both are representation changes, so the legacy shape has to
+ * keep meaning what it meant: a stored integer 0..23 is an HOUR from the old settings and is read as
+ * hour*60 (see quietBoundary), while anything >= 24 is already minutes. `quietStart === quietEnd` keeps
+ * its old meaning - an empty window - and `quietEnabled:false` switches the window off without losing
+ * the chosen boundaries.
+ */
+export const QUIET_STEP_MINUTES=30;
+export const QUIET_LAST_MINUTES=24*60-QUIET_STEP_MINUTES;
+export const INITIATIVE_DEFAULTS={initiative:true,pace:'balanced',quietEnabled:true,quietStart:23*60,quietEnd:8*60,snoozeUntil:0};
 /**
  * The three initiative levels. They no longer carry "N messages per day" quotas: the user asked for
  * the exact counts (and the wording that stated them) to go away, because a quota made the companion
@@ -35,9 +47,24 @@ export const PACES={
 export const paceThreshold=pace=>(PACES[pace]||PACES.balanced).threshold;
 /** The level's quiet-time weight per gap. */
 export const paceTimeWeight=pace=>(PACES[pace]||PACES.balanced).timeWeight;
-const clock=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'});
-export function localClock(time){const p=Object.fromEntries(clock.formatToParts(new Date(time)).map(p=>[p.type,p.value]));return{day:`${p.year}-${p.month}-${p.day}`,hour:Number(p.hour)};}
-export function isQuiet(settings,time){const h=localClock(time).hour,a=settings.quietStart,b=settings.quietEnd;return a===b?false:a<b?h>=a&&h<b:h>=a||h<b;}
+const clock=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
+export function localClock(time){const p=Object.fromEntries(clock.formatToParts(new Date(time)).map(p=>[p.type,p.value]));const hour=Number(p.hour);return{day:`${p.year}-${p.month}-${p.day}`,hour,minute:Number(p.minute),minutes:hour*60+Number(p.minute)};}
+/**
+ * One boundary in minutes. Integers 0..23 are the LEGACY hour shape and are multiplied; anything on the
+ * half-hour grid is taken as minutes; anything else falls back, so a hand-edited state cannot produce a
+ * boundary the settings page cannot express.
+ */
+export function quietBoundary(value,fallback=0){const number=Number(value);if(!Number.isFinite(number))return fallback;if(Number.isInteger(number)&&number>=0&&number<=23)return number*60;if(Number.isInteger(number)&&number>=0&&number<=QUIET_LAST_MINUTES&&number%QUIET_STEP_MINUTES===0)return number;return fallback;}
+/** The window as the gate, the page and the receipts all read it. */
+export function quietWindow(settings={}){return{enabled:settings.quietEnabled!==false,start:quietBoundary(settings.quietStart,INITIATIVE_DEFAULTS.quietStart),end:quietBoundary(settings.quietEnd,INITIATIVE_DEFAULTS.quietEnd)};}
+/** `1410` -> `23:30`, for receipts and the page. */
+export function quietClock(minutes){const value=quietBoundary(minutes,0);return String(Math.floor(value/60)).padStart(2,'0')+':'+String(value%60).padStart(2,'0');}
+export function isQuiet(settings,time){
+ const{enabled,start,end}=quietWindow(settings);
+ if(!enabled||start===end)return false;
+ const m=localClock(time).minutes;
+ return start<end?m>=start&&m<end:m>=start||m<end;
+}
 export function dayCounts(state,time){return state.day===localClock(time).day?{attempts:state.attempts||0,sent:state.sent||0}:{attempts:0,sent:0};}
 export function touchDay(state,time){const day=localClock(time).day;if(state.day!==day)Object.assign(state,{day,attempts:0,sent:0});}
 /**

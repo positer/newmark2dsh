@@ -2877,7 +2877,25 @@ function readPageGlobals() {
             const timer = setInterval(() => { try { model.refresh?.(); } catch {} }, 1500);
             return () => clearInterval(timer);
           }, [qrOpen]);
-          const quietOptions = Array.from({ length: 24 }, (_, hour) => ({ value: hour, label: String(hour).padStart(2, '0') + ':00' }));
+          /**
+ * Quiet hours are half-hour slots, and the value is MINUTES from midnight.
+ *
+ * The user asked for half-hour granularity (静默时间段设置调整为半小时一段) and for a switch that turns
+ * the window off (静默区间开关). The host stores minutes on a 30-minute grid; a state written before
+ * 0.3.91 holds whole hours, and quietMinutes() reads that shape the same way the host migrates it, so
+ * the page shows the window that is actually in force even before the host rewrites it.
+ */
+const quietMinutes = (value, fallback) => {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  if (Number.isInteger(number) && number >= 0 && number <= 23) return number * 60;
+  if (Number.isInteger(number) && number >= 0 && number <= 1410 && number % 30 === 0) return number;
+  return fallback;
+};
+const quietOptions = Array.from({ length: 48 }, (_, slot) => {
+  const minutes = slot * 30;
+  return { value: minutes, label: String(Math.floor(minutes / 60)).padStart(2, '0') + ':' + String(minutes % 60).padStart(2, '0') };
+});
           return h(ConfigCard, {
             title: '陪伴与工作区监控',
             description: '两页写的是同一份设置：开关立即生效，对比间隔从下一轮开始算，不会打断正在进行的那一轮。',
@@ -2902,13 +2920,20 @@ function readPageGlobals() {
                 }),
               }),
               h(ConfigNote, null, '主动性同时决定触发阈值（当前 ' + (watch.threshold ?? 0.6) + '）和安静时间的权重；没有每日条数上限，间距与静默时段仍然生效。'),
-              h(ConfigField, {
-                label: '静默时段（北京时间）', inline: true,
-                control: h(React.Fragment, null,
-                  h(ConfigSelect, { id: 'nmc-quiet-start', label: '静默开始时间', value: settings.quietStart ?? 23, options: quietOptions, disabled: busy, onChange: value => save({ quietStart: Number(value) }) }),
-                  h('span', { className: 'nmc-unit' }, '至'),
-                  h(ConfigSelect, { id: 'nmc-quiet-end', label: '静默结束时间', value: settings.quietEnd ?? 8, options: quietOptions, disabled: busy, onChange: value => save({ quietEnd: Number(value) }) })),
+              h(ConfigSwitch, {
+                id: 'nmc-quiet-enabled', label: '启用静默区间',
+                checked: settings.quietEnabled !== false, disabled: busy,
+                onChange: value => save({ quietEnabled: value }),
               }),
+              h(ConfigNote, null, '开启时，下面这段时间既不主动发消息也不做主动检查；关闭后静默区间整段失效，起止时间仍会保留。'),
+              h(ConfigField, {
+                label: '静默区间（北京时间，半小时一段）', inline: true,
+                control: h(React.Fragment, null,
+                  h(ConfigSelect, { id: 'nmc-quiet-start', label: '静默开始时间', value: quietMinutes(settings.quietStart, 23 * 60), options: quietOptions, disabled: busy || settings.quietEnabled === false, onChange: value => save({ quietStart: Number(value) }) }),
+                  h('span', { className: 'nmc-unit' }, '至'),
+                  h(ConfigSelect, { id: 'nmc-quiet-end', label: '静默结束时间', value: quietMinutes(settings.quietEnd, 8 * 60), options: quietOptions, disabled: busy || settings.quietEnabled === false, onChange: value => save({ quietEnd: Number(value) }) })),
+              }),
+              h(ConfigNote, null, '跨零点自动换行（例如 23:30 至 08:00）；起止取同一时刻表示不设静默。' + (settings.quietEnabled === false ? ' 当前静默区间已关闭。' : '')),
               h('div', { className: 'nmc-actions' },
                 h(ConfigButton, { variant: 'outline', disabled: busy, onClick: () => save({ snoozeUntil: Date.now() + 8 * 3600000 }) }, '暂停主动陪伴 8 小时'),
                 (settings.snoozeUntil || 0) > Date.now()
