@@ -406,6 +406,38 @@ export function createWechatChannel({ root, mate, log = () => {}, baseUrl = ILIN
         log('wechat: no reply for task ' + taskId + ' within the window, dropped');
         continue;
       }
+      /**
+       * INTERIM SENTENCES RIDE THE SAME CHANNEL, IN ORDER, AND ONLY BEFORE THE ANSWER (2026-11-24).
+       *
+       * A reply that arrives in one piece is fine for a short answer and wrong for a long turn: the
+       * person on the phone asked, and then heard nothing until the end. So every interim sentence this
+       * task published is forwarded to the same peer, in the order it was written, claimed before the
+       * await (the same one-message-per-sentence rule the final reply uses), and DROPPED once the final
+       * answer has gone out - a late "I'm still looking" after the conclusion is a lie about the order.
+       * A task that did not come from this channel has no `awaiting` entry, so a page conversation still
+       * never pushes anything to the phone.
+       */
+      const interim = messages
+        .filter((message) => message && message.interim === true && String(message.taskId) === String(taskId))
+        .sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0));
+      for (const sentence of interim) {
+        if (state.sent[sentence.id]) continue;
+        if (state.sent[taskId]) { state.sent[sentence.id] = { at: Date.now(), skipped: 'after_reply' }; save(); continue; }
+        const value = textOf(sentence);
+        if (!value) { state.sent[sentence.id] = { at: Date.now(), skipped: 'empty' }; save(); continue; }
+        state.sent[sentence.id] = { at: Date.now(), claimed: true };
+        save();
+        const delivered = await ilink.sendText({ to: entry.peer, text: value, contextToken: entry.contextToken });
+        if (delivered.ok) {
+          state.stats.interim = (Number(state.stats.interim) || 0) + 1;
+          state.sent[sentence.id] = { at: Date.now(), messageId: delivered.messageId, chars: value.length, interim: true };
+          save();
+        } else {
+          delete state.sent[sentence.id];
+          state.stats.sendFailed += 1;
+          save();
+        }
+      }
       const reply = messages.find((message) => message && String(message.id) === String(taskId) && message.role === 'assistant');
       if (!reply) continue;
       const value = textOf(reply);

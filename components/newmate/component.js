@@ -21,6 +21,8 @@ import {INITIATIVE_DEFAULTS,PACES,MINUTE,HOUR,DAY,MAX_EVIDENCE_ATTEMPTS,QUIET_ST
 import { MONITOR_DEFAULTS, evaluateWorkspaces, settle } from './lib/workspace-diff.js';
 import { DIGEST_DEFAULTS, surveyChanges, summariseChanges, digestBlock } from './lib/change-digest.js';
 import { createCoreMemory, CORE_MEMORY_TOOL_NAME } from './lib/core-memory.js';
+import { NEWMATE_INTERIM_TOOL, INTERIM_MAX_CHARS, INTERIM_MAX_PER_RUN, INTERIM_MIN_GAP_MS, INTERIM_PLAIN_MAX_CHARS } from './lib/interim.js';
+import { buildDshDigest, summariseConversations } from './lib/dsh-digest.js';
 import { attachmentBlock, normalizeAttachments, readUploadContent, saveUpload, UPLOAD_EXCERPT_CHARS, UPLOAD_MAX_PER_MESSAGE } from './lib/upload-store.js';
 
 /**
@@ -82,7 +84,7 @@ export const NEWMATE_RUN_TOOLS = Object.freeze([
   'newmate_wechat_send_file', 'newmate_wechat_send_text', 'newmate_attachment_read',
   'newmate_conversation_list', 'newmate_conversation_new', 'newmate_conversation_send', 'newmate_conversation_read',
   'newmate_session_list', 'newmate_session_read', 'newmate_session_refresh', 'newmate_session_resume',
-  CORE_MEMORY_TOOL_NAME,
+  CORE_MEMORY_TOOL_NAME, NEWMATE_INTERIM_TOOL,
 ]);
 
 /** The two ComputerUse tools, and the owner label every NewMate lease carries. */
@@ -122,7 +124,7 @@ export function newMateRunTools({ automatic = false, origin } = {}) {
   const offered = NEWMATE_RUN_TOOLS.filter((name) => name !== 'newmate_task' && (!automatic || !NEWMATE_REQUEST_TOOLS.includes(name)));
   return !automatic && origin ? [...offered, 'newmate_task'] : offered;
 }
-export function createNewMate({ root, tools, agents, goals = () => null, now = Date.now, logger, onNotify = async () => {}, onCompanion = async () => {}, onPresence = () => {}, environment=()=>({ready:true,idleMs:2*MINUTE}) }) {
+export function createNewMate({ root, tools, agents, goals = () => null, now = Date.now, logger, onNotify = async () => {}, onCompanion = async () => {}, onPresence = () => {}, environment=()=>({ready:true,idleMs:2*MINUTE}), dshConversations = null }) {
   const failures = createErrorLog({root,logger});
   // The live view of the run in flight: what the page, newmate_state and the MCP status read.
   const live = createLoopStatus(now);
@@ -523,10 +525,20 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
          * interactive run and disposed at the end, so a DSH agent never sees it in its
          * catalog (its normal asking goes through the native ask_user_question), and a
          * call that somehow reaches it still refuses outside this ALS context. */
+        /**
+         * The conversation digest is read ONCE per check-in, before the prompt is built: it costs ten
+         * bounded reads, and doing it inside the template would read the same paths for every retry.
+         */
+        /**
+         * Only a host that supplies the conversation seams pays for them: a fixture without a provider
+         * keeps the previous synchronous path, and a real host gets the digest. (The await is what the
+         * fixtures feel: they resolve the dispatch in one microtask.)
+         */
+        const dsh=tasksBriefable(task)&&typeof dshConversations==='function'?await dshBrief():null;
         const disposeAsk = task.localText || automatic || maintenance ? undefined : tools.register(createAskTool({ ask }));
         let outcome;
         try { outcome = task.localText?{isError:false,value:{ok:true,result:{structured:{notify:true,text:task.localText,topic:'gentle-presence'}}}}:await withComputerUseOwner(NEWMATE_CU_OWNER,()=>withComputerUseCaller(task.origin?{agent:{session:{id:task.origin}}}:undefined,()=>withNewMateContext({...memory,conversation:conversationOf(task),session:{id:task.threadId,taskId:task.id},steer:{drain:()=>guide?.drain()||[],hasPending:()=>Boolean(guide?.pending.length)},onEvent:event=>live.event(event)},()=>executeOne(tools,{ callId: `newmate:${task.id}`, name: 'agent_api_send', arguments: {
-          prompt: `${timeLine}${sessionBlock(task.threadId)}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。用户要求重复时给 repeat：{every,unit:\'min\'|\'h\'|\'d\',weekdays?:[1-7]（1=周一）,at?:\'HH:MM\'}，或等价规则串 rule（如 \"every 2 d on 1-5 at 09:00\"）；不给 repeat 就只触发一次。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、核心记忆、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n${briefBlock(task)}当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪件事、在哪个项目或目录、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。brief 写第②步的整理（一条判断，≤200 字），text 写第③步的提醒正文；两者都不要复述扫描过程。':''}\n${REPLY_PROTOCOL}`,
+          prompt: `${timeLine}${sessionBlock(task.threadId)}你可使用 newmate_todo_add/list/cancel 管理定时待办，创建必须有确定的激活时间（带时区 ISO）和要发送给用户的原文；缺少时间时先确认。用户要求重复时给 repeat：{every,unit:\'min\'|\'h\'|\'d\',weekdays?:[1-7]（1=周一）,at?:\'HH:MM\'}，或等价规则串 rule（如 \"every 2 d on 1-5 at 09:00\"）；不给 repeat 就只触发一次。仅为用户明确需求或可靠的已有委托创建，不凭空给用户安排事项。默认 mode=conversation，到期在合适时激活一轮 NewMate；仅需原文提醒时显式使用 mode=reminder，不调用模型。人格、核心记忆、完整 MemoryLab 标签树、全部短期记忆与记忆工具组 schema 已在最早的系统前缀注入。\n近期对话：${JSON.stringify(history)}\n${briefBlock(task,dsh)}当前任务：${task.prompt}${delegated?'\n这是用户预先安排的待办激活。现在运行这一轮，结合记忆和既有对话自然回应或处理上述明确委托；不要仅复述待办，不要为待办之外的事扩大授权。不是实时用户发问，不编造用户刚刚说了什么；只发送有用结果或具体下一步。任务失败不自动重试，不创建重复待办。':''}${unsolicited?'\n'+PROACTIVE_STYLE+'\n若最近确实有工作区变动或已安静很久，主动消息的正文要用具体事实说明（哪件事、在哪个项目或目录、隔了多久）；没有具体内容就保持沉默，不要只说“有变化”或泛泛问候。brief 写第②步的整理（一条判断，≤200 字），text 写第③步的提醒正文；两者都不要复述扫描过程。':''}\n${REPLY_PROTOCOL}`,
           tools: { allow: newMateRunTools({automatic:automatic||maintenance,origin:task.origin}) }, timeout_ms: maintenance?60000:automatic?45000:120000, max_steps: maintenance?4:automatic?3:0,
           ...(automatic ? { output_schema: { type:'object',properties:{notify:{type:'boolean'},text:{type:'string',maxLength:400},plain:{type:'string',maxLength:120},topic:{type:'string',maxLength:80},brief:{type:'string',maxLength:200}},required:['notify','text'],additionalProperties:false } } : {}),
         }, signal: active.signal }))));
@@ -644,6 +656,33 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
           return;
         }
         const attempted=s.tasks.find(t => t.id === task.id);delete attempted.deferred;Object.assign(attempted, { status: manualRestart?'pending':userPreempted?'interrupted':paused?'paused':stopped ? 'interrupted' : 'failed', error: manualRestart?'已切换为用户引导':userPreempted?'用户已切换到新对话':paused?'主动陪伴已暂停':String(error.message), finished: now() });if(task.todoId&&!manualRestart)Object.assign(s.todos.find(t=>t.id===task.todoId),{status:'failed',error:String(error.message)});if(automatic)s.initiative.lastOutcome=manualRestart?'user_steer':paused?'paused':stopped?'interrupted':'failed'; });
+      /**
+       * A TURN THAT SPOKE MID-LOOP AND THEN DIED HAS TO SAY SO.
+       *
+       * Measured 2026-11-24 02:00 (this machine, live): the third acceptance round published its interim
+       * sentence, then the provider dropped the stream (TRANSPORT, four attempts), and the conversation
+       * ended on "I'm looking into it" with the failure visible only in the task list. A sentence that
+       * promised work and then nothing is worse than no sentence: the person waits.
+       *
+       * So a failed CHAT turn that already spoke gets one closing message, written by the runtime and
+       * labelled as such. It carries the task id, which is deliberate: it is the answer for the page, it
+       * is what `forwardReplies` sends to the phone, and it cannot be confused with model text.
+       */
+      if (!stopped && !paused && !manualRestart && !userPreempted && task.kind === 'chat') {
+        try {
+          const after = store.read();
+          const spoke = after.messages.some((m) => m.interim === true && m.taskId === task.id);
+          const answered = after.messages.some((m) => String(m.id) === String(task.id));
+          if (spoke && !answered) {
+            const raw = String(error?.message || '');
+            const why = /TRANSPORT|Connection|offline|ECONN|socket/i.test(raw) ? '连接中断，没有拿到结果' : (raw.slice(0, 80) || '运行中断');
+            const note = '这一轮没有走完：' + why + '。我停在这里，没有再继续。';
+            const closing = { id: task.id, threadId: task.threadId, role: 'assistant', text: note, plain: note, at: now(), unread: true, runtime: true, failed: true, taskId: task.id };
+            store.change((s) => { if (s.messages.some((m) => String(m.id) === String(task.id))) return; s.messages.push(closing); const th = s.threads.find((t) => t.id === task.threadId); if (th) th.updated = now(); });
+            await notify({ ...closing, text: bubbleText(closing), rich_text: closing.text });
+          }
+        } catch (failure) { failures.record({ where: 'newmate/failure-close', code: failure?.code || 'failure_close_failed', message: String(failure?.message) }); }
+      }
     } finally {
       // A lease outlives the turn that took it, so it is released HERE, before the task is
       // reported settled: an unattended companion must not leave the desktop in takeover.
@@ -1218,7 +1257,9 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
    * Runs that a person asked for (chat, a scheduled todo) keep the old one-line workspace fact: their
    * prompt is about the user's request, and a full change brief would compete with it.
    */
-  function briefBlock(task){
+  /** The runs a conversation digest may be read for: the unsolicited check-in only. */
+  function tasksBriefable(task){return task?.kind==='self_activation';}
+  function briefBlock(task,dsh){
     const state=store.read(),watch=state.watch||{},settings=state.settings||{},initiative=state.initiative||{},at=now();
     if(task?.kind!=='self_activation')return '工作区最近变动（稀疏监控的浅层事实，只含文件数量/名称/最新修改时间，不是文件内容）：'+(watch.lastDescription||'（本机尚无对比结果）')+'\n';
     const memory=nativeMemory();
@@ -1242,8 +1283,34 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
     lines.push('- 记忆：长期记忆 '+memory.tree.counts.tags+' 个标签 / '+memory.tree.counts.components+' 个节点；短期记忆 '+memory.shortMemory.length+' 条（其中已过期 '+expired+' 条，过期内容不可当作当前事实）。');
     lines.push('- 待办：未投递 '+todos.length+' 条，其中 '+dueNow.length+' 条已到点、'+dueSoon.length+' 条 24 小时内到期。');
     if(facts)lines.push('- 本会话消息 '+facts.messages+' 条 / '+facts.chars+' 字符。');
-    lines.push('处理顺序（这就是这次主动联系的机制）：①先通读上面的工作区变动概览，弄清哪些项目、哪些目录、哪一类文件真的动了；②把这次变动整理成一句自己的判断——哪一件值得此刻说、为什么，写进 brief；③再根据这句判断和上面所有可较快获取的信息写 text，只写用户能直接用的具体事实（哪件事、在哪个项目或目录）和至多一个不催促的可选邀请，不复述扫描过程、不罗列文件清单。没有值得此刻说的具体内容就 notify=false。');
+    /**
+     * THE LAST TEN DSH CONVERSATIONS, AND WHAT TO DO WITH THEM (2026-11-24).
+     *
+     * Added because a check-in that only knows what changed on disk cannot notice work that stopped
+     * halfway: a question left unanswered, a task where the last thing said was "let me check", a
+     * conclusion that never landed. The material is bounded (titles, workspace, age, two quoted
+     * messages); the SUGGESTION is the model's, and the prompt says exactly what makes one worth
+     * saying.
+     */
+    if(dsh)lines.push('- '+dsh.text);
+    lines.push('处理顺序（这就是这次主动联系的机制）：①先通读上面的工作区变动概览，弄清哪些项目、哪些目录、哪一类文件真的动了；②再看最近 DSH 对话，找一件「停在中途、问题没答案、结论没落地」的具体事（不要复述对话内容，也不要评价别人怎么工作）；③把这两部分整理成一句自己的判断，并在 brief 末尾给出**一条可以立刻执行的建议**（做什么、为什么值得现在做）；④再根据这句判断和上面所有可较快获取的信息写 text，只写用户能直接用的具体事实（哪件事、在哪个项目或目录）和至多一个不催促的可选邀请，不复述扫描过程、不罗列文件清单。没有值得此刻说的具体内容就 notify=false。');
     return lines.join('\n')+'\n';
+  }
+
+  /**
+   * THE OTHER HALF OF "WHAT IS GOING ON": the recent DSH conversations (2026-11-24).
+   *
+   * The user asked the check-in to read the last ten host conversations and turn them into a
+   * suggestion. They are read through the conversation bridge's own seams (bounded list + bounded
+   * read), so this cannot open, resume or write a session; a host that does not carry the bridge
+   * degrades to a statement instead of a crash, and the digest is only built for a check-in run.
+   */
+  async function dshBrief(){
+    let seams=null;
+    try{seams=typeof dshConversations==='function'?dshConversations():null;}catch{seams=null;}
+    if(!seams||typeof seams.list!=='function')return{ok:false,code:'dsh_digest_unavailable',text:summariseConversations({ok:false,code:'dsh_digest_unavailable'},{now:now()})};
+    const digest=await buildDshDigest(seams,{now:now()});
+    return{...digest,text:summariseConversations(digest,{now:now()})};
   }
 
   /** How long since the last contact, in words a person would use. */
@@ -1319,6 +1386,53 @@ export function createNewMate({ root, tools, agents, goals = () => null, now = D
      * refuses outside a NewMate run.
      */
     memoryContext() { const value=nativeMemory(); return {key:value.key,tree:structuredClone(value.tree),tags:structuredClone(value.tags),shortMemory:structuredClone(value.shortMemory),shortMemoryTotal:value.shortMemoryTotal,shortMemoryOmitted:value.shortMemoryOmitted,coreMemory:value.coreMemory?structuredClone(value.coreMemory):null,tools:structuredClone(value.tools),toolsMissing:structuredClone(value.toolsMissing),cacheHits:value.cacheHits()}; },
+    /**
+     * ONE INTERIM SENTENCE, PUBLISHED WHILE THE TURN KEEPS RUNNING.
+     *
+     * The model asks for this through `newmate_progress`; the rules live here because only the
+     * component knows what kind of turn is in flight (see lib/interim.js for why each rule exists).
+     * The message is stored with the conversation and WITHOUT a notification: a person already
+     * waiting on this turn reads the page, and a bubble would be a second interruption for the same
+     * sentence.
+     */
+    async interim({ text: body, plain } = {}) {
+      const task = activeTask;
+      if (!task || !running) return { ok: false, code: 'interim_not_running', error: '没有正在进行的回合，这条中间回复没有发送' };
+      if (task.kind !== 'chat') return { ok: false, code: 'interim_not_conversational', error: '只有用户发起的对话可以发中间回复；主动检查、会话维护与定时激活不发' };
+      const value = typeof body === 'string' ? body.trim() : '';
+      if (!value) return { ok: false, code: 'interim_empty', error: '中间回复不能为空' };
+      if (value.length > INTERIM_MAX_CHARS) return { ok: false, code: 'interim_too_long', error: '中间回复最多 ' + INTERIM_MAX_CHARS + ' 字（本次 ' + value.length + '），请写进展与下一步' };
+      const state = store.read();
+      const sentSoFar = state.messages.filter((message) => message.interim === true && message.taskId === task.id);
+      if (sentSoFar.length >= INTERIM_MAX_PER_RUN) return { ok: false, code: 'interim_limit', error: '这一轮已经发过 ' + sentSoFar.length + ' 条中间回复，请直接完成并给出最终回复' };
+      const previous = sentSoFar[sentSoFar.length - 1];
+      if (previous && previous.text === value) return { ok: false, code: 'interim_repeated', error: '同一句话刚刚已经发过，不要重复' };
+      if (previous && now() - Number(previous.at || 0) < INTERIM_MIN_GAP_MS) return { ok: false, code: 'interim_too_soon', error: '两条中间回复至少间隔 ' + Math.round(INTERIM_MIN_GAP_MS / 1000) + ' 秒' };
+      /**
+       * ONE REPLY, TWO RENDERINGS - the same rule the final answer already follows.
+       *
+       * The page renders `text`; the desktop bubble and the WeChat channel get `plain`. The model is
+       * asked for it (optional, <=120 chars); when it ignores the field, toPlain() derives it, exactly
+       * as normalizeReply() does for the final answer, so a bubble can never show raw Markdown.
+       */
+      const plainText = typeof plain === 'string' && plain.trim() ? plain.trim().slice(0, INTERIM_PLAIN_MAX_CHARS) : toPlain(value);
+      const id = task.id + ':interim:' + (sentSoFar.length + 1);
+      const message = { id, threadId: task.threadId, role: 'assistant', text: value, plain: plainText, at: now(), interim: true, taskId: task.id, unread: true };
+      store.change((s) => {
+        s.messages.push(message);
+        const thread = s.threads.find((entry) => entry.id === task.threadId);
+        if (thread) thread.updated = now();
+      });
+      /**
+       * THE BUBBLE IS PART OF THE INTERIM REPLY (2026-11-24): 「同步生成纯文字版本且推送气泡」. It goes
+       * through the same notify() as every other message, so quiet hours, snooze and the reader window
+       * mute it by the same rule - an interim sentence is not an exception to being polite. A failure to
+       * pop a bubble is recorded, not thrown: the sentence is already in the conversation.
+       */
+      try { await notify({ ...message, text: bubbleText(message), rich_text: message.text }); }
+      catch (error) { failures.record({ where: 'newmate/interim-notify', code: 'interim_notify_failed', message: String(error?.message || error) }); }
+      return { ok: true, id, chars: value.length, plain: plainText, plainChars: plainText.length, remaining: Math.max(0, INTERIM_MAX_PER_RUN - sentSoFar.length - 1) };
+    },
     /** The core memory store, for the tool NewMate alone gets (see lib/core-memory.js). */
     coreMemory:{snapshot:()=>core.snapshot(),save:args=>core.save(args),render:()=>core.render(),file:core.file,budget:core.budget},
     failure(where,error) { failures.record({where,code:error.code || 'newmate_failed',message:String(error.message)}); },

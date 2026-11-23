@@ -10,6 +10,7 @@ import { createNewMateSearch } from './lib/web-search.js';
 import { createConversationBridge } from './lib/conversations.js';
 import { createSessionBridge } from './lib/sessions.js';
 import { coreMemoryDefinition } from './lib/core-memory.js';
+import { interimDefinition } from './lib/interim.js';
 import { createWechatChannel } from './lib/wechat-channel.js';
 import { MONITOR_DEFAULTS, uniqueRoots } from './lib/workspace-diff.js';
 import { UPLOAD_MAX_BYTES } from './lib/upload-store.js';
@@ -42,7 +43,13 @@ export function apply(ctx, config) {
     return answer;
   });
   const environment=()=>{const pet=companionPetEvents();let busy=false;try{const agents=ctx.get?.('agents')?.list?.()||[],jobs=ctx.get?.('jobs');busy=agents.some(a=>a.status==='running'||a.inbox?.nextTurn?.length>0||a.inbox?.nextStep?.length>0)||Boolean(jobs&&[undefined,...agents].some(a=>jobs.list(a?.id).some(j=>['running','stopping'].includes(j.status))));}catch{busy=true;}return{ready:pet.running&&pet.statusAgeMs<2000&&pet.window?.user_desktop_active===true,readerFocused:pet.window?.reader_focused===true,busy:busy||pet.window?.cu===true,idleMs:pet.window?.input_idle_ms??0};};
-  const mate = createNewMate({ root: resolveRoot(config), tools: ctx.tools, agents: () => ctx.get?.('agents'), goals: () => ctx.get?.('goals'), logger:ctx.logger,onCompanion:companion,onNotify:notifyDesktopPet,onPresence:updateDesktopPetFocus,environment });
+  /**
+   * The check-in reads the last ten DSH conversations through the conversation bridge's own bounded,
+   * read-only seams (created below, evaluated lazily). A host without those services answers
+   * "unavailable" in the digest instead of failing the run.
+   */
+  const dshConversations = () => (conversations ? { list: (args) => conversations.list(args), read: (args) => conversations.read(args) } : null);
+  const mate = createNewMate({ root: resolveRoot(config), tools: ctx.tools, agents: () => ctx.get?.('agents'), goals: () => ctx.get?.('goals'), logger:ctx.logger,onCompanion:companion,onNotify:notifyDesktopPet,onPresence:updateDesktopPetFocus,environment, dshConversations });
   /**
    * The WeChat ClawBot channel. Driven from the settings page (one button, two states) and
    * independent of the companion switches: it forwards the final reply of a run the WeChat message
@@ -93,6 +100,16 @@ export function apply(ctx, config) {
    */
   const coreMemory=coreMemoryDefinition({services:{core:()=>mate?.coreMemory}});
   privateTools[coreMemory.name]=coreMemory;
+  /**
+   * INTERIM REPLIES, as a private tool of the companion.
+   *
+   * Private for the same reason as the others: the sentence must be in NewMate's voice about NewMate's
+   * own turn, and it is only meaningful while that turn is running (the component refuses otherwise).
+   * A DSH agent that reached the private map through agent_api_send still gets the refusal, because the
+   * tool requires the NewMate run context.
+   */
+  const interim=interimDefinition({services:{mate:()=>mate}});
+  privateTools[interim.name]=interim;
   /**
    * The report path: NewMate telling the user something it found out by itself.
    *
